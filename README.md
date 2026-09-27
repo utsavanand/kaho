@@ -32,7 +32,7 @@ telemetry.
 - **Dictionary** — list your names, products, and jargon; Whisper stops
   guessing "Soto" for "Sotto"
 - **On-device** — audio never leaves the machine; works offline
-- **Small** — one Python file, five dependencies
+- **Small** — one Python file, seven dependencies
 
 ## The menu
 
