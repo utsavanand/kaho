@@ -111,18 +111,21 @@ worker thread     ──▶ loops on Queue.get(): transcribe ▸ optional rewrit
 
 ## macOS permissions (manual, one-time)
 
-The terminal app that runs this (Terminal/iTerm) needs all three:
+Sotto.app needs exactly two grants (Input Monitoring stopped being required
+in 1.1.1, when the CGEventTap was replaced with NSEvent monitors):
 
 1. **Microphone** — prompted automatically on first recording
-2. **Accessibility** — required to observe global keys and send Cmd+V
-3. **Input Monitoring** — required alongside Accessibility for global key
-   observation on current macOS
+2. **Accessibility** — required to observe the global hotkey and post the
+   synthetic Cmd+V
 
-The TCC grant is bound to the specific binary and launching terminal:
-recreating the venv, upgrading Homebrew Python, or switching Terminal→iTerm
-silently revokes it, and the symptom is "runs but sees no keys." Startup
-therefore checks `AXIsProcessTrusted()` and prints a pointer to System
-Settings instead of sitting mute.
+The TCC grant is bound to the binary's identity: rebuilding via install.sh,
+upgrading Homebrew Python, or switching between the source build and the
+notarized bundle silently invalidates it, and the symptom is "runs but sees
+no keys" or "transcribes but never pastes." Startup checks
+`CGPreflightPostEventAccess()` and shows a pointer to System Settings; since
+1.7.9 the same check runs before every paste, so a grant revoked mid-session
+surfaces on the pill instead of failing silently. When running from the repo
+with run.sh, the grants attach to the launching terminal instead of Sotto.
 
 ## Failure modes
 
