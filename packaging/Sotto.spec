@@ -9,10 +9,18 @@
 # Build:  pyinstaller packaging/Sotto.spec --noconfirm
 
 import os
+import re
 
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
+
+# The version comes from sotto.py's APP_VERSION. A literal default here drifted
+# to 1.7.3 while the app shipped 1.7.9, so any build that forgot SOTTO_VERSION
+# would have been mislabelled. SOTTO_VERSION still wins, for a one-off build.
+with open(os.path.join(SPECPATH, "..", "sotto.py")) as _f:
+    _app_version = re.search(r'^APP_VERSION = "([^"]+)"', _f.read(), re.MULTILINE).group(1)
+VERSION = os.environ.get("SOTTO_VERSION", _app_version)
 
 # Naming lazy imports one at a time is a losing game — mlx alone failed on
 # mlx._reprlib_fix, and each fix costs a 10-minute rebuild to discover the
@@ -137,8 +145,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Sotto",
         "CFBundleDisplayName": "Sotto",
-        "CFBundleShortVersionString": os.environ.get("SOTTO_VERSION", "1.7.3"),
-        "CFBundleVersion": os.environ.get("SOTTO_VERSION", "1.7.3"),
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "LSUIElement": True,  # menu bar only, no Dock icon by default
         "LSMinimumSystemVersion": "14.0",
         "NSMicrophoneUsageDescription":

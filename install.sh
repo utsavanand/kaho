@@ -18,6 +18,9 @@ done
 echo "using $PY"
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
+# Read the version out of sotto.py rather than keeping a second copy here
+VERSION="$(sed -nE 's/^APP_VERSION = "([^"]+)".*/\1/p' "$SRC/sotto.py")"
+[[ -n "$VERSION" ]] || { echo "could not read APP_VERSION from sotto.py"; exit 1; }
 SUPPORT="$HOME/Library/Application Support/Sotto"
 APP="/Applications/Sotto.app"
 STAGE="/Applications/.Sotto.app.new"
@@ -35,7 +38,7 @@ fi
 # slip into an app that holds mic + Accessibility permissions
 "$SUPPORT/venv/bin/pip" install --quiet --require-hashes --no-deps --timeout 60 --retries 10 -r "$SRC/requirements.lock"
 
-echo "building $APP ..."
+echo "building $APP $VERSION ..."
 # Stage the new bundle completely before touching the existing app, so a
 # failed build never destroys a working installation
 rm -rf "$STAGE"
@@ -43,7 +46,7 @@ mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp "$SRC/sotto.py" "$STAGE/Contents/Resources/"
 cp "$SRC/assets/Sotto.icns" "$STAGE/Contents/Resources/"
 
-cat > "$STAGE/Contents/Info.plist" <<'PLIST'
+cat > "$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -54,7 +57,7 @@ cat > "$STAGE/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>sotto</string>
   <key>CFBundleIconFile</key><string>Sotto</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.7.9</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSMicrophoneUsageDescription</key><string>Sotto records while you hold the hotkey and transcribes on-device.</string>
