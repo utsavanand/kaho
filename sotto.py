@@ -243,6 +243,7 @@ settings = {"hotkey": "right_option", "rewrite": "off"}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
+rewriter_lock = threading.Lock()  # see ensure_rewriter
 
 
 # Transcripts are sensitive: create log/history files 0600 instead of the
@@ -652,11 +653,19 @@ def transcribe(audio, use_dictionary=True):
 
 
 def ensure_rewriter():
+    """Start the loader unless the model is already loaded or on its way.
+
+    The check and the start have to be atomic: this is called from the backend
+    thread at startup and from the menu and the settings window on the main
+    thread, and two callers landing together each downloaded and loaded their
+    own copy of a 2.3 GB model.
+    """
     global rewriter_thread
-    if rewriter or (rewriter_thread and rewriter_thread.is_alive()):
-        return
-    rewriter_thread = threading.Thread(target=_load_rewriter, daemon=True)
-    rewriter_thread.start()
+    with rewriter_lock:
+        if rewriter or (rewriter_thread and rewriter_thread.is_alive()):
+            return
+        rewriter_thread = threading.Thread(target=_load_rewriter, daemon=True)
+        rewriter_thread.start()
 
 
 def _load_rewriter():
