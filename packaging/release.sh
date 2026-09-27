@@ -75,12 +75,13 @@ STAGE="$BUILD/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"   # drag-to-install target
-# Detach any stale mount first: hdiutil mounts the image at /Volumes/<volname>
-# while building it, and a leftover /Volumes/Sotto from a previous download or
-# test makes it fail with a bare "Operation not permitted".
-hdiutil detach "/Volumes/Sotto" -force >/dev/null 2>&1 || true
-hdiutil detach "/Volumes/Sotto 1" -force >/dev/null 2>&1 || true
-hdiutil create -volname "Sotto" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+# The volume name must not be "Sotto": hdiutil mounts the image at
+# /Volumes/<volname> while building, and something on this machine holds a
+# claim on /Volumes/Sotto that survives a detach — every attempt fails with a
+# bare "Operation not permitted" naming no cause. "Sotto Installer" also reads
+# better in the Finder title bar when the image is opened.
+hdiutil detach "/Volumes/Sotto Installer" -force >/dev/null 2>&1 || true
+hdiutil create -volname "Sotto Installer" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
 echo "==> notarizing (usually minutes; large uploads can take an hour)"
