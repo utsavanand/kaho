@@ -18,6 +18,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -564,6 +565,62 @@ class TestSettingsWiring(SottoTestCase):
             sotto.open_dictionary()
         self.assertTrue(pathlib.Path(sotto.DICTIONARY_PATH).exists())
         sp.run.assert_called_once_with(["open", "-t", sotto.DICTIONARY_PATH], check=False)
+
+
+class TestRewriterLoading(SottoTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(sotto, "rewriter_thread", None))
+
+    def test_repeated_calls_start_one_loader(self):
+        with mock.patch.object(sotto, "threading") as threading_stub:
+            started = threading_stub.Thread.return_value
+            started.is_alive.return_value = True
+            sotto.ensure_rewriter()
+            sotto.ensure_rewriter()
+            sotto.ensure_rewriter()
+        threading_stub.Thread.assert_called_once_with(target=sotto._load_rewriter, daemon=True)
+        started.start.assert_called_once()
+
+    def test_a_second_caller_arriving_mid_start_is_held_at_the_lock(self):
+        """The race itself, staged rather than argued about.
+
+        ensure_rewriter is called from the backend thread at startup and from
+        the menu and settings window on the main thread. Without the lock, a
+        caller landing between the "already loading?" check and the thread
+        start passes the check too, and downloads and loads its own copy of a
+        2.3 GB model.
+
+        The thread factory is where we interrupt: the first call is inside the
+        critical section when the second arrives.
+        """
+        real_thread = threading.Thread
+        created, was_blocked = [], []
+
+        def factory(target=None, daemon=None):
+            handle = mock.MagicMock()
+            handle.is_alive.return_value = True
+            created.append(handle)
+            if len(created) == 1:
+                other = real_thread(target=sotto.ensure_rewriter, daemon=True)
+                other.start()
+                other.join(timeout=0.3)
+                # Still alive = still waiting on the lock, which is the point
+                was_blocked.append(other.is_alive())
+            return handle
+
+        with mock.patch("sotto.threading.Thread", factory):
+            sotto.ensure_rewriter()
+
+        self.assertEqual(was_blocked, [True], "the second caller was not held at the lock")
+        self.assertEqual(len(created), 1, "two loaders were started for one model")
+
+    def test_nothing_starts_once_the_model_is_loaded(self):
+        self.enterContext(mock.patch.object(sotto, "rewriter", ("model", "tokenizer")))
+        self.enterContext(mock.patch.object(sotto, "rewriter_thread", None))
+        with mock.patch.object(sotto, "threading") as threading_stub:
+            sotto.ensure_rewriter()
+        threading_stub.Thread.assert_not_called()
 
 
 class TestHallucinationFilter(unittest.TestCase):
