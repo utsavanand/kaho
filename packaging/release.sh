@@ -75,6 +75,11 @@ STAGE="$BUILD/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"   # drag-to-install target
+# Detach any stale mount first: hdiutil mounts the image at /Volumes/<volname>
+# while building it, and a leftover /Volumes/Sotto from a previous download or
+# test makes it fail with a bare "Operation not permitted".
+hdiutil detach "/Volumes/Sotto" -force >/dev/null 2>&1 || true
+hdiutil detach "/Volumes/Sotto 1" -force >/dev/null 2>&1 || true
 hdiutil create -volname "Sotto" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
