@@ -1318,22 +1318,13 @@ class SettingsWindow(AppKit.NSObject):
             )
 
     def openDictionary_(self, _sender):
-        ensure_dictionary_file()
-        subprocess.run(["open", "-t", DICTIONARY_PATH], check=False)
+        open_dictionary()
 
     def hotkeyChanged_(self, sender):
-        settings["hotkey"] = sender.selectedItem().representedObject()
-        save_settings()
-        log(f"hotkey: {hotkey_label()}")
-        rebuild_status_menu()
+        apply_hotkey(sender.selectedItem().representedObject())
 
     def rewriteChanged_(self, sender):
-        settings["rewrite"] = sender.selectedItem().representedObject()
-        save_settings()
-        if settings["rewrite"] != "off":
-            ensure_rewriter()
-        self.refreshHint()
-        rebuild_status_menu()
+        apply_rewrite(sender.selectedItem().representedObject())
 
 
 def make_label(text, x, y, size, bold=False, dim=False):
@@ -1458,23 +1449,62 @@ def install_app_menu():
     main_menu.addItem_(app_item)
     # The submenu's own title is what macOS renders in bold as the app menu
     app_menu = AppKit.NSMenu.alloc().initWithTitle_("Sotto")
-    for title, action, key in (
-        ("Settings…", "showSettings:", ","),
-        ("Edit Dictionary…", "editDictionary:", ""),
-        ("History…", "showHistory:", "h"),
-        ("Report a Bug…", "reportBug:", ""),
-        (None, None, None),
-        ("Quit Sotto", "terminate:", "q"),
-    ):
-        if title is None:
-            app_menu.addItem_(AppKit.NSMenuItem.separatorItem())
+    for title, action, key in MENU_ACTIONS:
+        if action in APP_MENU_OMITS:
             continue
+        if action == "quit:":
+            app_menu.addItem_(AppKit.NSMenuItem.separatorItem())
+            # NSApp's own selector, so ⌘Q works with no target of ours
+            action = "terminate:"
         item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
         if action != "terminate:":
             item.setTarget_(status_item)
         app_menu.addItem_(item)
     app_item.setSubmenu_(app_menu)
     AppKit.NSApp.setMainMenu_(main_menu)
+
+
+# One table for both menus. The status item shows all of it; the app menu drops
+# Open Log and quits through NSApp's own terminate: so ⌘Q works without a
+# target. Two hand-maintained copies drifted twice, which is why
+# tools/check_docs_sync.py reads this list.
+MENU_ACTIONS = (
+    ("Settings…", "showSettings:", ","),
+    ("Edit Dictionary…", "editDictionary:", ""),
+    ("History…", "showHistory:", "h"),
+    ("Open Log", "openLog:", ""),
+    ("Report a Bug…", "reportBug:", ""),
+    ("Quit Sotto", "quit:", "q"),
+)
+APP_MENU_OMITS = ("openLog:",)
+
+
+def open_dictionary():
+    ensure_dictionary_file()
+    subprocess.run(["open", "-t", DICTIONARY_PATH], check=False)
+
+
+def refresh_settings_ui():
+    """Both surfaces show the same settings, so a change on either refreshes
+    the other — the menu's checkmarks and the window's popups."""
+    rebuild_status_menu()
+    if settings_win and getattr(settings_win, "window", None):
+        settings_win.syncControls()
+
+
+def apply_hotkey(name):
+    settings["hotkey"] = name
+    save_settings()
+    log(f"hotkey: {hotkey_label()}")
+    refresh_settings_ui()
+
+
+def apply_rewrite(mode):
+    settings["rewrite"] = mode
+    save_settings()
+    if mode != "off":
+        ensure_rewriter()
+    refresh_settings_ui()
 
 
 def rebuild_status_menu():
@@ -1558,36 +1588,17 @@ class StatusItem(AppKit.NSObject):
                 settings["rewrite"], "setRewrite:",
             )
         )
-        actions = (
-            ("Settings…", "showSettings:", ","),
-            ("Edit Dictionary…", "editDictionary:", ""),
-            ("History…", "showHistory:", "h"),
-            ("Open Log", "openLog:", ""),
-            ("Report a Bug…", "reportBug:", ""),
-            ("Quit Sotto", "quit:", "q"),
-        )
-        for title, action, key in actions:
+        for title, action, key in MENU_ACTIONS:
             entry = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
             entry.setTarget_(self)
             menu.addItem_(entry)
         self.item.setMenu_(menu)
 
     def setHotkey_(self, sender):
-        settings["hotkey"] = sender.representedObject()
-        save_settings()
-        log(f"hotkey: {hotkey_label()}")
-        self.rebuildMenu()
-        if settings_win and getattr(settings_win, "window", None):
-            settings_win.syncControls()
+        apply_hotkey(sender.representedObject())
 
     def setRewrite_(self, sender):
-        settings["rewrite"] = sender.representedObject()
-        save_settings()
-        if settings["rewrite"] != "off":
-            ensure_rewriter()
-        self.rebuildMenu()
-        if settings_win and getattr(settings_win, "window", None):
-            settings_win.syncControls()
+        apply_rewrite(sender.representedObject())
 
     def copyTranscript_(self, sender):
         set_clipboard(sender.representedObject())
@@ -1602,8 +1613,7 @@ class StatusItem(AppKit.NSObject):
         subprocess.run(["open", LOG_PATH], check=False)
 
     def editDictionary_(self, _sender):
-        ensure_dictionary_file()
-        subprocess.run(["open", "-t", DICTIONARY_PATH], check=False)
+        open_dictionary()
 
     def reportBug_(self, _sender):
         body = (

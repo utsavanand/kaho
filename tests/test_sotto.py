@@ -433,6 +433,66 @@ class TestHistory(SottoTestCase):
         self.assertEqual(texts[-1], "entry 3")
 
 
+class TestMenuWiring(unittest.TestCase):
+    """The status menu and the app menu are built from one table."""
+
+    def test_every_menu_action_has_a_handler(self):
+        # A typo in a selector is silent at runtime: the item just does nothing
+        for title, action, _ in sotto.MENU_ACTIONS:
+            self.assertTrue(
+                hasattr(sotto.StatusItem, action.replace(":", "_")),
+                f"{title!r} points at {action!r}, which StatusItem does not implement",
+            )
+
+    def test_the_app_menu_drops_open_log_and_quits_through_nsapp(self):
+        sotto.AppKit.NSMenuItem.reset_mock()
+        with mock.patch.object(sotto, "status_item", mock.MagicMock()):
+            sotto.install_app_menu()
+        built = [
+            call[0]
+            for call in sotto.AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_.call_args_list
+        ]
+        self.assertNotIn("openLog:", [action for _, action, _ in built])
+        self.assertIn(("Quit Sotto", "terminate:", "q"), built)
+        self.assertIn(("Settings…", "showSettings:", ","), built)
+        # The separator that sits above Quit
+        sotto.AppKit.NSMenuItem.separatorItem.assert_called_once()
+
+
+class TestSettingsWiring(SottoTestCase):
+    """A change on either surface has to reach the other."""
+
+    def setUp(self):
+        super().setUp()
+        self.status = mock.MagicMock()
+        self.window = mock.MagicMock()
+        self.enterContext(mock.patch.object(sotto, "status_item", self.status))
+        self.enterContext(mock.patch.object(sotto, "settings_win", self.window))
+
+    def test_applying_a_hotkey_saves_it_and_refreshes_both_surfaces(self):
+        sotto.apply_hotkey("right_shift")
+        self.assertEqual(sotto.settings["hotkey"], "right_shift")
+        self.assertIn('"hotkey": "right_shift"', pathlib.Path(sotto.SETTINGS_PATH).read_text())
+        self.status.rebuildMenu.assert_called_once()
+        self.window.syncControls.assert_called_once()
+        self.assertTrue(any("Right Shift" in m for m in self.logged))
+
+    def test_applying_a_rewrite_mode_loads_the_model_only_when_on(self):
+        with mock.patch.object(sotto, "ensure_rewriter") as ensure:
+            sotto.apply_rewrite("caveman")
+            ensure.assert_called_once()
+            ensure.reset_mock()
+            sotto.apply_rewrite("off")
+            ensure.assert_not_called()
+        self.assertEqual(sotto.settings["rewrite"], "off")
+
+    def test_opening_the_dictionary_creates_the_template_first(self):
+        with mock.patch.object(sotto, "subprocess") as sp:
+            sotto.open_dictionary()
+        self.assertTrue(pathlib.Path(sotto.DICTIONARY_PATH).exists())
+        sp.run.assert_called_once_with(["open", "-t", sotto.DICTIONARY_PATH], check=False)
+
+
 class TestHallucinationFilter(unittest.TestCase):
     """Whisper's repetition loops must not reach the user's editor."""
 
