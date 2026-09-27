@@ -15,6 +15,9 @@ to your terminal in dev mode, separately from the Sotto.app grants.
 ## Before opening a PR
 
 - `ruff check sotto.py` passes (CI enforces this)
+- `python -m unittest discover -s tests -t .` passes (CI enforces this too).
+  The suite stubs AppKit and the MLX packages, so it runs anywhere and needs no
+  venv. Add a case there for anything you can test without a microphone.
 - Test the full loop by voice: dictate twice in a row (verifies the hotkey
   survives a completed transcription — the event-tap regression in DESIGN.md)
 - Read [DESIGN.md](DESIGN.md) first — several "obvious cleanups" are
