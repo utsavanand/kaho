@@ -1,4 +1,17 @@
 # Changelog
+## 1.7.8 — 2026-09-26
+
+- Dictation no longer destroys your clipboard. Sotto saves what you had
+  copied, pastes the transcript, and puts the original back — guarded by
+  the pasteboard's changeCount so it never overwrites something you copied
+  in the meantime. Transcripts are also marked transient so clipboard
+  managers stop archiving them.
+- The app bundle drops from 904 MB to 477 MB. mlx-whisper declares torch as
+  a dependency but only imports it from torch_whisper.py, a conversion
+  module nothing loads. (numba and scipy look equally unused but are not —
+  transcribe.py imports timing.py at module load, and excluding them kills
+  the app at startup.)
+
 ## 1.7.7 — 2026-09-26
 
 - Raised the silence floor from 0.012 to 0.025. A clip at peak 0.013 slipped

@@ -78,7 +78,14 @@ a = Analysis(
     # so excluding it broke the whole torch -> transformers -> AutoTokenizer
     # chain, surfacing three layers later as a bogus "AutoTokenizer" error.
     # Only exclude packages nothing in the import graph reaches.
+    # torch is declared by mlx-whisper but never reached: it lives only in
+    # torch_whisper.py, a conversion module nothing imports. ~530 MB saved.
+    #
+    # numba and scipy CANNOT be excluded despite only being used for word-level
+    # timestamps we never request — transcribe.py imports timing.py at module
+    # load, so the app dies with ModuleNotFoundError on startup. Tested.
     excludes=[
+        "torch",
         "tkinter",
         "matplotlib",
         "PIL",

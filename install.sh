@@ -54,7 +54,7 @@ cat > "$STAGE/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>sotto</string>
   <key>CFBundleIconFile</key><string>Sotto</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.7.7</string>
+  <key>CFBundleShortVersionString</key><string>1.7.8</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSMicrophoneUsageDescription</key><string>Sotto records while you hold the hotkey and transcribes on-device.</string>
