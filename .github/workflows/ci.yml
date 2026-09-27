@@ -14,9 +14,14 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install ruff==0.16.5
-      - run: ruff check sotto.py
-      - run: python -m py_compile sotto.py
-      - run: bash -n install.sh run.sh
+      # Every Python file, not just sotto.py — tools/check_docs_sync.py had
+      # five findings nothing was looking at. The spec has to be named
+      # explicitly because ruff only discovers .py by extension.
+      - run: ruff check . packaging/Sotto.spec
+      - run: python -m py_compile sotto.py tools/check_docs_sync.py
+      # These are zsh scripts, and bash -n was only approximating them
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      - run: zsh -n install.sh run.sh packaging/release.sh packaging/setup-signing.sh
       # Illustrations drifted behind renamed modes and new menu items three
       # times before this check existed
       - run: python tools/check_docs_sync.py
