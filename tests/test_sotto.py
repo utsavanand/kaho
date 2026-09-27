@@ -23,6 +23,25 @@ import unittest
 from unittest import mock
 
 
+def _real_numpy():
+    """The real numpy if it is installed, else None.
+
+    The audio drop rules need real arrays; nothing else here does. CI installs
+    numpy for exactly that reason — without it those cases skip rather than
+    testing a MagicMock's opinion of `<`. This has to be decided BEFORE the
+    stubs are installed, or `import numpy` finds the stub and answers yes.
+    """
+    try:
+        import numpy
+    except ImportError:
+        return None
+    return numpy
+
+
+REAL_NUMPY = _real_numpy()
+HAVE_NUMPY = REAL_NUMPY is not None
+
+
 def _install_stubs():
     """Stand in for the Mac-only and ML dependencies before sotto is imported.
 
@@ -61,7 +80,7 @@ def _install_stubs():
         ("sounddevice", sounddevice),
         ("mlx_whisper", _Stub("mlx_whisper")),
         ("huggingface_hub", _Stub("huggingface_hub")),
-        ("numpy", _Stub("numpy")),
+        ("numpy", REAL_NUMPY or _Stub("numpy")),
         ("PyObjCTools", pyobjctools),
         ("PyObjCTools.AppHelper", pyobjctools.AppHelper),
     ):
@@ -431,6 +450,60 @@ class TestHistory(SottoTestCase):
         self.assertEqual(len(texts), sotto.HISTORY_SIZE)
         self.assertEqual(texts[0], f"entry {sotto.HISTORY_SIZE + 2}")
         self.assertEqual(texts[-1], "entry 3")
+
+
+@unittest.skipUnless(HAVE_NUMPY, "the audio drop rules need real numpy arrays")
+class TestAudioDropRules(SottoTestCase):
+    """What reaches Whisper, and what is dropped before it can hallucinate."""
+
+    def frames(self, seconds, amplitude):
+        np = REAL_NUMPY
+        n = int(sotto.SAMPLE_RATE * seconds)
+        # A tone rather than a constant: peak is what the rules look at, but a
+        # constant would also make rms meaningless if these ever grow
+        wave = amplitude * np.sin(np.linspace(0, 40 * np.pi, n, dtype="float32"))
+        return [wave.reshape(-1, 1)]
+
+    def test_no_frames_at_all(self):
+        audio, message = sotto._audio_or_drop_reason([])
+        self.assertIsNone(audio)
+        self.assertEqual(message, "dropped: no audio captured")
+
+    def test_a_hold_too_short_to_be_speech(self):
+        audio, message = sotto._audio_or_drop_reason(self.frames(0.1, 0.5))
+        self.assertIsNone(audio)
+        self.assertIn(f"under the {sotto.MIN_SECONDS}s minimum", message)
+
+    def test_pure_silence_names_the_permission(self):
+        audio, message = sotto._audio_or_drop_reason(self.frames(1.0, 0.0))
+        self.assertIsNone(audio)
+        self.assertIn("macOS delivered no mic signal", message)
+        self.assertIn("Microphone", message)
+
+    def test_audio_under_the_speech_floor(self):
+        audio, message = sotto._audio_or_drop_reason(self.frames(1.0, sotto.MIN_PEAK / 2))
+        self.assertIsNone(audio)
+        self.assertIn("too quiet to be speech", message)
+
+    def test_a_real_dictation_gets_through(self):
+        audio, message = sotto._audio_or_drop_reason(self.frames(2.0, 0.2))
+        self.assertIsNotNone(audio)
+        self.assertEqual(len(audio), 2 * sotto.SAMPLE_RATE)
+        self.assertIn("recorded 2.0s", message)
+        self.assertIn("transcribing", message)
+
+    def test_finish_recording_hides_the_pill_on_every_drop(self):
+        for buf in ([], self.frames(0.1, 0.5), self.frames(1.0, 0.0),
+                    self.frames(1.0, sotto.MIN_PEAK / 2)):
+            sotto.AppHelper.callAfter.reset_mock()
+            sotto._finish_recording(None, buf)
+            sotto.AppHelper.callAfter.assert_called_once_with(sotto.overlay.hide)
+            self.assertTrue(sotto.jobs.empty(), "dropped audio must not reach the worker")
+
+    def test_finish_recording_queues_usable_audio(self):
+        sotto._finish_recording(None, self.frames(2.0, 0.2))
+        self.assertFalse(sotto.jobs.empty())
+        sotto.AppHelper.callAfter.assert_not_called()
 
 
 class TestMenuWiring(unittest.TestCase):
