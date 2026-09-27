@@ -44,10 +44,10 @@ def rewrite_modes():
 
 
 def menu_items():
-    """Titles from the status menu's `actions` tuple."""
-    block = re.search(r"^        actions = \((.*?)^        \)", SOURCE, re.DOTALL | re.MULTILINE)
+    """Titles from MENU_ACTIONS, which both menus are built from."""
+    block = re.search(r"^MENU_ACTIONS = \((.*?)^\)", SOURCE, re.DOTALL | re.MULTILINE)
     if not block:
-        sys.exit("could not find the status menu actions tuple in sotto.py")
+        sys.exit("could not find MENU_ACTIONS in sotto.py")
     return re.findall(r'\("([^"]+)",\s*"[a-zA-Z]+:"', block.group(1))
 
 
