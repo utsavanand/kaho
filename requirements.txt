@@ -1,4 +1,13 @@
+# Everything sotto.py imports directly, and nothing else. install.sh installs
+# from requirements.lock instead — hash-pinned, transitive deps included — so
+# this file is the dev install, and the input the lock is regenerated from.
+# huggingface_hub, numpy and pyobjc-framework-Cocoa (AppKit) used to arrive
+# only as transitive deps of the others, which meant an upstream dropping one
+# would have broken the dev install with nothing in the lock changing.
+huggingface_hub>=1.29,<2
 mlx-lm>=0.31.3,<0.32
 mlx-whisper>=0.4.3,<0.5
-sounddevice>=0.5.6,<0.6
+numpy>=2.5,<3
+pyobjc-framework-Cocoa>=11,<13
 pyobjc-framework-Quartz>=11,<13
+sounddevice>=0.5.6,<0.6
