@@ -5,10 +5,15 @@ release, and the transcribed text is inserted into whatever app has focus.
 Transcription runs entirely on-device.
 
 Revised after design review. Material changes from v1: transcription moved off
-the pynput listener callback onto a worker thread (blocking the callback stalls
+the key-listener callback onto a worker thread (blocking the callback stalls
 the macOS event tap, delays keystrokes system-wide, and can silently kill the
-listener); startup warmup inference added; clipboard save/restore dropped;
-`no_speech_prob` filter cut; secure-input and TCC failure modes documented.
+listener); startup warmup inference added; clipboard save/restore dropped
+(reinstated in 1.7.8, see Post-v1 revisions); `no_speech_prob` filter cut;
+secure-input and TCC failure modes documented.
+
+**Goals, Stack and Flow below describe the code as it stands**; Post-v1
+revisions records how it got there, and CHANGELOG.md has the per-release
+detail.
 
 ## Goals
 
@@ -33,11 +38,12 @@ listener); startup warmup inference added; clipboard save/restore dropped;
   pinned Qwen3-4B-Instruct through mlx-lm, lazy-loaded, falling back to the
   raw transcript on any failure. Dictionary and per-app formatting remain
   out.)*
-- No clipboard preservation: dictation overwrites the clipboard. The
-  save/restore alternative has a timing race (restore too early and slow apps
-  paste the *old* clipboard), pollutes clipboard-manager history with two
-  writes per dictation, and `pbpaste` round-trips destroy non-text content.
-  Overwriting is the honest, deterministic v1 behavior.
+- No clipboard preservation: dictation overwrites the clipboard
+  *(superseded: 1.7.8 restores it after a delay, guarded by `changeCount`.
+  The three objections that ruled it out in v1 are all answered — the timing
+  race by waiting `CLIPBOARD_RESTORE_SECONDS`, the clipboard-manager noise by
+  declaring the transcript transient, and the non-text destruction by going
+  through `NSPasteboard` for a string rather than round-tripping `pbpaste`.)*
 - No auto-start at login (documented as a manual `launchd` step, not built)
 - No Windows/Linux
 
@@ -52,32 +58,43 @@ listener); startup warmup inference added; clipboard save/restore dropped;
   `~/.cache/huggingface`. Inference itself is offline.
 - **Audio capture**: `sounddevice` (bundles PortAudio), 16 kHz mono float32 —
   Whisper's native input format, no resampling or ffmpeg needed
-- **Hotkey**: `pynput` **raw `Listener`** — deliberately not `GlobalHotKeys`,
-  whose alt/ctrl combination matching is broken on macOS (pynput #297). The
-  raw listener does report `Key.alt_r` on both edges. Do not "clean this up"
-  into the hotkey API.
+- **Hotkey**: `NSEvent` global + local monitors for `flagsChanged`, installed
+  on the main run loop (`install_hotkey_monitors`). Deliberately not a
+  `CGEventTap`, which would additionally require the Input Monitoring grant,
+  and no longer `pynput`, whose key handling calls TIS APIs off the main
+  thread — macOS 15 kills that with `EXC_BREAKPOINT` (both switches are in
+  Post-v1 revisions). Each hotkey is matched on its raw keycode *plus* the
+  device-specific `NX_DEVICE*KEYMASK` bit: the aggregate
+  `NSEventModifierFlagOption` stays set while LEFT Option is held, which made
+  a right-Option release look like a press and left recording stuck on.
   Default key: hold **right Option**. Caveat: right Option is a dead-key
   modifier (composes ø, ∆, …), so it's only conflict-free when held *alone* —
   and Cmd+V must not be synthesized while it's still physically down, or apps
   receive Cmd+Opt+V ("Paste and Match Style" or nothing). The worker-thread
   structure guarantees the paste happens after release.
-- **Text insertion**: set clipboard via `pbcopy`, simulate Cmd+V with pynput.
-  Pasting is instant regardless of length; per-character synthetic typing is
-  10-100× slower and drops characters in some apps.
+- **Text insertion**: set the clipboard with `pbcopy`, then post a synthetic
+  Cmd+V with `Quartz.CGEventPost`. Pasting is instant regardless of length;
+  per-character synthetic typing is 10-100× slower and drops characters in
+  some apps.
 
 ## Flow
 
 ```
-right-Option down ──▶ ignore if a recording is already active (one boolean)
-                      else start mic stream, append frames to a list
-right-Option up   ──▶ stop stream
-                      < 0.3 s of audio? drop it (accidental tap)
-                      else put audio ndarray on a Queue and return immediately
-worker thread     ──▶ loops on Queue.get(): transcribe ▸ pbcopy ▸ Cmd+V
-                      prints one line per event (text, timing, or why dropped)
+right-Option down ──▶ ignore unless state is "ready"
+                      else claim the recording, queue "open stream" on the
+                      audio thread, show the overlay pill
+right-Option up   ──▶ held past TAP_MAX_SECONDS (0.45 s)? queue "stop stream"
+                      a tap? defer that stop by one double-tap window
+                      second tap inside DOUBLE_TAP_SECONDS (0.9 s)? lock
+                      hands-free — the next tap past the grace period stops it
+stop              ──▶ under 0.3 s, or peak below the speech floor? drop it
+                      else put the audio ndarray on a Queue and return
+worker thread     ──▶ loops on Queue.get(): transcribe ▸ optional rewrite ▸
+                      pbcopy ▸ Cmd+V ▸ history
+                      logs one line per event (text, timing, or why dropped)
 ```
 
-- The listener callbacks only flip state and enqueue — they return in
+- The monitor callbacks only flip state and enqueue — they return in
   microseconds. All slow work (transcription, paste) lives on one
   `threading.Thread(daemon=True)` with a `queue.Queue`. Nothing larger: no
   pool, no executor, no framework.
@@ -88,6 +105,9 @@ worker thread     ──▶ loops on Queue.get(): transcribe ▸ pbcopy ▸ Cmd+
   only shows while the key is held. Cost: stream open takes ~100-200 ms, so
   speech in the first instant after keydown can clip — hold, breathe, speak.
 - A second hold during a long transcription queues behind it on the Queue
+- Every PortAudio call is queued onto one dedicated audio thread, so start
+  and stop are asynchronous and the live stream changes hands between that
+  thread and the run loop — see Serialized audio thread below
 
 ## macOS permissions (manual, one-time)
 
@@ -108,26 +128,36 @@ Settings instead of sitting mute.
 
 - **Secure input**: password fields, `sudo` prompts, and Keychain dialogs
   enable secure event input, which blocks event taps process-wide — both the
-  hotkey and the synthetic paste stop working, by OS design. If the hotkey
-  ever stops responding globally, a stuck secure-input session (usually a
-  terminal) is the first suspect.
+  hotkey and the synthetic paste stop working, by OS design. Since 1.7.9 the
+  paste path checks for it (`IsSecureEventInputEnabled` through Carbon, plus
+  a live Accessibility preflight) and names the holding process in the log
+  rather than failing silently; the transcript is left on the clipboard and
+  the pill says "Not pasted — ⌘V". A stuck secure-input session (usually a
+  terminal with Secure Keyboard Entry) is still the first suspect when the
+  hotkey itself stops responding.
 - Hugging Face unreachable on first run → mlx-whisper raises; retry when
   online (one-time download)
 - No microphone permission or device held exclusively by another app →
   stream open raises per-hold; caught and printed with the reason, process
   keeps running
 - Whisper hallucinating on silence (the classic "thank you for watching") →
-  mitigated only by the 0.3 s minimum. A `no_speech_prob` threshold was cut
-  from v1: tuning a magic number before observing a false positive risks
-  silently eating real quiet speech, which is worse.
+  two floors, both set from observed failures rather than guessed in advance,
+  which is why v1 cut its `no_speech_prob` threshold. `MIN_SECONDS` drops
+  accidental taps and `MIN_PEAK` drops audio too quiet to be speech (0.025:
+  real dictation peaks at 0.05+, the hallucinations that reached users all
+  sat under 0.02). `looks_hallucinated()` then catches the repetition loops
+  that clear both — one word emitted hundreds of times — before they reach
+  the clipboard.
 - Every event prints one console line, so "nothing happened" is always
   distinguishable from "hotkey not firing"
 
 ## Execution plan
 
-1. Scaffold `~/ws-my-projects/local-apps/sotto/`: `sotto.py`,
-   `run.sh`, `requirements.txt`, `README.md`
-2. `python3 -m venv .venv` and install `mlx-whisper sounddevice pynput`
+The original v1 plan, kept as the record of what was verified before the app
+existed. For today's setup see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+1. Scaffold the repo: `sotto.py`, `run.sh`, `requirements.txt`, `README.md`
+2. `python3 -m venv .venv` and `pip install -r requirements.txt`
 3. Verify the model end-to-end without a mic: generate a spoken wav with
    macOS `say`, load it, run it through the same `transcribe()` call the app
    uses, and check the text matches the input phrase
@@ -168,11 +198,12 @@ bundle (Info.plist + zsh launcher that execs the venv python) in
 - A native Swift rewrite (WhisperKit) is the "real product" path but 10× the
   code for the same v1 behavior
 
-`LSUIElement` makes it a menu-bar-only app (no Dock icon). rumps provides the
-status item: state glyph (… / 🎙 / 🔴), Open Log, Quit. A 0.3 s rumps.Timer
-polls the state variable because AppKit UI must only be touched from the main
-thread. All logs go to `~/Library/Logs/Sotto.log` as well as stdout, since a
-double-clicked app has no terminal.
+`LSUIElement` makes it a menu-bar-only app (no Dock icon). The status item is
+built directly on `NSStatusBar` — rumps provided it until 1.1.0, where its
+item turned out to be invisible when the app was launched from a bundle — and
+a 0.3 s `NSTimer` polls the state variable, because AppKit UI must only be
+touched from the main thread. All logs go to `~/Library/Logs/Sotto.log` as
+well as stdout, since a double-clicked app has no terminal.
 
 ### Hotkey via NSEvent monitors (v1.1.1)
 
@@ -183,3 +214,49 @@ Accessibility — one less grant for users (and how commercial dictation apps
 avoid the Input Monitoring prompt). Caveat: with Accessibility missing the
 global monitor silently never fires, so the startup preflight check is the
 only signal.
+
+### Serialized audio thread (v1.7.5)
+
+CoreAudio's open/stop can block indefinitely on a HAL mutex held by another
+audio client — observed as a full main-thread deadlock with Wispr Flow running
+— so every PortAudio call is queued onto one dedicated thread (`audio_control`).
+The hotkey and the UI stay alive whatever the audio stack does, and serializing
+the ops means a wedged device pins that one thread instead of leaking a new one
+per recording. `audio_wedged()` reports an op stuck over 5 s, and the overlay
+arms a watchdog so a pill can never outlive a pipeline that never reports back.
+
+Because start and stop are now asynchronous, ownership of the live stream moves
+between the run loop and the audio thread. `recording_lock` guards that handoff:
+without it a key release could land between `_open_stream`'s "is this recording
+still current?" check and its publish of the stream, leaving a stream nobody
+closed and the microphone live.
+
+### Hands-free double-tap (v1.7.4 – v1.7.6)
+
+A double-tap locks recording until the next tap. Three constants carry it, each
+paid for by a bug: a press under `TAP_MAX_SECONDS` (0.45 s) counts as a tap; two
+taps within `DOUBLE_TAP_SECONDS` make a pair (0.9 s — 0.5 s was tighter than a
+natural double-tap and real attempts silently missed); and `LOCK_GRACE_SECONDS`
+ignores the tail of the locking double-tap, which otherwise cancelled the lock
+it had just engaged.
+
+The first tap's stop is *deferred* by one double-tap window rather than executed.
+Tearing the stream down and reopening it ~60 ms later handed back a stream that
+captured silence — PortAudio had not finished releasing the device — and Whisper
+hallucinated fluent paragraphs from that noise floor.
+
+### Clipboard restore (v1.7.8)
+
+The v1 non-goal above stood until 1.7.8: dictation overwrote the clipboard,
+and losing whatever you had copied is a real cost paid on every dictation. It is now restored, and each of the original objections is met
+head-on rather than waived.
+
+The timing race — restore too early and a slow app pastes the *old* clipboard —
+is handled by waiting `CLIPBOARD_RESTORE_SECONDS` (1.5 s) after the keystroke,
+and by checking `changeCount` before writing: a clipboard the user changed in
+the meantime is left alone, so the failure mode is "your transcript stays on
+the clipboard", never "your copy is gone". The transcript is also declared with
+`org.nspasteboard.TransientType`, the convention that asks clipboard managers
+not to archive it — a dictated transcript is private more often than a normal
+copy. Non-text content survives because the restore goes through
+`NSPasteboard` for a string instead of round-tripping `pbpaste`.

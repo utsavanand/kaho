@@ -154,10 +154,12 @@ silent hold can still produce one of these.
 <details>
 <summary><strong>Why did my clipboard change?</strong></summary>
 
-Sotto pastes by writing the transcript to the clipboard and sending
-<kbd>⌘V</kbd>. Overwriting is deliberate — restoring the old clipboard has a
-race that can paste stale content into slow apps (see
-[DESIGN.md](DESIGN.md)). Clipboard managers will record every dictation.
+It changes for about a second and a half, then changes back. Sotto pastes by
+writing the transcript to the clipboard and sending <kbd>⌘V</kbd>, then puts
+your previous clipboard back — unless you copied something else in the
+meantime, in which case yours wins and the transcript is left alone. The
+transcript is marked transient, so clipboard managers that honour that flag
+(Maccy, Paste, Raycast) will not archive your dictations.
 </details>
 
 <details>
