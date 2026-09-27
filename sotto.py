@@ -210,6 +210,15 @@ SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_
 jobs = queue.Queue()
 audio_ops = queue.Queue()  # serialized PortAudio operations, see audio_control()
 audio_op_started = None  # monotonic start of the op in flight, None when idle
+# Guards the recording handoff — state, record_buf, stream, locked — between the
+# main run loop (hotkey, UI) and the audio thread. Without it _open_stream's
+# check-then-publish raced a key release: stop_recording read `stream` while it
+# was still None, so the stream published an instant later belonged to nobody,
+# was never closed, and left the microphone live until the next recording
+# overwrote the reference. Held only around these assignments, never across a
+# PortAudio call — those can block for seconds, which is why they run on the
+# audio thread in the first place.
+recording_lock = threading.Lock()
 record_buf = None  # per-recording frame list; identity marks the active recording
 stream = None
 monitors = []
@@ -399,9 +408,14 @@ def start_recording():
             "audio apps (e.g. another dictation tool) or relaunch Sotto."
         )
         return
-    state = "recording"
-    buf = []
-    record_buf = buf
+    with recording_lock:
+        # Re-checked under the lock: the audio thread also moves `state` back to
+        # "ready" when a mic open fails
+        if state != "ready":
+            return
+        state = "recording"
+        buf = []
+        record_buf = buf
     overlay.show()
     audio_ops.put(lambda: _open_stream(buf))
 
@@ -419,14 +433,24 @@ def _open_stream(buf):
         s.start()
     except sd.PortAudioError as e:
         log(f"mic open failed: {e}\n(System Settings > Privacy & Security > Microphone)")
-        if buf is record_buf and state == "recording":
-            state = "ready"
-            locked = False
+        with recording_lock:
+            current = buf is record_buf and state == "recording"
+            if current:
+                state = "ready"
+                locked = False
+        if current:
             AppHelper.callAfter(overlay.hide)
         return
-    if buf is record_buf and state == "recording":
-        stream = s
-    else:
+    # Publishing under the same lock stop_recording holds is what keeps the
+    # shutdown owned by exactly one side: either stop_recording already took
+    # this recording down — it then passed s=None to _finish_recording and we
+    # close the stream here — or it has yet to run and will find the stream in
+    # `stream` and close it there.
+    with recording_lock:
+        current = buf is record_buf and state == "recording"
+        if current:
+            stream = s
+    if not current:
         # Released before the stream finished opening — discard
         _shutdown_stream(s)
 
@@ -447,18 +471,21 @@ def _shutdown_stream(s):
 
 def stop_recording():
     global state, stream, record_buf
-    if state != "recording":
-        return
-    state = "ready"
+    with recording_lock:
+        if state != "recording":
+            return
+        state = "ready"
+        # `stream` is still None when the open is in flight; _open_stream then
+        # sees the recording is gone and closes its own stream
+        s, buf = stream, record_buf
+        stream = None
+        record_buf = None
     # The pill stays up: the worker switches it to "Transcribing…" and hides
     # it when the paste lands. _finish_recording hides it for dropped audio,
     # and the watchdog below covers the case where the audio thread is wedged
     # in CoreAudio and _finish_recording never runs at all.
     overlay.setPhase_("transcribing")
     overlay.armWatchdog()
-    s, buf = stream, record_buf
-    stream = None
-    record_buf = None
     audio_ops.put(lambda: _finish_recording(s, buf))
 
 
