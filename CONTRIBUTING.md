@@ -18,9 +18,11 @@ to your terminal in dev mode, separately from the Sotto.app grants.
 - Test the full loop by voice: dictate twice in a row (verifies the hotkey
   survives a completed transcription — the event-tap regression in DESIGN.md)
 - Read [DESIGN.md](DESIGN.md) first — several "obvious cleanups" are
-  deliberately avoided and documented there, e.g. switching to pynput's
-  `GlobalHotKeys` (broken alt/ctrl matching on macOS) or transcribing on the
-  listener callback (stalls the macOS event tap)
+  deliberately avoided and documented there, e.g. replacing the NSEvent
+  monitors with a CGEventTap (costs every user the Input Monitoring grant),
+  transcribing on the event callback (stalls the macOS event tap), or
+  stopping the audio stream between the halves of a double-tap (the reopened
+  stream records silence)
 
 ## Scope
 
