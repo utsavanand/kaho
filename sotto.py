@@ -493,35 +493,41 @@ def stop_recording():
     audio_ops.put(lambda: _finish_recording(s, buf))
 
 
+def _audio_or_drop_reason(buf):
+    """Returns (audio, log line), exactly one of which is None.
+
+    Either the recording is usable and the line describes it, or it is dropped
+    and the line says why — every case ends with one log call and one hide, so
+    a future rule cannot forget either.
+    """
+    if not buf:
+        return None, "dropped: no audio captured"
+    audio = np.concatenate(buf)[:, 0]
+    secs = len(audio) / SAMPLE_RATE
+    if secs < MIN_SECONDS:
+        return None, f"dropped: {secs:.2f}s is under the {MIN_SECONDS}s minimum"
+    peak = float(np.abs(audio).max())
+    if peak < 1e-6:
+        return None, (
+            f"dropped: {secs:.1f}s of pure silence — macOS delivered no mic signal "
+            "(check System Settings > Privacy & Security > Microphone)"
+        )
+    if peak < MIN_PEAK:
+        return None, f"dropped: {secs:.1f}s too quiet to be speech (peak {peak:.3f})"
+    return audio, f"recorded {secs:.1f}s on '{input_name}' (peak {peak:.3f}), transcribing..."
+
+
 def _finish_recording(s, buf):
     if s is not None:
         t0 = time.monotonic()
         _shutdown_stream(s)
         if time.monotonic() - t0 > 3:
             log("audio device was slow to release — another audio app may be fighting for the mic")
-    if not buf:
-        log("dropped: no audio captured")
+    audio, message = _audio_or_drop_reason(buf)
+    log(message)
+    if audio is None:
         AppHelper.callAfter(overlay.hide)
         return
-    audio = np.concatenate(buf)[:, 0]
-    secs = len(audio) / SAMPLE_RATE
-    if secs < MIN_SECONDS:
-        log(f"dropped: {secs:.2f}s is under the {MIN_SECONDS}s minimum")
-        AppHelper.callAfter(overlay.hide)
-        return
-    peak = float(np.abs(audio).max())
-    if peak < 1e-6:
-        log(
-            f"dropped: {secs:.1f}s of pure silence — macOS delivered no mic signal "
-            "(check System Settings > Privacy & Security > Microphone)"
-        )
-        AppHelper.callAfter(overlay.hide)
-        return
-    if peak < MIN_PEAK:
-        log(f"dropped: {secs:.1f}s too quiet to be speech (peak {peak:.3f})")
-        AppHelper.callAfter(overlay.hide)
-        return
-    log(f"recorded {secs:.1f}s on '{input_name}' (peak {peak:.3f}), transcribing...")
     jobs.put(audio)
 
 
