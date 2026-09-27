@@ -2,11 +2,13 @@
 locally transcribed text is pasted into the focused app. See DESIGN.md."""
 
 import collections
+import ctypes
 import json
 import multiprocessing
 import os
 import platform
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -201,7 +203,7 @@ DICTIONARY_TEMPLATE = """\
 # Kubernetes
 """
 TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠️"}
-APP_VERSION = "1.7.8"  # keep in sync with CFBundleShortVersionString in install.sh
+APP_VERSION = "1.7.9"  # keep in sync with CFBundleShortVersionString in install.sh
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
@@ -683,6 +685,46 @@ TRANSIENT_TYPES = (
 )
 
 
+def secure_input_holder():
+    """Best-effort name of the process holding secure input. Failure path
+    only — ioreg is slow, and the name just makes the log line actionable."""
+    try:
+        out = subprocess.run(
+            ["ioreg", "-l", "-w", "0"], capture_output=True, text=True, timeout=4, check=False
+        ).stdout
+        m = re.search(r'"kCGSSessionSecureInputPID"=(\d+)', out)
+        if m:
+            name = subprocess.run(
+                ["ps", "-p", m.group(1), "-o", "comm="],
+                capture_output=True, text=True, timeout=2, check=False,
+            ).stdout.strip()
+            return os.path.basename(name) or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def paste_blocked_reason():
+    """Why a synthetic Cmd+V would go nowhere, or None if it should land.
+
+    Checked per paste, not just at startup: Accessibility can be revoked
+    while running, and secure input comes and goes with password prompts.
+    """
+    if not Quartz.CGPreflightPostEventAccess():
+        return (
+            "Accessibility permission is missing — enable Sotto in "
+            "System Settings > Privacy & Security > Accessibility"
+        )
+    if _carbon.IsSecureEventInputEnabled():
+        holder = secure_input_holder()
+        held = f" (held by {holder})" if holder else ""
+        return (
+            f"secure input is active{held} — a password prompt or a terminal "
+            "with Secure Keyboard Entry is blocking synthetic keystrokes"
+        )
+    return None
+
+
 def paste(text):
     """Paste the transcript, then hand the clipboard back.
 
@@ -743,9 +785,19 @@ def worker():
                 AppHelper.callAfter(overlay.setPhase_, "rewriting")
                 text = rewrite(text, mode) or text
             if text:
-                paste(text)
-                append_history(text)
-                AppHelper.callAfter(overlay.finish)
+                reason = paste_blocked_reason()
+                if reason is None:
+                    paste(text)
+                    append_history(text)
+                    AppHelper.callAfter(overlay.finish)
+                else:
+                    # Leave the transcript on the clipboard (no restore) so
+                    # one manual Cmd+V recovers the dictation, and say so on
+                    # the pill — a silent no-op here reads as a dead app.
+                    set_clipboard(text)
+                    append_history(text)
+                    log(f"paste blocked: {reason} — transcript is on the clipboard")
+                    AppHelper.callAfter(overlay.blocked)
             else:
                 AppHelper.callAfter(overlay.hide)
             log(f"[{time.monotonic() - t0:.2f}s] {text or '(empty transcription, nothing pasted)'}")
@@ -855,7 +907,15 @@ PHASE_LABELS = {
     "transcribing": "Transcribing…",
     "rewriting": "Rewriting…",
     "done": "Pasted",
+    "blocked": "Not pasted — ⌘V",
 }
+
+# Secure input (password fields, Terminal's "Secure Keyboard Entry", sudo
+# prompts) silently swallows synthetic keystrokes: transcription succeeds,
+# the clipboard fills, and nothing appears — which reads as "Sotto is
+# broken". Carbon exposes the state so we can say so instead.
+_carbon = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
+_carbon.IsSecureEventInputEnabled.restype = ctypes.c_bool
 
 
 class LevelView(AppKit.NSView):
@@ -917,11 +977,12 @@ def draw_elapsed(view, bounds):
 def draw_phase(phase, ticks, bounds):
     # Three dots cycling left-to-right: cheap to draw, reads as "working"
     # without a spinner's implication of a known duration
+    r, g, b = (1.0, 0.72, 0.30) if phase == "blocked" else (0.48, 0.64, 0.97)
     for i in range(3):
-        alpha = 0.9 if phase == "done" else 0.25 + 0.65 * (
+        alpha = 0.9 if phase in ("done", "blocked") else 0.25 + 0.65 * (
             0.5 + 0.5 * np.sin(ticks * 0.28 - i * 0.9)
         )
-        AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.48, 0.64, 0.97, alpha).setFill()
+        AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha).setFill()
         AppKit.NSBezierPath.bezierPathWithOvalInRect_(
             ((14 + i * 11, bounds.size.height / 2 - 3), (6, 6))
         ).fill()
@@ -1037,6 +1098,16 @@ class Overlay(AppKit.NSObject):
         if self.panel.isVisible():
             log("overlay timed out waiting for the pipeline — hiding it")
             self.hide()
+
+    def blocked(self):
+        """Warn that the transcript did not paste. Lingers longer than the
+        "Pasted" flash — this one the user genuinely needs to read."""
+        self.setPhase_("blocked")
+        if self.done_timer:
+            self.done_timer.invalidate()
+        self.done_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            3.5, self, "hideTimer:", None, False
+        )
 
     def finish(self):
         """Flash 'Pasted' briefly, then hide — a silent disappearance makes a

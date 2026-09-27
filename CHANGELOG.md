@@ -1,4 +1,15 @@
 # Changelog
+## 1.7.9 — 2026-09-27
+
+- A blocked paste now says so instead of silently doing nothing. When
+  Accessibility has been revoked, or a password prompt / terminal with
+  Secure Keyboard Entry is holding secure input, synthetic keystrokes go
+  nowhere — transcription succeeded, the clipboard filled, and the app
+  looked dead. The pill now shows an amber "Not pasted — ⌘V", the log
+  names the process holding secure input, and the transcript stays on
+  the clipboard (no restore) so one manual paste recovers it. Checked
+  per paste, not just at startup.
+
 ## 1.7.8 — 2026-09-26
 
 - Dictation no longer destroys your clipboard. Sotto saves what you had
