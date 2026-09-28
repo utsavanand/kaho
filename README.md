@@ -12,7 +12,8 @@
     <a href="LICENSE"><img src="https://img.shields.io/github/license/utsavanand/sotto" alt="License"></a>
   </p>
 
-  <p><a href="https://sotto.utsava.xyz"><strong>sotto.utsava.xyz</strong></a></p>
+  <p><a href="https://sotto.utsava.xyz"><strong>sotto.utsava.xyz</strong></a>
+  · <a href="https://github.com/utsavanand/sotto/releases/download/v1.7.8/sotto-explainer.mp4">3-minute explainer video</a></p>
 </div>
 
 Hold a key anywhere on macOS, speak, release — your words are typed into
