@@ -12,12 +12,12 @@
 #   3. xcrun notarytool store-credentials sotto-notary \
 #        --apple-id "you@example.com" --team-id "TEAMID" --password "app-specific-password"
 #
-# Then:  ./packaging/release.sh 1.7.3
+# Then:  ./packaging/release.sh 2.0.0
 
 set -euo pipefail
 
 VERSION="${1:-}"
-[[ -n "$VERSION" ]] || { echo "usage: $0 <version>   e.g. $0 1.7.3"; exit 1; }
+[[ -n "$VERSION" ]] || { echo "usage: $0 <version>   e.g. $0 2.0.0"; exit 1; }
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$SRC/build-release"
