@@ -1127,6 +1127,10 @@ class Overlay(AppKit.NSObject):
             False,
         )
         panel.setOpaque_(False)
+        # The default window shadow is drawn for the square panel frame, not
+        # the rounded pill inside it — on a light background it reads as a
+        # faint rectangular border around the pill
+        panel.setHasShadow_(False)
         panel.setBackgroundColor_(AppKit.NSColor.clearColor())
         panel.setLevel_(AppKit.NSScreenSaverWindowLevel)
         panel.setIgnoresMouseEvents_(True)
