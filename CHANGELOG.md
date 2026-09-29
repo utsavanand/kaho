@@ -1,4 +1,36 @@
 # Changelog
+## 2.2.0 — 2026-10-01
+
+- Transcription moves from Whisper large-v3-turbo (mlx-whisper) to
+  Qwen3-ASR 1.7B 8-bit (mlx-audio). Benchmarked on an M4 Max over 109
+  clips, both with the dictionary:
+
+  | | Whisper | Qwen3-ASR 1.7B |
+  |---|---|---|
+  | median latency, 0-5 s clip | 0.88 s | 0.30 s |
+  | median latency, 5-10 s clip | 0.98 s | 0.41 s |
+  | median latency, 20-30 s clip | 1.88 s | 1.97 s |
+  | WER, LibriSpeech clean / other | 1.5% / 1.6% | 1.3% / 0.6% |
+  | WER, jargon dictations | 4.4% | 3.4% |
+  | dictionary terms spelled right | 87% | 87% |
+
+  Most dictations are short, which is where the gain is; past ~20 s the
+  two are even, because Whisper padded every clip to 30 s while this
+  model's cost grows with length. Parakeet v3 was faster still but takes
+  no vocabulary, so it spelled names wrong (44% of terms). Costs: a
+  ~2.3 GB first download instead of ~1.6 GB, ~1.1 GB more memory, and a
+  slower first load (about 4 s).
+- The dictionary is passed to the model as hotwords, and a new spelling
+  pass fixes close misses afterwards: the model still wrote "Soto" for
+  "Sotto" (the old name) in 8 of 12 clips despite the hotword. A word is replaced only
+  when it is within one letter of a term's length, at least 85% similar,
+  not an English word (or a regular inflection of one), and capitalized as
+  the name the model took it for, so "motto", "a swift reply" and "the
+  postmen came" are left alone.
+- Dependencies shrink: dropping mlx-whisper removes torch, numba,
+  llvmlite, sympy and tiktoken from the lock; mlx-audio adds itself and
+  miniaudio.
+
 ## 2.1.0 — 2026-09-30
 
 - Escape cancels a dictation. During recording the audio is dropped and

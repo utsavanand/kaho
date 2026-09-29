@@ -1,6 +1,6 @@
 """Unit tests for the parts of Kaho that do not need a Mac.
 
-kaho.py imports AppKit, Quartz, sounddevice, mlx_whisper, huggingface_hub and
+kaho.py imports AppKit, Quartz, sounddevice, mlx_audio, huggingface_hub and
 numpy at module scope, so importing it normally requires an Apple Silicon Mac
 with the app's venv installed. Stubbing those six in sys.modules first makes the
 pure logic testable anywhere, including CI — which is the point: the tap state
@@ -79,7 +79,9 @@ def _install_stubs():
         ("AppKit", appkit),
         ("Quartz", _Stub("Quartz")),
         ("sounddevice", sounddevice),
-        ("mlx_whisper", _Stub("mlx_whisper")),
+        ("mlx_audio", _Stub("mlx_audio")),
+        ("mlx_audio.stt", _Stub("mlx_audio.stt")),
+        ("mlx_audio.stt.utils", _Stub("mlx_audio.stt.utils")),
         ("huggingface_hub", _Stub("huggingface_hub")),
         ("numpy", REAL_NUMPY or _Stub("numpy")),
         ("PyObjCTools", pyobjctools),
@@ -417,18 +419,12 @@ class TestDictionary(KahoTestCase):
         )
         self.assertEqual(kaho.read_dictionary(), ["Duckterm", "Kubernetes"])
 
-    def test_the_term_cap_protects_whispers_prompt_window(self):
+    def test_the_term_cap_bounds_the_prompt(self):
         terms = [f"term{i}" for i in range(kaho.DICTIONARY_MAX_TERMS + 5)]
         pathlib.Path(kaho.DICTIONARY_PATH).write_text("\n".join(terms))
         read = kaho.read_dictionary()
         self.assertEqual(len(read), kaho.DICTIONARY_MAX_TERMS)
-        self.assertTrue(any("224 tokens" in m for m in self.logged))
-
-    def test_the_prompt_reads_as_a_sentence(self):
-        # A bare list of nouns biases Whisper toward transcribing lists
-        prompt = kaho.dictionary_prompt(["Kaho", "Duckterm"])
-        self.assertTrue(prompt.endswith("."))
-        self.assertIn("Kaho, Duckterm", prompt)
+        self.assertTrue(any("using the first" in m for m in self.logged))
 
     def test_the_template_is_created_once_and_never_overwritten(self):
         kaho.ensure_dictionary_file()
@@ -438,6 +434,58 @@ class TestDictionary(KahoTestCase):
         path.write_text("Mine\n")
         kaho.ensure_dictionary_file()
         self.assertEqual(path.read_text(), "Mine\n")
+
+
+class TestRespell(KahoTestCase):
+    """Near-misses from the benchmark, and the real words that must survive."""
+
+    TERMS = ("Sotto", "Siobhan", "PostgreSQL", "Postman", "Swift")
+
+    def setUp(self):
+        super().setUp()
+        # CI's Linux runner has no /usr/share/dict/words; use a known list
+        # shaped like the macOS one — base forms, no "postmen" or "motions"
+        words = pathlib.Path(self.tmp.name) / "words"
+        words.write_text("postman\nswift\nmotto\nmotion\nreview\nthe\n")
+        self.enterContext(mock.patch.object(kaho, "ENGLISH_WORDS_PATH", str(words)))
+        self.enterContext(mock.patch.object(kaho, "_english_words", None))
+
+    def respell(self, text):
+        return kaho.respell(text, self.TERMS)
+
+    def test_a_near_miss_takes_the_dictionary_spelling(self):
+        self.assertEqual(
+            self.respell("Soto runs on the GPU through MLX."), "Sotto runs on the GPU through MLX."
+        )
+
+    def test_a_possessive_keeps_its_suffix(self):
+        self.assertEqual(self.respell("Soto's pill is back."), "Sotto's pill is back.")
+
+    def test_an_exact_match_takes_the_dictionary_casing(self):
+        self.assertEqual(self.respell("the PostgresQL pool"), "the PostgreSQL pool")
+
+    def test_two_words_that_join_into_a_term_are_merged(self):
+        self.assertEqual(self.respell("move it into Postgre SQL now"), "move it into PostgreSQL now")
+
+    def test_a_mishearing_too_far_from_the_term_is_left_alone(self):
+        # "Savan" for "Siobhan" was a real benchmark miss — too different to fix safely
+        self.assertEqual(self.respell("Can you ask Savan?"), "Can you ask Savan?")
+
+    def test_a_lowercase_word_is_not_claimed_by_a_capitalized_term(self):
+        # "postmen" scores 0.86 against "Postman" and is missing from the word
+        # list; that the model did not capitalize it is what keeps it
+        self.assertEqual(self.respell("the postmen arrived"), "the postmen arrived")
+
+    def test_the_word_list_covers_regular_inflections(self):
+        self.assertTrue(kaho.is_english("motions"))
+        self.assertTrue(kaho.is_english("Reviewed"))
+        self.assertFalse(kaho.is_english("Soto"))
+
+    def test_a_real_word_that_matches_a_term_keeps_its_case(self):
+        self.assertEqual(self.respell("a swift reply"), "a swift reply")
+
+    def test_no_dictionary_means_no_changes(self):
+        self.assertEqual(kaho.respell("Soto runs", []), "Soto runs")
 
 
 class TestHistory(KahoTestCase):
@@ -809,19 +857,22 @@ class TestConstantsAgree(unittest.TestCase):
 
 
 class TestLanguage(KahoTestCase):
-    """Whisper mis-detects the language on short audio; pinning it is the cure."""
+    """Detection can guess wrong on short audio; pinning the language is the cure."""
 
     def transcribe_kwargs(self):
+        asr = self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
+        asr.generate.return_value.text = ""
         kaho.transcribe(mock.MagicMock(), use_dictionary=False)
-        return kaho.mlx_whisper.transcribe.call_args.kwargs
+        return asr.generate.call_args.kwargs
 
-    def test_auto_lets_whisper_detect(self):
+    def test_auto_lets_the_model_detect(self):
         kaho.settings["language"] = "auto"
         self.assertIsNone(self.transcribe_kwargs()["language"])
 
-    def test_a_chosen_language_is_passed_through(self):
+    def test_a_chosen_language_is_passed_by_name(self):
+        # Qwen3-ASR matches language names, not codes: "en" would be ignored
         kaho.settings["language"] = "en"
-        self.assertEqual(self.transcribe_kwargs()["language"], "en")
+        self.assertEqual(self.transcribe_kwargs()["language"], "English")
 
     def test_it_is_saved_and_reloaded(self):
         kaho.apply_language("hi")
@@ -872,7 +923,8 @@ class TestCancel(KahoTestCase):
         """
         kaho.jobs.put((mock.MagicMock(), 0))
         kaho.job_generation = 1
-        kaho.mlx_whisper.transcribe.return_value = {"text": "unwanted text"}
+        self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
+        kaho.asr.generate.return_value.text = "unwanted text"
 
         with mock.patch.object(kaho, "paste") as paste, \
              mock.patch.object(kaho, "append_history") as history:
@@ -884,7 +936,8 @@ class TestCancel(KahoTestCase):
 
     def test_an_uncancelled_job_still_pastes(self):
         kaho.jobs.put((mock.MagicMock(), 0))
-        kaho.mlx_whisper.transcribe.return_value = {"text": "wanted text"}
+        self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
+        kaho.asr.generate.return_value.text = "wanted text"
 
         with mock.patch.object(kaho, "paste") as paste, \
              mock.patch.object(kaho, "append_history"), \

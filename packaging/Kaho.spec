@@ -29,7 +29,9 @@ VERSION = os.environ.get("KAHO_VERSION", _app_version)
 _collected_datas, _collected_binaries, _collected_hidden = [], [], []
 # transformers resolves AutoTokenizer through a lazy-module shim, so its
 # submodules are invisible to static analysis too.
-for _pkg in ("mlx", "mlx_whisper", "mlx_lm", "sounddevice", "transformers", "tokenizers"):
+# mlx_audio picks the model class by importlib from the checkpoint's
+# model_type, so qwen3_asr is only reachable through that sweep too.
+for _pkg in ("mlx", "mlx_audio", "mlx_lm", "sounddevice", "transformers", "tokenizers"):
     _d, _b, _h = collect_all(_pkg)
     _collected_datas += _d
     _collected_binaries += _b
@@ -40,7 +42,7 @@ a = Analysis(
     pathex=[],
     binaries=_collected_binaries,
     datas=[("../assets/Kaho.icns", ".")] + _collected_datas,
-    # mlx_whisper and mlx_lm resolve model code lazily, so PyInstaller's static
+    # mlx_audio and mlx_lm resolve model code lazily, so PyInstaller's static
     # analysis misses these. mlx's C extension imports mlx._reprlib_fix and
     # friends at init time — there is no upstream PyInstaller hook for mlx, so
     # its submodules have to be named explicitly or the app dies on first
@@ -53,11 +55,9 @@ a = Analysis(
         "mlx.extension",
         "mlx._reprlib_fix",
         "mlx.__array_api_info",
-        "mlx_whisper",
-        "mlx_whisper.audio",
-        "mlx_whisper.decoding",
-        "mlx_whisper.load_models",
-        "mlx_whisper.transcribe",
+        "mlx_audio",
+        "mlx_audio.stt.utils",
+        "mlx_audio.stt.models.qwen3_asr",
         "mlx_lm",
         "mlx_lm.models",
         "mlx_lm.tokenizer_utils",
@@ -74,6 +74,10 @@ a = Analysis(
         "transformers.tokenization_utils",
         "transformers.tokenization_utils_base",
         "transformers.tokenization_utils_fast",
+        # Qwen3-ASR's loader imports transformers' WhisperFeatureExtractor for
+        # its log-mel frontend — the model is not Whisper, the frontend is
+        "transformers.models.whisper",
+        "transformers.models.whisper.feature_extraction_whisper",
         "tokenizers",
         "sounddevice",
         "huggingface_hub",
@@ -81,19 +85,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # Excluding torch submodules looks like free size savings and is not:
-    # torch.utils.data.dataloader imports torch.distributed unconditionally,
-    # so excluding it broke the whole torch -> transformers -> AutoTokenizer
-    # chain, surfacing three layers later as a bogus "AutoTokenizer" error.
-    # Only exclude packages nothing in the import graph reaches.
-    # torch is declared by mlx-whisper but never reached: it lives only in
-    # torch_whisper.py, a conversion module nothing imports. ~530 MB saved.
-    #
-    # numba and scipy CANNOT be excluded despite only being used for word-level
-    # timestamps we never request — transcribe.py imports timing.py at module
-    # load, so the app dies with ModuleNotFoundError on startup. Tested.
+    # Only exclude packages nothing in the import graph reaches. torch used to
+    # head this list: mlx-whisper declared it, and it is no longer installed
+    # at all since 2.2.0 replaced mlx-whisper with mlx-audio.
     excludes=[
-        "torch",
         "tkinter",
         "matplotlib",
         "PIL",

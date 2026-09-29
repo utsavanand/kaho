@@ -20,10 +20,12 @@ detail.
 - Hold-to-talk dictation that works in any app (editor, browser, terminal, Slack)
 - Fully local: audio never leaves the machine, works offline
 - Fast enough to feel like typing: < 1.5 s **end-to-end** (key-release to text
-  visible) in steady state on this machine (M4 Max). Whisper pads every input
-  to a 30 s window, so short and long utterances cost nearly the same; the
-  first inference after startup is much slower (Metal warmup), which is why
-  startup runs a throwaway transcribe on a zero buffer.
+  visible) in steady state on this machine (M4 Max). Transcription cost grows
+  with the length of the dictation (about 0.2 s for 5 s of speech, 0.5 s for
+  14 s); Whisper, before 2.2.0, padded every input to a 30 s window, so short
+  and long cost nearly the same. The first inference after startup is much
+  slower (Metal warmup), which is why startup runs a throwaway transcribe on a
+  zero buffer.
 
 ## Non-goals (v1)
 
@@ -50,14 +52,18 @@ detail.
 ## Stack
 
 - Python 3.13, single process, one file (`kaho.py`) + `run.sh`
-- **Model**: `mlx-community/whisper-large-v3-turbo` via `mlx-whisper`.
-  MLX runs on the M4 Max GPU; steady-state inference for one utterance lands
-  well under a second there (weights ~1.6 GB; resident footprint is higher
-  under load once activations and KV cache are counted — irrelevant at 36 GB).
-  Model downloads from Hugging Face on first run, then cached in
-  `~/.cache/huggingface`. Inference itself is offline.
+- **Model**: `mlx-community/Qwen3-ASR-1.7B-8bit` via `mlx-audio`, since
+  2.2.0. It replaced `whisper-large-v3-turbo` (via `mlx-whisper`) after a
+  benchmark on this machine: 0.30 s vs 0.88 s median on 0-5 s clips, 1.3% vs
+  1.5% WER on LibriSpeech clean, 3.4% vs 4.4% on jargon, both with the
+  dictionary. Parakeet v3 was faster still but takes no vocabulary, so it was
+  out. Dictionary terms go in as `hotwords`; the model still misspells some
+  (it wrote "Soto" for the old name, Sotto), so `respell()` corrects close misses afterwards. Weights ~2.3 GB,
+  about 1.1 GB more resident than Whisper. Model downloads from Hugging Face
+  on first run, then cached in `~/.cache/huggingface`. Inference itself is
+  offline.
 - **Audio capture**: `sounddevice` (bundles PortAudio), 16 kHz mono float32 —
-  Whisper's native input format, no resampling or ffmpeg needed
+  the model's native input format, no resampling or ffmpeg needed
 - **Hotkey**: `NSEvent` global + local monitors for `flagsChanged`, installed
   on the main run loop (`install_hotkey_monitors`). Deliberately not a
   `CGEventTap`, which would additionally require the Input Monitoring grant,
@@ -138,12 +144,13 @@ with run.sh, the grants attach to the launching terminal instead of Kaho.
   the pill says "Not pasted — ⌘V". A stuck secure-input session (usually a
   terminal with Secure Keyboard Entry) is still the first suspect when the
   hotkey itself stops responding.
-- Hugging Face unreachable on first run → mlx-whisper raises; retry when
+- Hugging Face unreachable on first run → the model download raises; retry when
   online (one-time download)
 - No microphone permission or device held exclusively by another app →
   stream open raises per-hold; caught and printed with the reason, process
   keeps running
-- Whisper hallucinating on silence (the classic "thank you for watching") →
+- The speech model hallucinating on silence (observed with Whisper, the
+  classic "thank you for watching"; the floors were kept for Qwen3-ASR) →
   two floors, both set from observed failures rather than guessed in advance,
   which is why v1 cut its `no_speech_prob` threshold. `MIN_SECONDS` drops
   accidental taps and `MIN_PEAK` drops audio too quiet to be speech (0.025:
