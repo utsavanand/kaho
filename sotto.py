@@ -157,6 +157,23 @@ REWRITE_PROMPTS = {
         "Transcript:\n{text}"
     ),
 }
+# Whisper often returns a transcript Clean up would leave untouched, and
+# generating it anyway costs 0.7-1.4 s. One forward pass reads how likely the
+# first answer token is A vs B: a decision, not generation. The direction
+# matters — asked "does it need cleanup?" Qwen3-4B answered yes to every
+# transcript, clean or not; asked this way round it separated 15 clean and 9
+# messy made-up dictations at 1.00 vs 0.00.
+CLEAN_CHECK_PROMPT = (
+    "Is this dictated transcript already clean enough to paste exactly as-is: "
+    "no filler words (um, uh, like, you know), no false starts or "
+    "self-corrections, no repeated words, and correct punctuation?\n"
+    "A) Yes, paste it as-is\n"
+    "B) No, it needs cleanup\n"
+    "Answer with the letter only.\n\nTranscript:\n{text}"
+)
+# A wrong skip pastes filler the user asked to have removed; a wrong rewrite
+# only costs time. So skip only when the check is close to certain.
+SKIP_REWRITE_CONFIDENCE = 0.9
 SAMPLE_RATE = 16_000
 MIN_SECONDS = 0.3
 # Whisper invents fluent text from near-silence — 0.6s at peak 0.005 produced
@@ -213,7 +230,7 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 # it from here, and tools/check_docs_sync.py fails the build when the top of
 # CHANGELOG.md disagrees — the Sotto.spec copy had silently sat at 1.7.3 for six
 # releases, which is what a bundle built without SOTTO_VERSION would have shipped.
-APP_VERSION = "1.7.10"
+APP_VERSION = "1.7.11"
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
@@ -700,11 +717,37 @@ def _load_rewriter():
         log(f"rewrite model failed to load: {e!r} — dictations paste unrewritten")
 
 
+def clean_as_is_probability(text):
+    """How sure the rewrite model is that Clean up would change nothing."""
+    import mlx.core as mx
+
+    model, tokenizer = rewriter
+    ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": CLEAN_CHECK_PROMPT.format(text=text)}],
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    letters = mx.array([tokenizer.encode(c, add_special_tokens=False)[0] for c in "AB"])
+    logits = model(mx.array([ids]))[0, -1]
+    return mx.softmax(logits[letters].astype(mx.float32))[0].item()
+
+
 def rewrite(text, mode):
     """Returns the rewritten text, or None to paste the transcript as-is."""
     if rewriter is None:
         log("rewrite skipped: model not loaded yet — pasted the raw transcript")
         return None
+    if mode == "clean":
+        t0 = time.monotonic()
+        # A failed check must not cost the rewrite: fall through and generate
+        try:
+            p = clean_as_is_probability(text)
+        except Exception as e:  # noqa: BLE001
+            log(f"clean check failed: {e!r} — rewriting anyway")
+            p = 0.0
+        if p >= SKIP_REWRITE_CONFIDENCE:
+            log(f"[rewrite skipped {time.monotonic() - t0:.2f}s] already clean (p={p:.2f})")
+            return None
     model, tokenizer = rewriter
     prompt = tokenizer.apply_chat_template(
         [{"role": "user", "content": REWRITE_PROMPTS[mode].format(text=text)}],

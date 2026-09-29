@@ -65,6 +65,10 @@ formatting around them cut.
 
 <img src="assets/rewrite.svg" width="900" alt="Rewrite example: filler-laden dictation becomes clean prose or a structured list">
 
+In Clean up, Sotto first asks the same model whether the transcript is
+already clean — one forward pass, ~85 ms, no text generated — and pastes it
+as-is when the model is at least 90% sure, skipping the rewrite entirely.
+
 Off by default. If the model isn't loaded yet or a rewrite fails, the raw
 transcript is pasted — you never lose words.
 
