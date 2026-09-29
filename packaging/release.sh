@@ -90,9 +90,25 @@ echo "==> notarizing (usually minutes; large uploads can take an hour)"
 # Submit and wait separately. `submit --wait` died mid-wait when the script
 # ran detached, leaving an unstapled DMG that looked like a success. Capturing
 # the id first means the wait can be retried without re-uploading 350+ MB.
-SUBMIT_ID="$(xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" \
-    | awk '/^  id:/ {print $2; exit}')"
-[[ -n "$SUBMIT_ID" ]] || { echo "no submission id returned"; exit 1; }
+#
+# The submission goes to a file rather than straight into $( ): notarytool has
+# twice been killed partway through while the script was backgrounded, and a
+# command substitution swallows whatever it had printed, so the id — and the
+# upload it represents — was lost even though Apple had accepted the bytes.
+SUBMIT_OUT="$BUILD/notarytool-submit.txt"
+xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" \
+    2>&1 | tee "$SUBMIT_OUT"
+SUBMIT_ID="$(awk '/^  id:/ {print $2; exit}' "$SUBMIT_OUT")"
+if [[ -z "$SUBMIT_ID" ]]; then
+    echo ""
+    echo "No submission id. notarytool output is in $SUBMIT_OUT."
+    echo "If the upload did complete, find the id with:"
+    echo "  xcrun notarytool history --keychain-profile $NOTARY_PROFILE"
+    echo "then resume without re-uploading:"
+    echo "  xcrun notarytool wait <id> --keychain-profile $NOTARY_PROFILE"
+    echo "  xcrun stapler staple \"$DMG\""
+    exit 1
+fi
 echo "submission id: $SUBMIT_ID"
 xcrun notarytool wait "$SUBMIT_ID" --keychain-profile "$NOTARY_PROFILE"
 
