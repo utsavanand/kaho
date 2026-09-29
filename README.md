@@ -12,8 +12,9 @@
     <a href="LICENSE"><img src="https://img.shields.io/github/license/utsavanand/kaho" alt="License"></a>
   </p>
 
-  <p><a href="https://kaho.utsava.xyz"><strong>kaho.utsava.xyz</strong></a>
-  · <a href="https://github.com/utsavanand/kaho/releases/download/v1.7.8/kaho-explainer.mp4">3-minute explainer video</a></p>
+  <p><a href="https://github.com/utsavanand/kaho/releases/latest"><strong>Download for macOS</strong></a>
+  · <a href="https://kaho.utsava.xyz">kaho.utsava.xyz</a>
+  · <a href="https://github.com/utsavanand/kaho/releases/download/v1.7.8/sotto-explainer.mp4">3-minute explainer video</a></p>
 </div>
 
 Hold a key anywhere on macOS, speak, release — your words are typed into
