@@ -182,6 +182,12 @@ LONG_RECORDING_SECONDS = 60  # elapsed counter turns amber past this
 # Upper bound on transcribe+rewrite before the overlay gives up and hides.
 # Generous: a 5-minute dictation plus a rewrite stays well inside it.
 PIPELINE_TIMEOUT_SECONDS = 90
+# After this much inference idleness, macOS has typically paged out the model
+# weights (2.3 GB for Qwen alone), and the next dictation pays 5-10 s of
+# page-in — measured: median 1.1 s back-to-back vs p90 7.1 s after an hour
+# idle, worst 17.8 s. A warmup fired at record-start hides that behind the
+# seconds the user spends speaking.
+WARM_IDLE_SECONDS = 120
 LOG_PATH = os.path.expanduser("~/Library/Logs/Sotto.log")
 SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/Sotto")
 HISTORY_PATH = os.path.join(SUPPORT_DIR, "history.jsonl")
@@ -207,7 +213,7 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 # it from here, and tools/check_docs_sync.py fails the build when the top of
 # CHANGELOG.md disagrees — the Sotto.spec copy had silently sat at 1.7.3 for six
 # releases, which is what a bundle built without SOTTO_VERSION would have shipped.
-APP_VERSION = "1.7.9"
+APP_VERSION = "1.7.10"
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
@@ -243,6 +249,8 @@ settings = {"hotkey": "right_option", "rewrite": "off"}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
+last_inference = 0.0  # monotonic time of the last real or warmup inference
+WARMUP = object()  # sentinel job: page the models back in before the audio lands
 rewriter_lock = threading.Lock()  # see ensure_rewriter
 
 
@@ -422,6 +430,11 @@ def start_recording():
         buf = []
         record_buf = buf
     overlay.show()
+    # Fire a warmup while the user is still speaking: the page-in of idle
+    # model weights overlaps the recording instead of delaying the paste.
+    # Same queue as real jobs, so it can never race the model.
+    if state == "recording" and time.monotonic() - last_inference > WARM_IDLE_SECONDS:
+        jobs.put(WARMUP)
     audio_ops.put(lambda: _open_stream(buf))
 
 
@@ -815,9 +828,21 @@ def paste(text):
 # All slow work happens here: the hotkey handler runs on the main run loop,
 # and blocking it would freeze the menu bar and delay key handling.
 def worker():
+    global last_inference
     while True:
         audio = jobs.get()
         t0 = time.monotonic()
+        if audio is WARMUP:
+            try:
+                transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), use_dictionary=False)
+                if rewriter is not None and settings["rewrite"] != "off":
+                    model, tokenizer = rewriter
+                    mlx_lm.generate(model, tokenizer, prompt="hi", max_tokens=1)
+                log(f"[warmup {time.monotonic() - t0:.2f}s] models paged back in")
+            except Exception as e:  # noqa: BLE001
+                log(f"warmup failed (harmless): {e!r}")
+            last_inference = time.monotonic()
+            continue
         # The sole worker must outlive any single bad job, or dictation dies
         # silently while the UI still shows ready
         try:
@@ -846,6 +871,7 @@ def worker():
                     AppHelper.callAfter(overlay.blocked)
             else:
                 AppHelper.callAfter(overlay.hide)
+            last_inference = time.monotonic()
             log(f"[{time.monotonic() - t0:.2f}s] {text or '(empty transcription, nothing pasted)'}")
         except Exception as e:  # noqa: BLE001
             AppHelper.callAfter(overlay.hide)
@@ -853,7 +879,7 @@ def worker():
 
 
 def backend():
-    global state, input_device, input_name
+    global state, input_device, input_name, last_inference
     # Without this boundary a failed download/device/model init leaves the
     # menu bar stuck on "…" forever with no explanation
     global model_path
@@ -866,6 +892,7 @@ def backend():
         # Warmup on silence: pays model load + Metal kernel compilation now
         # instead of on the first real dictation
         transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), use_dictionary=False)
+        last_inference = time.monotonic()
         log(f"model ready in {time.monotonic() - t0:.1f}s — hold {hotkey_label()} to dictate")
         state = "ready"
         threading.Thread(target=worker, daemon=True).start()

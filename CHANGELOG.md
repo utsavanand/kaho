@@ -1,4 +1,15 @@
 # Changelog
+## 1.7.10 — 2026-09-28
+
+- Idle cold-start hidden. Analysis of 514 logged dictations: 1.1 s median
+  back-to-back, but a 7.1 s p90 (17.8 s worst) after an hour idle — macOS
+  pages out the models, and the rewrite model's 2.3 GB dominated the
+  page-in. Starting a recording after 2+ minutes of inference idleness now
+  fires a tiny warmup on the worker queue, so the page-in overlaps the
+  seconds the user spends speaking instead of following them. Verified
+  live: warmup 1.18 s during speech, post-idle dictation back at 0.90 s.
+  Each warmup logs itself, so the next latency analysis can measure it.
+
 ## 1.7.9 — 2026-09-27
 
 - A blocked paste now says so instead of silently doing nothing. When
