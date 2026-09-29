@@ -1,4 +1,17 @@
 # Changelog
+## 1.7.11 — 2026-09-29
+
+- Clean up skips the rewrite when there is nothing to clean. Before
+  generating, one forward pass asks the rewrite model "already clean? A)
+  yes B) no" and reads the two letter probabilities — a decision, not
+  generation, ~85 ms. At 90%+ confidence the transcript is pasted as-is,
+  saving the 0.35-1.4 s rewrite. On 24 made-up dictations it skipped all
+  15 clean ones and none of the 9 messy ones. The question's direction
+  matters: phrased "does it need cleanup?" the model said yes to every
+  transcript. Structured and Caveman still always rewrite — the same check
+  could not reliably tell when a sentence should become a list. A failed
+  check falls through to the rewrite.
+
 ## 1.7.10 — 2026-09-28
 
 - Idle cold-start hidden. Analysis of 514 logged dictations: 1.1 s median

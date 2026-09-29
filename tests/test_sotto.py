@@ -454,6 +454,40 @@ class TestHistory(SottoTestCase):
 
 
 @unittest.skipUnless(HAVE_NUMPY, "the audio drop rules need real numpy arrays")
+class TestCleanSkip(SottoTestCase):
+    """Clean up skips generation when the model is sure it would change nothing."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(sotto, "rewriter", (mock.MagicMock(), mock.MagicMock())))
+        self.mlx_lm = self.enterContext(mock.patch.object(sotto, "mlx_lm", mock.MagicMock()))
+        self.mlx_lm.generate.return_value = "Rewritten."
+
+    def check_returns(self, value):
+        return self.enterContext(mock.patch.object(sotto, "clean_as_is_probability", return_value=value))
+
+    def test_a_confident_check_pastes_the_transcript_untouched(self):
+        self.check_returns(0.99)
+        self.assertIsNone(sotto.rewrite("Thanks, that works for me.", "clean"))
+        self.mlx_lm.generate.assert_not_called()
+
+    def test_an_unsure_check_still_rewrites(self):
+        self.check_returns(sotto.SKIP_REWRITE_CONFIDENCE - 0.01)
+        self.assertEqual(sotto.rewrite("um so yeah", "clean"), "Rewritten.")
+
+    def test_a_failed_check_rewrites_instead_of_skipping(self):
+        self.enterContext(
+            mock.patch.object(sotto, "clean_as_is_probability", side_effect=RuntimeError("metal"))
+        )
+        self.assertEqual(sotto.rewrite("um so yeah", "clean"), "Rewritten.")
+
+    def test_other_modes_never_run_the_check(self):
+        check = self.check_returns(1.0)
+        for mode in ("structured", "caveman"):
+            self.assertEqual(sotto.rewrite("Thanks, that works for me.", mode), "Rewritten.")
+        check.assert_not_called()
+
+
 class TestAudioDropRules(SottoTestCase):
     """What reaches Whisper, and what is dropped before it can hallucinate."""
 
