@@ -1,5 +1,17 @@
 # Changelog
-## 1.7.11 — 2026-09-29
+## 2.0.0 — 2026-09-29
+
+- Renamed from Sotto to Kaho (Hindi कहो, "say it"). A commercial product
+  with a near-identical name was already on the market, which would have
+  confused anyone searching for either one. The app, bundle identifier
+  (`com.utsavanand.kaho`), log file, support directory and repository move
+  together.
+- Settings, transcript history and the dictionary carry over: on first
+  launch Kaho renames `~/Library/Application Support/Sotto` to `.../Kaho`
+  when the old directory exists and the new one does not.
+- macOS ties Microphone and Accessibility permission to the bundle
+  identifier, so it treats Kaho as a new app: grant both once more. The
+  recording pill names what is missing if a paste is blocked.
 
 - Clean up skips the rewrite when there is nothing to clean. Before
   generating, one forward pass asks the rewrite model "already clean? A)

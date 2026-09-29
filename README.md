@@ -1,19 +1,19 @@
 <div align="center">
-  <img src="assets/logo.svg" width="128" height="128" alt="Sotto logo">
-  <h1>Sotto</h1>
-  <p><em>sotto voce — under the breath</em></p>
+  <img src="assets/logo.svg" width="128" height="128" alt="Kaho logo">
+  <h1>Kaho</h1>
+  <p><em>कहो — Hindi for “say it”</em></p>
 
   <p>
     <img src="https://img.shields.io/badge/macOS-14%2B-000000?logo=apple&logoColor=white" alt="macOS 14+">
     <img src="https://img.shields.io/badge/Apple%20Silicon-arm64-0071e3" alt="Apple Silicon">
     <img src="https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white" alt="Python 3.13">
-    <a href="https://github.com/utsavanand/sotto/actions/workflows/ci.yml"><img src="https://github.com/utsavanand/sotto/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-    <a href="https://github.com/utsavanand/sotto/releases/latest"><img src="https://img.shields.io/github/v/release/utsavanand/sotto" alt="Latest release"></a>
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/utsavanand/sotto" alt="License"></a>
+    <a href="https://github.com/utsavanand/kaho/actions/workflows/ci.yml"><img src="https://github.com/utsavanand/kaho/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/utsavanand/kaho/releases/latest"><img src="https://img.shields.io/github/v/release/utsavanand/kaho" alt="Latest release"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/utsavanand/kaho" alt="License"></a>
   </p>
 
-  <p><a href="https://sotto.utsava.xyz"><strong>sotto.utsava.xyz</strong></a>
-  · <a href="https://github.com/utsavanand/sotto/releases/download/v1.7.8/sotto-explainer.mp4">3-minute explainer video</a></p>
+  <p><a href="https://kaho.utsava.xyz"><strong>kaho.utsava.xyz</strong></a>
+  · <a href="https://github.com/utsavanand/kaho/releases/download/v1.7.8/kaho-explainer.mp4">3-minute explainer video</a></p>
 </div>
 
 Hold a key anywhere on macOS, speak, release — your words are typed into
@@ -21,7 +21,7 @@ whatever app has focus. Everything runs on your Mac via
 [Apple MLX](https://github.com/ml-explore/mlx): no cloud, no account, no
 telemetry.
 
-![How Sotto works](assets/flow.svg)
+![How Kaho works](assets/flow.svg)
 
 - **Works everywhere** — any app that accepts paste
 - **Fast** — under 1.5 s from key-release to text (0.5 s typical on an M4 Max),
@@ -31,7 +31,7 @@ telemetry.
   then live progress ("Transcribing…", "Rewriting…", "Pasted") so you always
   know what it's doing
 - **Dictionary** — list your names, products, and jargon; Whisper stops
-  guessing "Soto" for "Sotto"
+  guessing "cow" for "Kaho"
 - **On-device** — audio never leaves the machine; works offline
 - **Small** — one Python file, seven dependencies
 
@@ -40,7 +40,7 @@ telemetry.
 Recent transcripts (click to copy), your hotkey, rewrite mode, history,
 log, and one-click bug reports:
 
-<img src="assets/menu.svg" width="640" alt="Sotto menu: transcripts, Hotkey and Rewrite submenus, Settings, History, Open Log, Report a Bug">
+<img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey and Rewrite submenus, Settings, History, Open Log, Report a Bug">
 
 - **Settings…** — a real window (⌘,) for hotkey and rewrite mode
 - **Edit Dictionary…** — names and jargon Whisper should spell your way
@@ -49,7 +49,7 @@ log, and one-click bug reports:
 - **Report a Bug…** — opens a pre-filled Mail draft with diagnostics and the
   log attached; nothing sends until you review it.
 
-If your menu bar is full, macOS hides the icon behind the notch. Sotto
+If your menu bar is full, macOS hides the icon behind the notch. Kaho
 detects that and adds a Dock icon with the same menu, so Settings and
 History stay reachable — no alert, no lost settings.
 
@@ -65,7 +65,7 @@ formatting around them cut.
 
 <img src="assets/rewrite.svg" width="900" alt="Rewrite example: filler-laden dictation becomes clean prose or a structured list">
 
-In Clean up, Sotto first asks the same model whether the transcript is
+In Clean up, Kaho first asks the same model whether the transcript is
 already clean — one forward pass, ~85 ms, no text generated — and pastes it
 as-is when the model is at least 90% sure, skipping the rewrite entirely.
 
@@ -91,12 +91,12 @@ brew install python@3.13
 Then:
 
 ```sh
-git clone https://github.com/utsavanand/sotto && cd sotto
+git clone https://github.com/utsavanand/kaho && cd kaho
 ./install.sh
-open /Applications/Sotto.app
+open /Applications/Kaho.app
 ```
 
-`install.sh` builds `Sotto.app` locally (hash-verified Python environment +
+`install.sh` builds `Kaho.app` locally (hash-verified Python environment +
 ad-hoc-signed bundle), so there are no Gatekeeper warnings. Grant both
 permissions in System Settings → Privacy & Security, then relaunch:
 
@@ -120,14 +120,14 @@ Everything else lives in the 🎙 menu.
 <summary><strong>Where do I see everything I've dictated?</strong></summary>
 
 🎙 → History…, or — if the menu bar icon is hidden behind the notch — just
-launch Sotto again (Launchpad, Finder, or `open /Applications/Sotto.app`)
+launch Kaho again (Launchpad, Finder, or `open /Applications/Kaho.app`)
 while it's running: the History window opens.
 </details>
 
 <details>
 <summary><strong>The hotkey does nothing.</strong></summary>
 
-Almost always permissions: check that *Sotto* (not your terminal) is enabled
+Almost always permissions: check that *Kaho* (not your terminal) is enabled
 under Accessibility, then relaunch it. Re-running `install.sh` rebuilds the
 bundle and can reset the grant. Also make sure you're pressing the key shown
 in 🎙 → Hotkey — it's the **right**-side key.
@@ -144,7 +144,7 @@ terminal that never released it). Close that app or its window.
 <details>
 <summary><strong>I'm wearing AirPods and the transcripts were wrong.</strong></summary>
 
-Fixed by design: Sotto always records from the built-in microphone. Bluetooth
+Fixed by design: Kaho always records from the built-in microphone. Bluetooth
 mics switch to a low-quality codec when recording starts and lose ~1 s of
 audio during the switch, garbling the start of every dictation.
 </details>
@@ -159,7 +159,7 @@ silent hold can still produce one of these.
 <details>
 <summary><strong>Why did my clipboard change?</strong></summary>
 
-It changes for about a second and a half, then changes back. Sotto pastes by
+It changes for about a second and a half, then changes back. Kaho pastes by
 writing the transcript to the clipboard and sending <kbd>⌘V</kbd>, then puts
 your previous clipboard back — unless you copied something else in the
 meantime, in which case yours wins and the transcript is left alone. The
@@ -170,7 +170,7 @@ transcript is marked transient, so clipboard managers that honour that flag
 <details>
 <summary><strong>Can I change the models?</strong></summary>
 
-The Whisper and rewrite models are constants at the top of `sotto.py`; re-run
+The Whisper and rewrite models are constants at the top of `kaho.py`; re-run
 `./install.sh` after editing. Smaller models (e.g.
 `mlx-community/whisper-small-mlx`) trade accuracy for speed and memory.
 </details>
@@ -200,7 +200,7 @@ trade-off discussion: [DESIGN.md](DESIGN.md).
 
 Audio is captured only while the hotkey is held, processed in memory, never
 written to disk or sent anywhere. Transcripts go to the clipboard, the local
-log, and the local history file (`~/Library/Application Support/Sotto/`) —
+log, and the local history file (`~/Library/Application Support/Kaho/`) —
 delete them any time. Rewriting runs entirely on-device too. The models are
 fetched once from Hugging Face; nothing else touches the network.
 
@@ -217,8 +217,8 @@ Design rationale: [DESIGN.md](DESIGN.md) · Contributing:
 ## Uninstall
 
 ```sh
-rm -rf /Applications/Sotto.app ~/Library/Logs/Sotto.log
-rm -rf "$HOME/Library/Application Support/Sotto"
+rm -rf /Applications/Kaho.app ~/Library/Logs/Kaho.log
+rm -rf "$HOME/Library/Application Support/Kaho"
 ```
 
 The cached models live in `~/.cache/huggingface` if you want those gone too.

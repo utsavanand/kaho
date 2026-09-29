@@ -6,4 +6,4 @@
 [lint.per-file-ignores]
 # PyInstaller injects Analysis, PYZ, EXE, COLLECT, BUNDLE and SPECPATH into a
 # spec file's namespace at exec time, so every one of them reads as undefined.
-"packaging/Sotto.spec" = ["F821"]
+"packaging/Kaho.spec" = ["F821"]

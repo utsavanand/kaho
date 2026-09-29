@@ -7,8 +7,8 @@ existed. Images are the first thing a reader sees, and nothing else in CI
 looks at them.
 
 The version is checked for the same reason: it was written out in three
-places by hand, and packaging/Sotto.spec sat at 1.7.3 through six releases.
-install.sh and Sotto.spec now read sotto.py, so all that is left to verify is
+places by hand, and packaging/Kaho.spec sat at 1.7.3 through six releases.
+install.sh and Kaho.spec now read kaho.py, so all that is left to verify is
 that the changelog was actually written for the version being shipped.
 """
 
@@ -17,7 +17,7 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SOURCE = (ROOT / "sotto.py").read_text()
+SOURCE = (ROOT / "kaho.py").read_text()
 MENU_SVG = (ROOT / "assets" / "menu.svg").read_text()
 CHANGELOG = (ROOT / "CHANGELOG.md").read_text()
 
@@ -25,7 +25,7 @@ CHANGELOG = (ROOT / "CHANGELOG.md").read_text()
 def app_version():
     m = re.search(r'^APP_VERSION = "([^"]+)"', SOURCE, re.MULTILINE)
     if not m:
-        sys.exit("could not find APP_VERSION in sotto.py")
+        sys.exit("could not find APP_VERSION in kaho.py")
     return m.group(1)
 
 
@@ -39,7 +39,7 @@ def changelog_version():
 def rewrite_modes():
     block = re.search(r"^REWRITE_MODES = \{(.*?)^\}", SOURCE, re.DOTALL | re.MULTILINE)
     if not block:
-        sys.exit("could not find REWRITE_MODES in sotto.py")
+        sys.exit("could not find REWRITE_MODES in kaho.py")
     return re.findall(r'"[a-z]+":\s*"([^"]+)"', block.group(1))
 
 
@@ -47,14 +47,14 @@ def menu_items():
     """Titles from MENU_ACTIONS, which both menus are built from."""
     block = re.search(r"^MENU_ACTIONS = \((.*?)^\)", SOURCE, re.DOTALL | re.MULTILINE)
     if not block:
-        sys.exit("could not find MENU_ACTIONS in sotto.py")
+        sys.exit("could not find MENU_ACTIONS in kaho.py")
     return re.findall(r'\("([^"]+)",\s*"[a-zA-Z]+:"', block.group(1))
 
 
 def main():
     if app_version() != changelog_version():
         print(
-            f"version mismatch: sotto.py says {app_version()}, the top of "
+            f"version mismatch: kaho.py says {app_version()}, the top of "
             f"CHANGELOG.md says {changelog_version()}.\n"
             "Add the changelog entry for this version, or correct APP_VERSION."
         )
@@ -67,12 +67,12 @@ def main():
         if title not in MENU_SVG:
             missing.append(f"menu item {title!r}")
     if missing:
-        print("assets/menu.svg is out of date with sotto.py:")
+        print("assets/menu.svg is out of date with kaho.py:")
         for item in missing:
             print(f"  - {item} is in the code but not the illustration")
         print("\nUpdate assets/menu.svg so the README screenshots match the app.")
         return 1
-    print(f"menu.svg matches sotto.py ({len(menu_items())} items, "
+    print(f"menu.svg matches kaho.py ({len(menu_items())} items, "
           f"{len(rewrite_modes())} rewrite modes), version {app_version()}")
     return 0
 

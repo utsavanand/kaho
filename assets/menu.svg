@@ -33,7 +33,7 @@
     <text x="316" y="272" font-size="13" fill="#24292f">Open Log</text>
     <text x="316" y="298" font-size="13" fill="#24292f">Report a Bug…</text>
     <line x1="312" y1="312" x2="558" y2="312" stroke="#d0d7de"/>
-    <text x="316" y="336" font-size="13" fill="#24292f">Quit Sotto</text>
+    <text x="316" y="336" font-size="13" fill="#24292f">Quit Kaho</text>
     <text x="550" y="336" font-size="12" text-anchor="end" fill="#57606a">⌘Q</text>
   </g>
 

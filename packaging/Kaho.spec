@@ -1,4 +1,4 @@
-# PyInstaller spec for a distributable Sotto.app.
+# PyInstaller spec for a distributable Kaho.app.
 #
 # The install.sh path builds a venv into Application Support and points a thin
 # launcher at it. That cannot be handed to someone else: the venv's python is a
@@ -6,7 +6,7 @@
 # Homebrew Python 3.13. This spec embeds the interpreter and every dependency
 # instead, producing a bundle that runs on a stock Mac.
 #
-# Build:  pyinstaller packaging/Sotto.spec --noconfirm
+# Build:  pyinstaller packaging/Kaho.spec --noconfirm
 
 import os
 import re
@@ -15,12 +15,12 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-# The version comes from sotto.py's APP_VERSION. A literal default here drifted
-# to 1.7.3 while the app shipped 1.7.9, so any build that forgot SOTTO_VERSION
-# would have been mislabelled. SOTTO_VERSION still wins, for a one-off build.
-with open(os.path.join(SPECPATH, "..", "sotto.py")) as _f:
+# The version comes from kaho.py's APP_VERSION. A literal default here drifted
+# to 1.7.3 while the app shipped 1.7.9, so any build that forgot KAHO_VERSION
+# would have been mislabelled. KAHO_VERSION still wins, for a one-off build.
+with open(os.path.join(SPECPATH, "..", "kaho.py")) as _f:
     _app_version = re.search(r'^APP_VERSION = "([^"]+)"', _f.read(), re.MULTILINE).group(1)
-VERSION = os.environ.get("SOTTO_VERSION", _app_version)
+VERSION = os.environ.get("KAHO_VERSION", _app_version)
 
 # Naming lazy imports one at a time is a losing game — mlx alone failed on
 # mlx._reprlib_fix, and each fix costs a 10-minute rebuild to discover the
@@ -36,10 +36,10 @@ for _pkg in ("mlx", "mlx_whisper", "mlx_lm", "sounddevice", "transformers", "tok
     _collected_hidden += _h
 
 a = Analysis(
-    ["../sotto.py"],
+    ["../kaho.py"],
     pathex=[],
     binaries=_collected_binaries,
-    datas=[("../assets/Sotto.icns", ".")] + _collected_datas,
+    datas=[("../assets/Kaho.icns", ".")] + _collected_datas,
     # mlx_whisper and mlx_lm resolve model code lazily, so PyInstaller's static
     # analysis misses these. mlx's C extension imports mlx._reprlib_fix and
     # friends at init time — there is no upstream PyInstaller hook for mlx, so
@@ -114,7 +114,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="Sotto",
+    name="Kaho",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -134,23 +134,23 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="Sotto",
+    name="Kaho",
 )
 
 app = BUNDLE(
     coll,
-    name="Sotto.app",
-    icon="../assets/Sotto.icns",
-    bundle_identifier="com.utsavanand.sotto",
+    name="Kaho.app",
+    icon="../assets/Kaho.icns",
+    bundle_identifier="com.utsavanand.kaho",
     info_plist={
-        "CFBundleName": "Sotto",
-        "CFBundleDisplayName": "Sotto",
+        "CFBundleName": "Kaho",
+        "CFBundleDisplayName": "Kaho",
         "CFBundleShortVersionString": VERSION,
         "CFBundleVersion": VERSION,
         "LSUIElement": True,  # menu bar only, no Dock icon by default
         "LSMinimumSystemVersion": "14.0",
         "NSMicrophoneUsageDescription":
-            "Sotto records while you hold the hotkey and transcribes on-device.",
+            "Kaho records while you hold the hotkey and transcribes on-device.",
         "NSHighResolutionCapable": True,
     },
 )

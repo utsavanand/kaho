@@ -11,7 +11,7 @@
 set -euo pipefail
 
 CER="${1:-}"
-KEYDIR="$HOME/Desktop/sotto-signing"
+KEYDIR="$HOME/Desktop/kaho-signing"
 KEY="$KEYDIR/DeveloperID.key"
 
 if [[ -z "$CER" ]]; then
@@ -45,7 +45,7 @@ if security find-identity -v -p codesigning | grep -q "Developer ID Application"
     echo ""
     echo "Team ID: developer.apple.com > Membership."
     echo "App-specific password: appleid.apple.com > Sign-In and Security."
-    echo "Then:  ./packaging/release.sh 1.7.3"
+    echo "Then:  ./packaging/release.sh <version>"
 else
     echo ""
     echo "No Developer ID Application identity yet."

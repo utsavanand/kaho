@@ -1,4 +1,4 @@
-"""Sotto: hold the hotkey (right Option by default) anywhere, speak, release —
+"""Kaho: hold the hotkey (right Option by default) anywhere, speak, release —
 locally transcribed text is pasted into the focused app. See DESIGN.md."""
 
 import collections
@@ -12,6 +12,7 @@ import re
 import subprocess
 import threading
 import time
+import traceback
 import urllib.parse
 
 import AppKit
@@ -205,8 +206,8 @@ PIPELINE_TIMEOUT_SECONDS = 90
 # idle, worst 17.8 s. A warmup fired at record-start hides that behind the
 # seconds the user spends speaking.
 WARM_IDLE_SECONDS = 120
-LOG_PATH = os.path.expanduser("~/Library/Logs/Sotto.log")
-SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/Sotto")
+LOG_PATH = os.path.expanduser("~/Library/Logs/Kaho.log")
+SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/Kaho")
 HISTORY_PATH = os.path.join(SUPPORT_DIR, "history.jsonl")
 SETTINGS_PATH = os.path.join(SUPPORT_DIR, "settings.json")
 DICTIONARY_PATH = os.path.join(SUPPORT_DIR, "dictionary.txt")
@@ -214,23 +215,23 @@ DICTIONARY_PATH = os.path.join(SUPPORT_DIR, "dictionary.txt")
 # dropped, and a bloated glossary dilutes the bias on the words you do say.
 DICTIONARY_MAX_TERMS = 120
 DICTIONARY_TEMPLATE = """\
-# Sotto dictionary — one term per line.
+# Kaho dictionary — one term per line.
 #
 # Whisper picks the likeliest spelling when audio is ambiguous, so listing
 # your names, products, and jargon here biases it toward yours. Lines
 # starting with # are ignored. Edits apply to the next dictation; no
 # restart needed.
 #
-# Sotto
+# Kaho
 # Duckterm
 # Kubernetes
 """
 TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠️"}
-# The one place the version is written. install.sh and packaging/Sotto.spec read
+# The one place the version is written. install.sh and packaging/Kaho.spec read
 # it from here, and tools/check_docs_sync.py fails the build when the top of
-# CHANGELOG.md disagrees — the Sotto.spec copy had silently sat at 1.7.3 for six
-# releases, which is what a bundle built without SOTTO_VERSION would have shipped.
-APP_VERSION = "1.7.11"
+# CHANGELOG.md disagrees — the Kaho.spec copy had silently sat at 1.7.3 for six
+# releases, which is what a bundle built without KAHO_VERSION would have shipped.
+APP_VERSION = "2.0.0"
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
@@ -435,7 +436,7 @@ def start_recording():
     if audio_wedged():
         log(
             "audio device is not responding — recording skipped. Quit other "
-            "audio apps (e.g. another dictation tool) or relaunch Sotto."
+            "audio apps (e.g. another dictation tool) or relaunch Kaho."
         )
         return
     with recording_lock:
@@ -714,7 +715,11 @@ def _load_rewriter():
         rewriter = (model, tokenizer)
         log(f"rewrite model ready in {time.monotonic() - t0:.1f}s")
     except Exception as e:  # noqa: BLE001
+        # The repr alone has twice sent a debugging session down the wrong
+        # path: an ImportError names the missing module, not the import that
+        # went looking for it
         log(f"rewrite model failed to load: {e!r} — dictations paste unrewritten")
+        log(traceback.format_exc().rstrip())
 
 
 def clean_as_is_probability(text):
@@ -814,7 +819,7 @@ def paste_blocked_reason():
     """
     if not Quartz.CGPreflightPostEventAccess():
         return (
-            "Accessibility permission is missing — enable Sotto in "
+            "Accessibility permission is missing — enable Kaho in "
             "System Settings > Privacy & Security > Accessibility"
         )
     if _carbon.IsSecureEventInputEnabled():
@@ -949,7 +954,7 @@ def backend():
 
 def startup_failed_alert(error):
     choice = run_alert(
-        "Sotto failed to start",
+        "Kaho failed to start",
         f"{error}\n\nIf this was the first run, check your internet connection "
         "(the model downloads once from Hugging Face) and relaunch. Details are "
         "in the log.",
@@ -984,10 +989,10 @@ def prompt_missing_permissions():
     Quartz.CGRequestPostEventAccess()
     log("missing permission: Accessibility")
     choice = run_alert(
-        "Sotto needs the Accessibility permission",
-        "Accessibility lets Sotto see the hotkey and paste the transcribed "
-        "text.\n\nEnable Sotto in System Settings > Privacy & Security > "
-        "Accessibility (it may be listed as \"Python\"), then quit Sotto from "
+        "Kaho needs the Accessibility permission",
+        "Accessibility lets Kaho see the hotkey and paste the transcribed "
+        "text.\n\nEnable Kaho in System Settings > Privacy & Security > "
+        "Accessibility (it may be listed as \"Python\"), then quit Kaho from "
         "the 🎙 menu and open it again — grants only apply on a fresh launch.",
         ["Open System Settings", "Later"],
     )
@@ -1028,7 +1033,7 @@ PHASE_LABELS = {
 
 # Secure input (password fields, Terminal's "Secure Keyboard Entry", sudo
 # prompts) silently swallows synthetic keystrokes: transcription succeeds,
-# the clipboard fills, and nothing appears — which reads as "Sotto is
+# the clipboard fills, and nothing appears — which reads as "Kaho is
 # broken". Carbon exposes the state so we can say so instead.
 _carbon = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
 _carbon.IsSecureEventInputEnabled.restype = ctypes.c_bool
@@ -1315,7 +1320,7 @@ class SettingsWindow(AppKit.NSObject):
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             ((0, 0), (460, 366)), mask, AppKit.NSBackingStoreBuffered, False
         )
-        window.setTitle_("Sotto Settings")
+        window.setTitle_("Kaho Settings")
         window.setReleasedWhenClosed_(False)
         window.center()
         content = window.contentView()
@@ -1386,8 +1391,8 @@ class SettingsWindow(AppKit.NSObject):
     def refreshHint(self):
         if status_item_onscreen() is False:
             self.notice.setStringValue_(
-                "Your menu bar is full, so macOS hides Sotto's icon behind the "
-                "notch — reach Sotto from the Dock instead. Everything runs on "
+                "Your menu bar is full, so macOS hides Kaho's icon behind the "
+                "notch — reach Kaho from the Dock instead. Everything runs on "
                 "this Mac."
             )
         else:
@@ -1454,7 +1459,7 @@ class HistoryWindow(AppKit.NSObject):
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             ((0, 0), (480, 560)), mask, AppKit.NSBackingStoreBuffered, False
         )
-        window.setTitle_("Sotto History")
+        window.setTitle_("Kaho History")
         window.setReleasedWhenClosed_(False)
         window.center()
         scroll = AppKit.NSScrollView.alloc().initWithFrame_(window.contentView().bounds())
@@ -1494,7 +1499,7 @@ def show_dock_icon():
 
 
 def set_process_name():
-    """Make the app menu say "Sotto", not "Python".
+    """Make the app menu say "Kaho", not "Python".
 
     macOS titles the app menu from the running executable's bundle — here
     Homebrew's Python.app — so it must be overridden in that bundle's info
@@ -1503,7 +1508,7 @@ def set_process_name():
     try:
         bundle = AppKit.NSBundle.mainBundle()
         info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
-        info["CFBundleName"] = "Sotto"
+        info["CFBundleName"] = "Kaho"
     except Exception as e:  # noqa: BLE001
         log(f"could not set the app menu name: {e!r}")
 
@@ -1512,15 +1517,15 @@ def apply_app_icon():
     """Set the Dock icon explicitly.
 
     The process runs out of Homebrew's Python.app, so macOS shows the Python
-    rocket rather than Sotto's icon — the .icns in our bundle is never
+    rocket rather than Kaho's icon — the .icns in our bundle is never
     consulted for a process whose executable lives elsewhere.
     """
     here = os.path.dirname(os.path.abspath(__file__))
-    # Installed: Resources/Sotto.icns beside this file. From the repo
-    # (run.sh): assets/Sotto.icns.
+    # Installed: Resources/Kaho.icns beside this file. From the repo
+    # (run.sh): assets/Kaho.icns.
     for icns in (
-        os.path.join(here, "Sotto.icns"),
-        os.path.join(here, "assets", "Sotto.icns"),
+        os.path.join(here, "Kaho.icns"),
+        os.path.join(here, "assets", "Kaho.icns"),
     ):
         image = AppKit.NSImage.alloc().initWithContentsOfFile_(icns)
         if image:
@@ -1537,7 +1542,7 @@ def install_app_menu():
     app_item = AppKit.NSMenuItem.alloc().init()
     main_menu.addItem_(app_item)
     # The submenu's own title is what macOS renders in bold as the app menu
-    app_menu = AppKit.NSMenu.alloc().initWithTitle_("Sotto")
+    app_menu = AppKit.NSMenu.alloc().initWithTitle_("Kaho")
     for title, action, key in MENU_ACTIONS:
         if action in APP_MENU_OMITS:
             continue
@@ -1563,7 +1568,7 @@ MENU_ACTIONS = (
     ("History…", "showHistory:", "h"),
     ("Open Log", "openLog:", ""),
     ("Report a Bug…", "reportBug:", ""),
-    ("Quit Sotto", "quit:", "q"),
+    ("Quit Kaho", "quit:", "q"),
 )
 APP_MENU_OMITS = ("openLog:",)
 
@@ -1710,14 +1715,14 @@ class StatusItem(AppKit.NSObject):
             "happened instead?\n\n\n"
             "If the issue is visual, attach a screenshot (press ⇧⌘4).\n\n"
             "--- diagnostics (keep this section) ---\n"
-            f"Sotto {APP_VERSION} · macOS {platform.mac_ver()[0]} · "
+            f"Kaho {APP_VERSION} · macOS {platform.mac_ver()[0]} · "
             f"Python {platform.python_version()}\n"
             f"mic: {input_name} · state: {state}\n"
             f"hotkey: {hotkey_label()} · rewrite: {settings['rewrite']}\n"
             f"whisper: {MODEL_REPO}@{MODEL_REVISION[:8]}\n"
             f"rewrite model: {REWRITE_REPO}@{REWRITE_REVISION[:8]} "
             f"(loaded: {rewriter is not None})\n\n"
-            "The attached Sotto.log includes recent transcripts — delete "
+            "The attached Kaho.log includes recent transcripts — delete "
             "anything private before sending.\n"
         )
         service = AppKit.NSSharingService.sharingServiceNamed_(
@@ -1725,7 +1730,7 @@ class StatusItem(AppKit.NSObject):
         )
         if service:
             service.setRecipients_([BUG_REPORT_EMAIL])
-            service.setSubject_(f"Sotto bug report ({APP_VERSION})")
+            service.setSubject_(f"Kaho bug report ({APP_VERSION})")
             items = [body]
             if os.path.exists(LOG_PATH):
                 items.append(AppKit.NSURL.fileURLWithPath_(LOG_PATH))
@@ -1737,7 +1742,7 @@ class StatusItem(AppKit.NSObject):
             body += f"\nPlease also attach {LOG_PATH}\n"
             url = (
                 f"mailto:{BUG_REPORT_EMAIL}"
-                f"?subject={urllib.parse.quote(f'Sotto bug report ({APP_VERSION})')}"
+                f"?subject={urllib.parse.quote(f'Kaho bug report ({APP_VERSION})')}"
                 f"&body={urllib.parse.quote(body)}"
             )
             AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(url))
@@ -1747,7 +1752,7 @@ class StatusItem(AppKit.NSObject):
 
 
 class AppDelegate(AppKit.NSObject):
-    # Launching Sotto again while it runs (Launchpad, Finder, `open`) lands
+    # Launching Kaho again while it runs (Launchpad, Finder, `open`) lands
     # here — show the history window, since the menu bar icon can be hidden
     # behind the notch on a crowded menu bar
     def applicationShouldHandleReopen_hasVisibleWindows_(self, _app, _has_windows):
@@ -1771,8 +1776,31 @@ def install_status_item():
     return delegate, item, timer
 
 
+def migrate_sotto_support_dir():
+    """Carry settings, history and the dictionary across the 2.0 rename.
+
+    The app was named Sotto through 1.7.x. install.sh does the same before it
+    builds the venv; this covers the DMG, where the app is the first thing to
+    run under the new name. Declines when the new directory already exists —
+    the user's current data always wins over an old leftover.
+    """
+    old_support = os.path.expanduser("~/Library/Application Support/Sotto")
+    if not os.path.isdir(old_support) or os.path.exists(SUPPORT_DIR):
+        return False
+    try:
+        os.rename(old_support, SUPPORT_DIR)
+    except OSError as e:
+        log(f"could not migrate old Sotto data: {e}")
+        return False
+    # A source-install venv in there refers to the old path throughout
+    subprocess.run(["rm", "-rf", os.path.join(SUPPORT_DIR, "venv")], check=False)
+    log("migrated settings and history from the Sotto era")
+    return True
+
+
 def main():
     global overlay, history_win, settings_win, status_item
+    migrate_sotto_support_dir()
     os.makedirs(SUPPORT_DIR, exist_ok=True)
     ensure_dictionary_file()
     # Migrate transcript files created by older versions to private mode;

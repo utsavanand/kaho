@@ -1,4 +1,4 @@
-# Everything sotto.py imports directly, and nothing else. install.sh installs
+# Everything kaho.py imports directly, and nothing else. install.sh installs
 # from requirements.lock instead — hash-pinned, transitive deps included — so
 # this file is the dev install, and the input the lock is regenerated from.
 # huggingface_hub, numpy and pyobjc-framework-Cocoa (AppKit) used to arrive

@@ -3,18 +3,18 @@
 ## Setup
 
 ```sh
-git clone https://github.com/utsavanand/sotto && cd sotto
+git clone https://github.com/utsavanand/kaho && cd kaho
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./run.sh
 ```
 
 `run.sh` runs the same code the app bundle runs, with logs in your terminal.
 Note: permission grants (Accessibility, Input Monitoring, Microphone) attach
-to your terminal in dev mode, separately from the Sotto.app grants.
+to your terminal in dev mode, separately from the Kaho.app grants.
 
 ## Before opening a PR
 
-- `ruff check sotto.py` passes (CI enforces this)
+- `ruff check kaho.py` passes (CI enforces this)
 - `python -m unittest discover -s tests -t .` passes (CI enforces this too).
   The suite stubs AppKit and the MLX packages, so it runs anywhere and needs no
   venv. Add a case there for anything you can test without a microphone.
@@ -29,7 +29,7 @@ to your terminal in dev mode, separately from the Sotto.app grants.
 
 ## Scope
 
-Sotto is deliberately one file with constants instead of configuration. Bug
+Kaho is deliberately one file with constants instead of configuration. Bug
 fixes and accuracy/latency improvements are welcome. Features that add UI,
 config files, or new dependencies need a strong case for why they can't be a
 constant or a fork.

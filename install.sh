@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -euo pipefail
 
-[[ "$(uname -m)" == "arm64" ]] || { echo "Sotto requires Apple Silicon (transcription runs on MLX)"; exit 1; }
+[[ "$(uname -m)" == "arm64" ]] || { echo "Kaho requires Apple Silicon (transcription runs on MLX)"; exit 1; }
 
 # Find a 3.13 interpreter by its versioned name first: after
 # `brew install python@3.13` the unversioned `python3` on PATH is often a
@@ -18,12 +18,23 @@ done
 echo "using $PY"
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
-# Read the version out of sotto.py rather than keeping a second copy here
-VERSION="$(sed -nE 's/^APP_VERSION = "([^"]+)".*/\1/p' "$SRC/sotto.py")"
-[[ -n "$VERSION" ]] || { echo "could not read APP_VERSION from sotto.py"; exit 1; }
-SUPPORT="$HOME/Library/Application Support/Sotto"
-APP="/Applications/Sotto.app"
-STAGE="/Applications/.Sotto.app.new"
+# Read the version out of kaho.py rather than keeping a second copy here
+VERSION="$(sed -nE 's/^APP_VERSION = "([^"]+)".*/\1/p' "$SRC/kaho.py")"
+[[ -n "$VERSION" ]] || { echo "could not read APP_VERSION from kaho.py"; exit 1; }
+SUPPORT="$HOME/Library/Application Support/Kaho"
+APP="/Applications/Kaho.app"
+STAGE="/Applications/.Kaho.app.new"
+
+# The app was named Sotto through 1.7.x. Carry settings, history and the
+# dictionary over before creating $SUPPORT — once it exists the app's own
+# migration correctly declines to touch it, and the old data is stranded.
+OLD_SUPPORT="$HOME/Library/Application Support/Sotto"
+if [[ -d "$OLD_SUPPORT" && ! -d "$SUPPORT" ]]; then
+  echo "carrying settings and history over from Sotto ..."
+  mv "$OLD_SUPPORT" "$SUPPORT"
+  # The old venv points at the old path in its own config and scripts
+  rm -rf "$SUPPORT/venv"
+fi
 
 echo "installing python environment into $SUPPORT ..."
 mkdir -p "$SUPPORT"
@@ -43,33 +54,33 @@ echo "building $APP $VERSION ..."
 # failed build never destroys a working installation
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
-cp "$SRC/sotto.py" "$STAGE/Contents/Resources/"
-cp "$SRC/assets/Sotto.icns" "$STAGE/Contents/Resources/"
+cp "$SRC/kaho.py" "$STAGE/Contents/Resources/"
+cp "$SRC/assets/Kaho.icns" "$STAGE/Contents/Resources/"
 
 cat > "$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Sotto</string>
-  <key>CFBundleDisplayName</key><string>Sotto</string>
-  <key>CFBundleIdentifier</key><string>com.utsavanand.sotto</string>
-  <key>CFBundleExecutable</key><string>sotto</string>
-  <key>CFBundleIconFile</key><string>Sotto</string>
+  <key>CFBundleName</key><string>Kaho</string>
+  <key>CFBundleDisplayName</key><string>Kaho</string>
+  <key>CFBundleIdentifier</key><string>com.utsavanand.kaho</string>
+  <key>CFBundleExecutable</key><string>kaho</string>
+  <key>CFBundleIconFile</key><string>Kaho</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
-  <key>NSMicrophoneUsageDescription</key><string>Sotto records while you hold the hotkey and transcribes on-device.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Kaho records while you hold the hotkey and transcribes on-device.</string>
 </dict>
 </plist>
 PLIST
 
-cat > "$STAGE/Contents/MacOS/sotto" <<LAUNCH
+cat > "$STAGE/Contents/MacOS/kaho" <<LAUNCH
 #!/bin/zsh
-exec "$SUPPORT/venv/bin/python" "\$(cd "\$(dirname "\$0")/../Resources" && pwd)/sotto.py"
+exec "$SUPPORT/venv/bin/python" "\$(cd "\$(dirname "\$0")/../Resources" && pwd)/kaho.py"
 LAUNCH
-chmod +x "$STAGE/Contents/MacOS/sotto"
+chmod +x "$STAGE/Contents/MacOS/kaho"
 
 # Ad-hoc signature: local install needs no notarization, and a signature gives
 # the bundle a stabler TCC identity than none at all
@@ -78,7 +89,7 @@ rm -rf "$APP"
 mv "$STAGE" "$APP"
 
 echo ""
-echo "done. launch with:  open /Applications/Sotto.app"
-echo "then grant Sotto in System Settings > Privacy & Security:"
+echo "done. launch with:  open /Applications/Kaho.app"
+echo "then grant Kaho in System Settings > Privacy & Security:"
 echo "  Microphone and Accessibility — and relaunch."
-echo "log file: ~/Library/Logs/Sotto.log (also in the menu bar: 🎙 > Open Log)"
+echo "log file: ~/Library/Logs/Kaho.log (also in the menu bar: 🎙 > Open Log)"

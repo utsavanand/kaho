@@ -14,11 +14,11 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install ruff==0.16.5
-      # Every Python file, not just sotto.py — tools/check_docs_sync.py had
+      # Every Python file, not just kaho.py — tools/check_docs_sync.py had
       # five findings nothing was looking at. The spec has to be named
       # explicitly because ruff only discovers .py by extension.
-      - run: ruff check . packaging/Sotto.spec
-      - run: python -m py_compile sotto.py tools/check_docs_sync.py
+      - run: ruff check . packaging/Kaho.spec
+      - run: python -m py_compile kaho.py tools/check_docs_sync.py
       # These are zsh scripts, and bash -n was only approximating them
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
       - run: zsh -n install.sh run.sh packaging/release.sh packaging/setup-signing.sh
@@ -29,7 +29,7 @@ jobs:
   # No dependencies and no Mac: the suite stubs AppKit, Quartz, sounddevice and
   # the MLX packages in sys.modules, so the logic that keeps breaking by hand —
   # the tap state machine, the settings migration, the recording handoff — is
-  # covered on a plain Linux runner. See tests/test_sotto.py.
+  # covered on a plain Linux runner. See tests/test_kaho.py.
   tests:
     runs-on: ubuntu-latest
     steps:
@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: "3.13"
       # numpy is the one real dependency the suite needs: the audio drop rules
-      # work on arrays, and tests/test_sotto.py skips those cases without it
+      # work on arrays, and tests/test_kaho.py skips those cases without it
       - run: pip install "numpy>=2.5,<3"
       - run: python -m unittest discover -s tests -t . -v
 

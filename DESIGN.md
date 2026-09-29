@@ -1,4 +1,4 @@
-# sotto — design
+# kaho — design
 
 A local clone of Wispr Flow's core loop: hold a key anywhere on macOS, speak,
 release, and the transcribed text is inserted into whatever app has focus.
@@ -49,7 +49,7 @@ detail.
 
 ## Stack
 
-- Python 3.13, single process, one file (`sotto.py`) + `run.sh`
+- Python 3.13, single process, one file (`kaho.py`) + `run.sh`
 - **Model**: `mlx-community/whisper-large-v3-turbo` via `mlx-whisper`.
   MLX runs on the M4 Max GPU; steady-state inference for one utterance lands
   well under a second there (weights ~1.6 GB; resident footprint is higher
@@ -111,7 +111,7 @@ worker thread     ──▶ loops on Queue.get(): transcribe ▸ optional rewrit
 
 ## macOS permissions (manual, one-time)
 
-Sotto.app needs exactly two grants (Input Monitoring stopped being required
+Kaho.app needs exactly two grants (Input Monitoring stopped being required
 in 1.1.1, when the CGEventTap was replaced with NSEvent monitors):
 
 1. **Microphone** — prompted automatically on first recording
@@ -125,7 +125,7 @@ no keys" or "transcribes but never pastes." Startup checks
 `CGPreflightPostEventAccess()` and shows a pointer to System Settings; since
 1.7.9 the same check runs before every paste, so a grant revoked mid-session
 surfaces on the pill instead of failing silently. When running from the repo
-with run.sh, the grants attach to the launching terminal instead of Sotto.
+with run.sh, the grants attach to the launching terminal instead of Kaho.
 
 ## Failure modes
 
@@ -159,7 +159,7 @@ with run.sh, the grants attach to the launching terminal instead of Sotto.
 The original v1 plan, kept as the record of what was verified before the app
 existed. For today's setup see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-1. Scaffold the repo: `sotto.py`, `run.sh`, `requirements.txt`, `README.md`
+1. Scaffold the repo: `kaho.py`, `run.sh`, `requirements.txt`, `README.md`
 2. `python3 -m venv .venv` and `pip install -r requirements.txt`
 3. Verify the model end-to-end without a mic: generate a spoken wav with
    macOS `say`, load it, run it through the same `transcribe()` call the app
@@ -185,16 +185,16 @@ visible in the log instead of manifesting as mystery transcripts. A peak of
 exactly ~0 additionally means macOS delivered no signal (mic permission), and
 is reported as such instead of being transcribed into a hallucination.
 
-### Packaging as Sotto.app
+### Packaging as Kaho.app
 
 Users install by cloning the repo and running `install.sh`, which builds the
-.app locally: venv in `~/Library/Application Support/Sotto`, a hand-rolled
+.app locally: venv in `~/Library/Application Support/Kaho`, a hand-rolled
 bundle (Info.plist + zsh launcher that execs the venv python) in
 `/Applications`, ad-hoc codesigned. Chosen over the alternatives because:
 
 - Building locally means no quarantine attribute → no Gatekeeper block → no
   $99/yr notarization needed
-- TCC prompts attribute to "Sotto" (the bundle), not the user's terminal —
+- TCC prompts attribute to "Kaho" (the bundle), not the user's terminal —
   which also removes the v1 gotcha of grants dying with the terminal binding
 - py2app/PyInstaller bundling of MLX + model was rejected: multi-GB artifact,
   fragile, and still unsigned
@@ -205,7 +205,7 @@ bundle (Info.plist + zsh launcher that execs the venv python) in
 built directly on `NSStatusBar` — rumps provided it until 1.1.0, where its
 item turned out to be invisible when the app was launched from a bundle — and
 a 0.3 s `NSTimer` polls the state variable, because AppKit UI must only be
-touched from the main thread. All logs go to `~/Library/Logs/Sotto.log` as
+touched from the main thread. All logs go to `~/Library/Logs/Kaho.log` as
 well as stdout, since a double-clicked app has no terminal.
 
 ### Hotkey via NSEvent monitors (v1.1.1)

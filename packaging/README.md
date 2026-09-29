@@ -1,11 +1,11 @@
 # Packaging
 
-Two ways to get Sotto, for two different audiences.
+Two ways to get Kaho, for two different audiences.
 
 ## `install.sh` — build from source
 
-Builds a venv into `~/Library/Application Support/Sotto` and points a thin
-`/Applications/Sotto.app` launcher at it. Requires Homebrew and Python 3.13.
+Builds a venv into `~/Library/Application Support/Kaho` and points a thin
+`/Applications/Kaho.app` launcher at it. Requires Homebrew and Python 3.13.
 
 This bundle is **not distributable**: the venv's `python3.13` is a symlink into
 Homebrew, so a copy handed to someone else is a dead link on a machine without
@@ -24,7 +24,7 @@ a stock Mac with no Gatekeeper warning and no terminal.
 ### One-time setup
 
 1. **Certificate.** A CSR and private key are already generated at
-   `~/Desktop/sotto-signing/`. Go to developer.apple.com → Certificates → **+**
+   `~/Desktop/kaho-signing/`. Go to developer.apple.com → Certificates → **+**
    → *Developer ID Application*, upload
    `DeveloperID.certSigningRequest` when asked, download the `.cer`, then:
 
@@ -41,7 +41,7 @@ a stock Mac with no Gatekeeper warning and no terminal.
 
 3. **Store the credentials** (once per machine):
    ```sh
-   xcrun notarytool store-credentials sotto-notary \
+   xcrun notarytool store-credentials kaho-notary \
      --apple-id "you@example.com" --team-id "TEAMID" --password "xxxx-xxxx-xxxx-xxxx"
    ```
    Team ID is at developer.apple.com → Membership.
@@ -56,7 +56,7 @@ which keeps the DMG under GitHub's 2 GB release limit.
 ### Verifying before you publish
 
 ```sh
-spctl -a -t open --context context:primary-signature -v build-release/Sotto-<version>.dmg
+spctl -a -t open --context context:primary-signature -v build-release/Kaho-<version>.dmg
 ```
 Should print `accepted` and `source=Notarized Developer ID`. The honest test is
 a machine that has never seen the app — a fresh user account works.

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Build, sign, notarize, and package Sotto.app as a distributable DMG.
+# Build, sign, notarize, and package Kaho.app as a distributable DMG.
 #
 # Unlike install.sh (which builds against the user's own Python and is not
 # distributable), this produces a self-contained bundle for people who will
@@ -21,7 +21,9 @@ VERSION="${1:-}"
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$SRC/build-release"
-NOTARY_PROFILE="${SOTTO_NOTARY_PROFILE:-sotto-notary}"
+# The keychain profile keeps its original name: renaming it would require
+# re-entering the app-specific password for zero benefit.
+NOTARY_PROFILE="${KAHO_NOTARY_PROFILE:-sotto-notary}"
 
 # Resolve the Developer ID automatically: hardcoding it means every machine
 # needs an edit, and the hash changes when the certificate is renewed
@@ -39,10 +41,10 @@ echo "signing as: $IDENTITY"
 echo "==> building the bundle"
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
-SOTTO_VERSION="$VERSION" "$SRC/.venv/bin/pyinstaller" "$SRC/packaging/Sotto.spec" \
+KAHO_VERSION="$VERSION" "$SRC/.venv/bin/pyinstaller" "$SRC/packaging/Kaho.spec" \
     --noconfirm --distpath "$BUILD/dist" --workpath "$BUILD/work" >/dev/null
 
-APP="$BUILD/dist/Sotto.app"
+APP="$BUILD/dist/Kaho.app"
 [[ -d "$APP" ]] || { echo "build produced no app bundle"; exit 1; }
 
 echo "==> signing"
@@ -70,18 +72,18 @@ codesign --force --deep --timestamp --options runtime \
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 echo "==> packaging the dmg"
-DMG="$BUILD/Sotto-$VERSION.dmg"
+DMG="$BUILD/Kaho-$VERSION.dmg"
 STAGE="$BUILD/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"   # drag-to-install target
-# The volume name must not be "Sotto": hdiutil mounts the image at
-# /Volumes/<volname> while building, and something on this machine holds a
-# claim on /Volumes/Sotto that survives a detach — every attempt fails with a
-# bare "Operation not permitted" naming no cause. "Sotto Installer" also reads
-# better in the Finder title bar when the image is opened.
-hdiutil detach "/Volumes/Sotto Installer" -force >/dev/null 2>&1 || true
-hdiutil create -volname "Sotto Installer" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+# The volume name is deliberately not the bare app name: hdiutil mounts the
+# image at /Volumes/<volname> while building, and under the old name something
+# on this machine held a claim on /Volumes/Sotto that survived a detach — every
+# attempt failed with a bare "Operation not permitted" naming no cause.
+# "Kaho Installer" also reads better in the Finder title bar.
+hdiutil detach "/Volumes/Kaho Installer" -force >/dev/null 2>&1 || true
+hdiutil create -volname "Kaho Installer" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
 echo "==> notarizing (usually minutes; large uploads can take an hour)"
