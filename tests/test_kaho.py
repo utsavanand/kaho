@@ -584,8 +584,34 @@ class TestMenuWiring(unittest.TestCase):
         self.assertNotIn("openLog:", [action for _, action, _ in built])
         self.assertIn(("Quit Kaho", "terminate:", "q"), built)
         self.assertIn(("Settings…", "showSettings:", ","), built)
-        # The separator that sits above Quit
-        kaho.AppKit.NSMenuItem.separatorItem.assert_called_once()
+        # One above Quit, one inside the Edit menu
+        self.assertEqual(kaho.AppKit.NSMenuItem.separatorItem.call_count, 2)
+
+    def test_the_edit_menu_carries_the_standard_shortcuts(self):
+        """⌘C and friends are routed by the menu bar, not by the focused view.
+
+        Without this menu they did nothing anywhere in the app: copying a
+        transcript out of History needed a right-click.
+        """
+        kaho.AppKit.NSMenuItem.reset_mock()
+        with mock.patch.object(kaho, "status_item", mock.MagicMock()):
+            kaho.install_app_menu()
+        built = [
+            call[0]
+            for call in kaho.AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_.call_args_list
+        ]
+        for entry in (
+            ("Copy", "copy:", "c"),
+            ("Paste", "paste:", "v"),
+            ("Cut", "cut:", "x"),
+            ("Select All", "selectAll:", "a"),
+        ):
+            self.assertIn(entry, built)
+        # No setTarget_ for these: a nil target is what sends them down the
+        # responder chain to the view that has focus
+        self.assertTrue(
+            any("Edit" in str(c) for c in kaho.AppKit.NSMenu.alloc().initWithTitle_.call_args_list)
+        )
 
 
 class TestSettingsWiring(KahoTestCase):

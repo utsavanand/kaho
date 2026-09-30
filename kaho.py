@@ -1556,6 +1556,9 @@ class HistoryWindow(AppKit.NSObject):
         scroll.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
         tv = AppKit.NSTextView.alloc().initWithFrame_(scroll.bounds())
         tv.setEditable_(False)
+        # Explicit: read-only must not mean unselectable, or there is no way
+        # to get a transcript out of this window
+        tv.setSelectable_(True)
         tv.setFont_(AppKit.NSFont.systemFontOfSize_(13))
         tv.setTextContainerInset_((14, 14))
         tv.setAutoresizingMask_(AppKit.NSViewWidthSizable)
@@ -1644,6 +1647,32 @@ def install_app_menu():
             item.setTarget_(status_item)
         app_menu.addItem_(item)
     app_item.setSubmenu_(app_menu)
+
+    # macOS routes ⌘C/⌘V/⌘X/⌘A through the menu bar, so without an Edit menu
+    # they do nothing anywhere in the app — copying out of History needed a
+    # right-click, and the dictionary editor could not be pasted into.
+    # Targets stay nil on purpose: AppKit then sends each action down the
+    # responder chain to whatever view has focus.
+    edit_item = AppKit.NSMenuItem.alloc().init()
+    main_menu.addItem_(edit_item)
+    edit_menu = AppKit.NSMenu.alloc().initWithTitle_("Edit")
+    for title, action, key in (
+        ("Undo", "undo:", "z"),
+        ("Redo", "redo:", "Z"),
+        (None, None, None),
+        ("Cut", "cut:", "x"),
+        ("Copy", "copy:", "c"),
+        ("Paste", "paste:", "v"),
+        ("Select All", "selectAll:", "a"),
+    ):
+        if title is None:
+            edit_menu.addItem_(AppKit.NSMenuItem.separatorItem())
+            continue
+        edit_menu.addItem_(
+            AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
+        )
+    edit_item.setSubmenu_(edit_menu)
+
     AppKit.NSApp.setMainMenu_(main_menu)
 
 
