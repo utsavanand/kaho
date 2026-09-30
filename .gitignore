@@ -6,3 +6,4 @@ temp/
 uv-out/
 build-release/
 .claude/
+build-bench/
