@@ -429,15 +429,45 @@ def audio_wedged():
     return started is not None and time.monotonic() - started > 5
 
 
+def relaunch():
+    """Quit and start a fresh copy.
+
+    The only way out of a wedged audio device: PortAudio's stop can block
+    forever inside CoreAudio (observed in FinishStoppingStream after a long
+    dictation), and that thread cannot be interrupted from here.
+    """
+    # NOT NSBundle.mainBundle(): the process runs out of Homebrew's
+    # Python.app, so that returns the Python framework and reopening it does
+    # nothing at all — the app would quit and never come back. This file
+    # lives in Kaho.app/Contents/Resources, so walk up to the bundle.
+    resources = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.dirname(os.path.dirname(resources))
+    if not path.endswith(".app"):
+        log(f"not running from an app bundle ({path}) — quit and start it again by hand")
+        AppKit.NSApp.terminate_(None)
+        return
+    # `open -n` after a delay: the replacement has to start once this copy is
+    # gone, or macOS just activates the dying instance instead of launching one
+    subprocess.Popen(
+        ["/bin/sh", "-c", f'sleep 1; open -n "{path}"'],
+        start_new_session=True,
+    )
+    log(f"relaunching {path} to clear the wedged audio device")
+    AppKit.NSApp.terminate_(None)
+
+
 def start_recording():
     global state, record_buf
     if state != "ready":
         return
     if audio_wedged():
+        # Say so on screen, not just in the log: this used to fail silently,
+        # and the only symptom was dictation quietly not working
         log(
-            "audio device is not responding — recording skipped. Quit other "
-            "audio apps (e.g. another dictation tool) or relaunch Kaho."
+            "audio device is not responding — recording skipped. "
+            "Use Restart Kaho in the menu to recover."
         )
+        overlay.show_wedged()
         return
     with recording_lock:
         # Re-checked under the lock: the audio thread also moves `state` back to
@@ -1029,6 +1059,7 @@ PHASE_LABELS = {
     "rewriting": "Rewriting…",
     "done": "Pasted",
     "blocked": "Not pasted — ⌘V",
+    "wedged": "Mic stuck — Restart Kaho",
 }
 
 # Secure input (password fields, Terminal's "Secure Keyboard Entry", sudo
@@ -1098,9 +1129,9 @@ def draw_elapsed(view, bounds):
 def draw_phase(phase, ticks, bounds):
     # Three dots cycling left-to-right: cheap to draw, reads as "working"
     # without a spinner's implication of a known duration
-    r, g, b = (1.0, 0.72, 0.30) if phase == "blocked" else (0.48, 0.64, 0.97)
+    r, g, b = (1.0, 0.72, 0.30) if phase in ("blocked", "wedged") else (0.48, 0.64, 0.97)
     for i in range(3):
-        alpha = 0.9 if phase in ("done", "blocked") else 0.25 + 0.65 * (
+        alpha = 0.9 if phase in ("done", "blocked", "wedged") else 0.25 + 0.65 * (
             0.5 + 0.5 * np.sin(ticks * 0.28 - i * 0.9)
         )
         AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha).setFill()
@@ -1233,6 +1264,20 @@ class Overlay(AppKit.NSObject):
         self.done_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             3.5, self, "hideTimer:", None, False
         )
+
+    def show_wedged(self):
+        """Report a stuck audio device, and stay up until it is dealt with.
+
+        Unlike every other phase this one does not time out: the device stays
+        broken until the app is relaunched, so a pill that faded away would
+        just let the next dictation fail silently too.
+        """
+        self.cancelWatchdog()
+        if self.done_timer:
+            self.done_timer.invalidate()
+            self.done_timer = None
+        self.panel.orderFrontRegardless()
+        self.setPhase_("wedged")
 
     def finish(self):
         """Flash 'Pasted' briefly, then hide — a silent disappearance makes a
@@ -1568,6 +1613,7 @@ MENU_ACTIONS = (
     ("History…", "showHistory:", "h"),
     ("Open Log", "openLog:", ""),
     ("Report a Bug…", "reportBug:", ""),
+    ("Restart Kaho", "restart:", ""),
     ("Quit Kaho", "quit:", "q"),
 )
 APP_MENU_OMITS = ("openLog:",)
@@ -1746,6 +1792,9 @@ class StatusItem(AppKit.NSObject):
                 f"&body={urllib.parse.quote(body)}"
             )
             AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(url))
+
+    def restart_(self, _sender):
+        relaunch()
 
     def quit_(self, _sender):
         AppKit.NSApp.terminate_(None)

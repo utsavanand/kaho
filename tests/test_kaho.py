@@ -353,6 +353,19 @@ class TestRecordingHandoff(KahoTestCase):
         self.assertEqual(kaho.state, "ready")
         self.assertTrue(any("not responding" in m for m in self.logged))
 
+    def test_a_wedged_audio_device_says_so_on_screen(self):
+        # It used to only reach the log, so the symptom was dictation
+        # silently doing nothing at all
+        kaho.audio_op_started = self.clock.now - 10
+        kaho.start_recording()
+        kaho.overlay.show_wedged.assert_called_once()
+
+    def test_an_op_that_is_merely_slow_is_not_treated_as_wedged(self):
+        kaho.audio_op_started = self.clock.now - 1
+        kaho.start_recording()
+        self.assertEqual(kaho.state, "recording")
+        kaho.overlay.show_wedged.assert_not_called()
+
 
 class TestSettings(KahoTestCase):
     def test_a_missing_file_keeps_the_defaults(self):
@@ -748,7 +761,8 @@ class TestConstantsAgree(unittest.TestCase):
 
     def test_every_post_release_phase_has_a_label(self):
         self.assertEqual(
-            set(kaho.PHASE_LABELS), {"transcribing", "rewriting", "done", "blocked"}
+            set(kaho.PHASE_LABELS),
+            {"transcribing", "rewriting", "done", "blocked", "wedged"},
         )
 
     def test_hotkeys_are_distinct_and_labelled(self):
@@ -758,6 +772,51 @@ class TestConstantsAgree(unittest.TestCase):
         self.assertEqual(len(set(keycodes)), len(keycodes))
         self.assertEqual(len(set(masks)), len(masks))
         self.assertEqual(len(set(labels)), len(labels))
+
+
+class TestRelaunch(KahoTestCase):
+    """Recovering from a wedged audio device is the only cure for it."""
+
+    def setUp(self):
+        super().setUp()
+        kaho.AppKit.NSApp.terminate_.reset_mock()
+
+    def test_it_reopens_the_app_bundle_then_quits(self):
+        with mock.patch.object(kaho, "__file__", "/Applications/Kaho.app/Contents/Resources/kaho.py"), \
+             mock.patch.object(kaho.subprocess, "Popen") as popen:
+            kaho.relaunch()
+
+        command = popen.call_args.args[0][-1]
+        self.assertIn("/Applications/Kaho.app", command)
+        # The bundle, not the file inside it, and not Contents/Resources
+        self.assertNotIn("Resources", command)
+        # `open -n`, or macOS activates the instance on its way out instead
+        # of launching a fresh one
+        self.assertIn("open -n", command)
+        # Detached, or the replacement dies with the process that spawned it
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        kaho.AppKit.NSApp.terminate_.assert_called_once()
+
+    def test_the_replacement_waits_for_this_copy_to_exit(self):
+        with mock.patch.object(kaho, "__file__", "/Applications/Kaho.app/Contents/Resources/kaho.py"), \
+             mock.patch.object(kaho.subprocess, "Popen") as popen:
+            kaho.relaunch()
+        self.assertIn("sleep", popen.call_args.args[0][-1])
+
+    def test_run_from_source_it_quits_rather_than_reopening_nothing(self):
+        """Relaunching only works from a bundle.
+
+        The first version of this used NSBundle.mainBundle(), which returns
+        Homebrew's Python.app because that is the running executable — so it
+        reopened the Python framework, the app quit, and nothing came back.
+        """
+        with mock.patch.object(kaho, "__file__", "/Users/me/src/kaho/kaho.py"), \
+             mock.patch.object(kaho.subprocess, "Popen") as popen:
+            kaho.relaunch()
+
+        popen.assert_not_called()
+        kaho.AppKit.NSApp.terminate_.assert_called_once()
+        self.assertTrue(any("by hand" in m for m in self.logged))
 
 
 class TestSottoMigration(KahoTestCase):
