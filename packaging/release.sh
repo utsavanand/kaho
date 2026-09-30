@@ -62,10 +62,30 @@ cat > "$BUILD/entitlements.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Sign inner binaries before the bundle: codesign requires depth-first order
-find "$APP/Contents" \( -name "*.so" -o -name "*.dylib" \) -print0 \
-    | xargs -0 -I {} codesign --force --timestamp --options runtime \
-        --entitlements "$BUILD/entitlements.plist" --sign "$IDENTITY" {} 2>/dev/null || true
+# Sign inner binaries before the bundle: codesign requires depth-first order.
+#
+# Retried, and NOT silenced. --timestamp contacts Apple's timestamp server for
+# every binary, and a single refused connection produces one dylib signed
+# without a timestamp. That used to be swallowed by `2>/dev/null || true`, so
+# the run continued, the outer signature was applied over an inner binary that
+# was later re-signed, and the verify failed with "a timestamp was expected"
+# on a bundle that could no longer be repaired in place.
+sign_inner() {
+    find "$APP/Contents" \( -name "*.so" -o -name "*.dylib" \) -print0 \
+        | xargs -0 -P 4 -I {} codesign --force --timestamp --options runtime \
+            --entitlements "$BUILD/entitlements.plist" --sign "$IDENTITY" {}
+}
+for attempt in 1 2 3; do
+    if sign_inner; then
+        break
+    fi
+    if [[ $attempt == 3 ]]; then
+        echo "inner binaries could not be signed after 3 attempts — see the errors above"
+        exit 1
+    fi
+    echo "signing failed (likely the timestamp server) — retrying in 15s"
+    sleep 15
+done
 
 codesign --force --deep --timestamp --options runtime \
     --entitlements "$BUILD/entitlements.plist" --sign "$IDENTITY" "$APP"
