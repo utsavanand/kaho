@@ -277,6 +277,16 @@ history_win = None
 settings_win = None
 status_item = None  # StatusItem delegate, so windows can refresh the menu
 locked = False
+# Bumped by Escape. A job carries the value it was queued with; when they no
+# longer match, the result is dropped instead of pasted. MLX inference is one
+# blocking call that cannot be interrupted, so cancelling suppresses the paste
+# rather than stopping the work — which is the part that matters, since the
+# damage is unwanted text landing in the user's document.
+job_generation = 0
+# Set by Escape during a recording, cleared when the audio is dropped. The
+# generation counter cannot cover this case: _finish_recording reads the
+# counter on the audio thread after the bump has landed.
+cancel_recording = False
 press_time = 0.0
 last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
@@ -604,12 +614,20 @@ def _finish_recording(s, buf):
         _shutdown_stream(s)
         if time.monotonic() - t0 > 3:
             log("audio device was slow to release — another audio app may be fighting for the mic")
+    global cancel_recording
+    # Consume the flag at the single point the job is queued. An earlier check
+    # can be bypassed: when the key is released before the open lands,
+    # _open_stream finishes the recording itself, on its own queued op.
+    if cancel_recording:
+        cancel_recording = False
+        AppHelper.callAfter(overlay.hide)
+        return
     audio, message = _audio_or_drop_reason(buf)
     log(message)
     if audio is None:
         AppHelper.callAfter(overlay.hide)
         return
-    jobs.put(audio)
+    jobs.put((audio, job_generation))
 
 
 def schedule_deferred_stop(tap_time):
@@ -683,6 +701,42 @@ def handle_flags_changed(event):
         stop_recording()
 
 
+ESCAPE_KEYCODE = 53
+
+
+def cancel_pending_job():
+    """Escape: drop whatever is in flight instead of pasting it.
+
+    MLX inference is a single blocking call, so the transcription or rewrite
+    already running cannot be stopped — bumping the generation makes the
+    worker throw the result away when it finishes. Recording, by contrast,
+    really is stopped.
+    """
+    global job_generation, locked, cancel_recording
+    if state != "recording" and not overlay.is_working():
+        return False
+    job_generation += 1
+    if state == "recording":
+        # NOT a generation bump: _finish_recording runs later, on the audio
+        # thread, and reads job_generation at that point — so any bump made
+        # here is already folded in by the time it queues the job, and the
+        # recording pastes anyway. The audio has to be dropped outright.
+        cancel_recording = True
+        locked = False
+        stop_recording()
+        log("cancelled the recording")
+    else:
+        log("cancelled — the result will be discarded")
+    overlay.hide()
+    return True
+
+
+def handle_key_down(event):
+    if event.keyCode() == ESCAPE_KEYCODE:
+        return cancel_pending_job()
+    return False
+
+
 # NSEvent monitors instead of a CGEventTap: same job for a single modifier
 # key, but gated on Accessibility only — a tap would additionally require
 # the Input Monitoring permission (this is how Wispr Flow gets away with
@@ -696,6 +750,16 @@ def install_hotkey_monitors():
         ),
         AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
             AppKit.NSEventMaskFlagsChanged, lambda e: (handle_flags_changed(e), e)[1]
+        ),
+        # Escape cancels. Global so it works while dictating into another app,
+        # which is the only place a dictation is ever in flight.
+        AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskKeyDown, handle_key_down
+        ),
+        # Locally, swallow the Escape that cancels so it does not also reach
+        # the focused window; pass every other key through untouched.
+        AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskKeyDown, lambda e: None if handle_key_down(e) else e
         ),
     ]
 
@@ -926,12 +990,57 @@ def paste(text):
 
 # All slow work happens here: the hotkey handler runs on the main run loop,
 # and blocking it would freeze the menu bar and delay key handling.
+def run_job(audio, generation, t0):
+    """Transcribe, optionally rewrite, and paste one recording.
+
+    Split out of worker() so the cancel path can be tested against the real
+    code rather than a copy of it. `continue` in the loop becomes `return`.
+    """
+    global last_inference
+    text = transcribe(audio)
+    if generation != job_generation:
+        # The models did run, so this still counts against idle warmup
+        last_inference = time.monotonic()
+        log("cancelled during transcription — nothing pasted")
+        return
+    if looks_hallucinated(text):
+        log(f"dropped: transcription looks like a repetition loop ({len(text.split())} words)")
+        AppHelper.callAfter(overlay.hide)
+        return
+    mode = settings["rewrite"]
+    if text and mode != "off":
+        AppHelper.callAfter(overlay.setPhase_, "rewriting")
+        text = rewrite(text, mode) or text
+        if generation != job_generation:
+            last_inference = time.monotonic()
+            log("cancelled during rewriting — nothing pasted")
+            return
+    if text:
+        reason = paste_blocked_reason()
+        if reason is None:
+            paste(text)
+            append_history(text)
+            AppHelper.callAfter(overlay.finish)
+        else:
+            # Leave the transcript on the clipboard (no restore) so one manual
+            # Cmd+V recovers the dictation, and say so on the pill — a silent
+            # no-op here reads as a dead app.
+            set_clipboard(text)
+            append_history(text)
+            log(f"paste blocked: {reason} — transcript is on the clipboard")
+            AppHelper.callAfter(overlay.blocked)
+    else:
+        AppHelper.callAfter(overlay.hide)
+    last_inference = time.monotonic()
+    log(f"[{time.monotonic() - t0:.2f}s] {text or '(empty transcription, nothing pasted)'}")
+
+
 def worker():
     global last_inference
     while True:
-        audio = jobs.get()
+        job = jobs.get()
         t0 = time.monotonic()
-        if audio is WARMUP:
+        if job is WARMUP:
             try:
                 transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), use_dictionary=False)
                 if rewriter is not None and settings["rewrite"] != "off":
@@ -945,33 +1054,7 @@ def worker():
         # The sole worker must outlive any single bad job, or dictation dies
         # silently while the UI still shows ready
         try:
-            text = transcribe(audio)
-            if looks_hallucinated(text):
-                log(f"dropped: transcription looks like a repetition loop ({len(text.split())} words)")
-                AppHelper.callAfter(overlay.hide)
-                continue
-            mode = settings["rewrite"]
-            if text and mode != "off":
-                AppHelper.callAfter(overlay.setPhase_, "rewriting")
-                text = rewrite(text, mode) or text
-            if text:
-                reason = paste_blocked_reason()
-                if reason is None:
-                    paste(text)
-                    append_history(text)
-                    AppHelper.callAfter(overlay.finish)
-                else:
-                    # Leave the transcript on the clipboard (no restore) so
-                    # one manual Cmd+V recovers the dictation, and say so on
-                    # the pill — a silent no-op here reads as a dead app.
-                    set_clipboard(text)
-                    append_history(text)
-                    log(f"paste blocked: {reason} — transcript is on the clipboard")
-                    AppHelper.callAfter(overlay.blocked)
-            else:
-                AppHelper.callAfter(overlay.hide)
-            last_inference = time.monotonic()
-            log(f"[{time.monotonic() - t0:.2f}s] {text or '(empty transcription, nothing pasted)'}")
+            run_job(*job, t0)
         except Exception as e:  # noqa: BLE001
             AppHelper.callAfter(overlay.hide)
             log(f"transcription failed: {e!r} — dictation continues")
@@ -1284,6 +1367,13 @@ class Overlay(AppKit.NSObject):
             self.done_timer.invalidate()
         self.done_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             3.5, self, "hideTimer:", None, False
+        )
+
+    def is_working(self):
+        """True while a dictation is in flight and could still be cancelled."""
+        return self.panel.isVisible() and getattr(self.view, "phase", None) in (
+            "transcribing",
+            "rewriting",
         )
 
     def show_wedged(self):

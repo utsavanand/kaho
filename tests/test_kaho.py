@@ -836,6 +836,123 @@ class TestLanguage(KahoTestCase):
         self.assertEqual(kaho.settings["language"], "auto")
 
 
+@unittest.skipUnless(HAVE_NUMPY, "cancel tests need real audio buffers")
+class TestCancel(KahoTestCase):
+    """Escape has to stop an unwanted dictation from landing in the document."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(kaho, "job_generation", 0))
+        self.enterContext(mock.patch.object(kaho, "cancel_recording", False))
+
+    def escape(self):
+        return kaho.handle_key_down(FakeEvent(kaho.ESCAPE_KEYCODE, 0))
+
+    def test_escape_while_recording_stops_it_and_discards_the_audio(self):
+        kaho.overlay.is_working.return_value = False
+        self.down()
+        self.run_audio_ops()
+        self.assertEqual(kaho.state, "recording")
+        self.speak()
+
+        self.assertTrue(self.escape())
+
+        self.assertEqual(kaho.state, "ready")
+        # The audio is dropped outright rather than versioned: _finish_recording
+        # runs later on the audio thread and would read the post-bump counter
+        self.assertTrue(kaho.cancel_recording)
+        self.run_audio_ops()
+        self.assertEqual(self.queued_audio(), [], "cancelled audio was queued anyway")
+
+    def test_a_cancelled_job_is_not_pasted(self):
+        """The worker drops a result whose generation no longer matches.
+
+        MLX inference cannot be interrupted, so this is what cancelling
+        actually buys: the text is computed and then thrown away.
+        """
+        kaho.jobs.put((mock.MagicMock(), 0))
+        kaho.job_generation = 1
+        kaho.mlx_whisper.transcribe.return_value = {"text": "unwanted text"}
+
+        with mock.patch.object(kaho, "paste") as paste, \
+             mock.patch.object(kaho, "append_history") as history:
+            self.run_one_job()
+
+        paste.assert_not_called()
+        history.assert_not_called()
+        self.assertTrue(any("cancelled" in m for m in self.logged))
+
+    def test_an_uncancelled_job_still_pastes(self):
+        kaho.jobs.put((mock.MagicMock(), 0))
+        kaho.mlx_whisper.transcribe.return_value = {"text": "wanted text"}
+
+        with mock.patch.object(kaho, "paste") as paste, \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            self.run_one_job()
+
+        paste.assert_called_once_with("wanted text")
+
+    def test_the_next_recording_is_not_dropped_by_a_stale_cancel(self):
+        kaho.overlay.is_working.return_value = False
+        self.down()
+        self.escape()
+        self.run_audio_ops()
+
+        # Well clear of the double-tap window, so this is a fresh dictation
+        # rather than the second half of a double-tap
+        self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
+        self.down()
+        self.run_audio_ops()
+        self.assertFalse(kaho.cancel_recording)
+        self.speak()
+        self.clock.advance(2.0)
+        self.up()
+        self.run_audio_ops()
+        self.assertEqual(
+            len(self.queued_audio()), 1, "the recording after a cancel was dropped"
+        )
+
+    def test_escape_does_nothing_when_idle(self):
+        kaho.overlay.is_working.return_value = False
+        self.assertFalse(self.escape())
+        self.assertEqual(kaho.job_generation, 0)
+
+    def test_other_keys_are_passed_through(self):
+        kaho.overlay.is_working.return_value = True
+        self.assertFalse(kaho.handle_key_down(FakeEvent(kaho.ESCAPE_KEYCODE + 1, 0)))
+        self.assertEqual(kaho.job_generation, 0)
+
+    def speak(self):
+        """Put audible samples in the live buffer.
+
+        Without this every recording is dropped as "no audio captured", and a
+        test cannot tell a cancelled recording from an empty one — which let
+        two mutations of the cancel logic pass.
+        """
+        loud = REAL_NUMPY.full((kaho.SAMPLE_RATE, 1), 0.5, dtype="float32")
+        kaho.record_buf.append(loud)
+
+    def queued_audio(self):
+        """Dictation jobs on the queue, ignoring WARMUP.
+
+        start_recording() queues a warmup sentinel when the models have gone
+        idle, so `jobs.empty()` is not the question — whether the *recording*
+        made it through is.
+        """
+        items = []
+        while not kaho.jobs.empty():
+            item = kaho.jobs.get()
+            if item is not kaho.WARMUP:
+                items.append(item)
+        return items
+
+    def run_one_job(self):
+        """The real worker body, minus its `while True`."""
+        audio, generation = kaho.jobs.get()
+        kaho.run_job(audio, generation, self.clock.now)
+
+
 class TestRelaunch(KahoTestCase):
     """Recovering from a wedged audio device is the only cure for it."""
 
