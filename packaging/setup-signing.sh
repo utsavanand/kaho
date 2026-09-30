@@ -39,11 +39,18 @@ if security find-identity -v -p codesigning | grep -q "Developer ID Application"
     echo "Signing is ready. Next, store notarization credentials once:"
     echo ""
     echo "  xcrun notarytool store-credentials sotto-notary \\"
-    echo "    --apple-id \"getutsava@gmail.com\" \\"
-    echo "    --team-id \"<TEAM_ID>\" \\"
+    # The Apple Developer account, which is not the address used for bug
+    # reports — storing the profile under the wrong one validates at the time
+    # and then fails every lookup later with "no Keychain password item found"
+    echo "    --apple-id \"pingutsav@gmail.com\" \\"
+    # The certificate's common name ends in "(TEAMID)", so the team id does
+    # not have to be looked up by hand
+    TEAM_ID="$(security find-identity -v -p codesigning \
+        | grep "Developer ID Application" | head -1 \
+        | sed -E 's/.*\(([A-Z0-9]+)\)".*/\1/')"
+    echo "    --team-id \"${TEAM_ID:-<TEAM_ID>}\" \\"
     echo "    --password \"<app-specific-password>\""
     echo ""
-    echo "Team ID: developer.apple.com > Membership."
     echo "App-specific password: appleid.apple.com > Sign-In and Security."
     echo "Then:  ./packaging/release.sh <version>"
 else
