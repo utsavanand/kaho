@@ -248,7 +248,7 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 # it from here, and tools/check_docs_sync.py fails the build when the top of
 # CHANGELOG.md disagrees — the Kaho.spec copy had silently sat at 1.7.3 for six
 # releases, which is what a bundle built without KAHO_VERSION would have shipped.
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.0"
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
