@@ -41,12 +41,17 @@ telemetry.
 Recent transcripts (click to copy), your hotkey, rewrite mode, history,
 log, and one-click bug reports:
 
-<img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey and Rewrite submenus, Settings, History, Open Log, Report a Bug">
+<img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey, Language and Rewrite submenus, Settings, History, Open Log, Report a Bug">
 
-- **Settings…** — a real window (⌘,) for hotkey and rewrite mode
+- **Settings…** — a real window (⌘,) for hotkey, language and rewrite mode
 - **Edit Dictionary…** — names and jargon Whisper should spell your way
 - **Hotkey** — right Option (default), right Command, right Control, or right
   Shift. Right-side only: the left keys are needed for typing.
+- **Language** — detected automatically by default. Pin yours if short
+  dictations come back in the wrong script: Whisper guesses per 30-second
+  window, and on brief or noisy audio it guesses wrong.
+- **Restart Kaho** — recovers a stuck microphone. macOS's audio stack can
+  wedge mid-recording; the pill says so when it happens.
 - **Report a Bug…** — opens a pre-filled Mail draft with diagnostics and the
   log attached; nothing sends until you review it.
 

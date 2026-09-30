@@ -147,7 +147,9 @@ class KahoTestCase(unittest.TestCase):
             ("rewriter", None),
         ):
             self.enterContext(mock.patch.object(kaho, name, value))
-        self.enterContext(mock.patch.object(kaho, "settings", {"hotkey": "right_option", "rewrite": "off"}))
+        self.enterContext(mock.patch.object(
+            kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto"}
+        ))
         self.enterContext(mock.patch.object(kaho, "overlay", mock.MagicMock()))
 
         # Keep the log out of stdout, and let tests read what was logged
@@ -370,7 +372,10 @@ class TestRecordingHandoff(KahoTestCase):
 class TestSettings(KahoTestCase):
     def test_a_missing_file_keeps_the_defaults(self):
         kaho.load_settings()
-        self.assertEqual(kaho.settings, {"hotkey": "right_option", "rewrite": "off"})
+        self.assertEqual(
+            kaho.settings,
+            {"hotkey": "right_option", "rewrite": "off", "language": "auto"},
+        )
 
     def test_malformed_json_keeps_the_defaults(self):
         pathlib.Path(kaho.SETTINGS_PATH).write_text("{not json")
@@ -388,7 +393,10 @@ class TestSettings(KahoTestCase):
             json.dumps({"hotkey": "left_option", "rewrite": "shakespeare"})
         )
         kaho.load_settings()
-        self.assertEqual(kaho.settings, {"hotkey": "right_option", "rewrite": "off"})
+        self.assertEqual(
+            kaho.settings,
+            {"hotkey": "right_option", "rewrite": "off", "language": "auto"},
+        )
 
     def test_saved_settings_round_trip_and_stay_private(self):
         kaho.settings["rewrite"] = "caveman"
@@ -772,6 +780,34 @@ class TestConstantsAgree(unittest.TestCase):
         self.assertEqual(len(set(keycodes)), len(keycodes))
         self.assertEqual(len(set(masks)), len(masks))
         self.assertEqual(len(set(labels)), len(labels))
+
+
+class TestLanguage(KahoTestCase):
+    """Whisper mis-detects the language on short audio; pinning it is the cure."""
+
+    def transcribe_kwargs(self):
+        kaho.transcribe(mock.MagicMock(), use_dictionary=False)
+        return kaho.mlx_whisper.transcribe.call_args.kwargs
+
+    def test_auto_lets_whisper_detect(self):
+        kaho.settings["language"] = "auto"
+        self.assertIsNone(self.transcribe_kwargs()["language"])
+
+    def test_a_chosen_language_is_passed_through(self):
+        kaho.settings["language"] = "en"
+        self.assertEqual(self.transcribe_kwargs()["language"], "en")
+
+    def test_it_is_saved_and_reloaded(self):
+        kaho.apply_language("hi")
+        kaho.settings["language"] = "auto"
+        kaho.load_settings()
+        self.assertEqual(kaho.settings["language"], "hi")
+
+    def test_an_unknown_language_falls_back_to_auto(self):
+        # A settings file from a newer version must not break this one
+        pathlib.Path(kaho.SETTINGS_PATH).write_text(json.dumps({"language": "klingon"}))
+        kaho.load_settings()
+        self.assertEqual(kaho.settings["language"], "auto")
 
 
 class TestRelaunch(KahoTestCase):

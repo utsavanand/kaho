@@ -1,4 +1,19 @@
 # Changelog
+## 2.0.1 — 2026-09-30
+
+- A wedged audio device now says so and can be recovered. PortAudio's
+  stop can block forever inside CoreAudio — twice now, both times after a
+  long dictation — and the guard that skips recording while an audio op
+  is stuck only wrote to the log, so the symptom was dictation quietly
+  doing nothing. The pill now reports it and stays up, and a new Restart
+  Kaho menu item quits and reopens the app, which is the only cure: that
+  thread cannot be interrupted.
+- Language can be pinned. Whisper detects the language per 30-second
+  window when it is not told one, and on short or noisy audio it guesses
+  wrong — an English sentence comes back transliterated into another
+  script. Menu bar and Settings both offer a language; detection stays
+  the default.
+
 ## 2.0.0 — 2026-09-29
 
 - Renamed from Sotto to Kaho (Hindi कहो, "say it"). A commercial product

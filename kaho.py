@@ -53,6 +53,23 @@ MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
 REWRITE_REPO = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 REWRITE_REVISION = "50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b"
 REWRITE_SIZE_LABEL = "~2.3 GB"
+# Whisper detects the language per 30 s window when it is not told one, and
+# on short or noisy audio it guesses wrong — an English sentence comes back
+# transliterated into Hindi or Spanish. Pinning it removes that failure mode.
+# "auto" stays the default so multilingual users are not forced to choose.
+LANGUAGES = {
+    "auto": "Detect automatically",
+    "en": "English",
+    "hi": "Hindi",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "pt": "Portuguese",
+    "it": "Italian",
+    "ja": "Japanese",
+    "zh": "Chinese",
+}
+
 REWRITE_MODES = {
     "off": "Off",
     "clean": "Clean up",
@@ -231,7 +248,7 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 # it from here, and tools/check_docs_sync.py fails the build when the top of
 # CHANGELOG.md disagrees — the Kaho.spec copy had silently sat at 1.7.3 for six
 # releases, which is what a bundle built without KAHO_VERSION would have shipped.
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
@@ -263,7 +280,7 @@ locked = False
 press_time = 0.0
 last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
-settings = {"hotkey": "right_option", "rewrite": "off"}
+settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto"}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
@@ -312,6 +329,8 @@ def load_settings():
     mode = {"bullets": "structured"}.get(saved.get("rewrite"), saved.get("rewrite"))
     if mode in REWRITE_MODES:
         settings["rewrite"] = mode
+    if saved.get("language") in LANGUAGES:
+        settings["language"] = saved["language"]
 
 
 def save_settings():
@@ -710,6 +729,8 @@ def transcribe(audio, use_dictionary=True):
         # every window the same bias instead, without the feedback loop.
         condition_on_previous_text=False,
         initial_prompt=dictionary_prompt(terms) if terms else None,
+        # None lets Whisper detect; a code pins it
+        language=None if settings["language"] == "auto" else settings["language"],
     )["text"].strip()
 
 
@@ -1363,16 +1384,16 @@ class SettingsWindow(AppKit.NSObject):
             | AppKit.NSWindowStyleMaskMiniaturizable
         )
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (460, 366)), mask, AppKit.NSBackingStoreBuffered, False
+            ((0, 0), (460, 432)), mask, AppKit.NSBackingStoreBuffered, False
         )
         window.setTitle_("Kaho Settings")
         window.setReleasedWhenClosed_(False)
         window.center()
         content = window.contentView()
 
-        content.addSubview_(make_label("Hotkey", 24, 318, 13, bold=True))
+        content.addSubview_(make_label("Hotkey", 24, 384, 13, bold=True))
         self.hotkey_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 286), (412, 26)), False
+            ((24, 352), (412, 26)), False
         )
         for name, (_, _, label) in HOTKEYS.items():
             self.hotkey_popup.addItemWithTitle_(label)
@@ -1381,7 +1402,24 @@ class SettingsWindow(AppKit.NSObject):
         self.hotkey_popup.setAction_("hotkeyChanged:")
         content.addSubview_(self.hotkey_popup)
         content.addSubview_(
-            make_label("Hold to dictate. Right-side keys only.", 24, 264, 11, dim=True)
+            make_label("Hold to dictate. Right-side keys only.", 24, 330, 11, dim=True)
+        )
+
+        content.addSubview_(make_label("Language", 24, 302, 13, bold=True))
+        self.language_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            ((24, 270), (412, 26)), False
+        )
+        for code, label in LANGUAGES.items():
+            self.language_popup.addItemWithTitle_(label)
+            self.language_popup.lastItem().setRepresentedObject_(code)
+        self.language_popup.setTarget_(self)
+        self.language_popup.setAction_("languageChanged:")
+        content.addSubview_(self.language_popup)
+        content.addSubview_(
+            make_label(
+                "Pick yours if detection gets it wrong on short dictations.",
+                24, 252, 11, dim=True,
+            )
         )
 
         content.addSubview_(make_label("Rewrite", 24, 224, 13, bold=True))
@@ -1428,6 +1466,9 @@ class SettingsWindow(AppKit.NSObject):
         for i in range(self.hotkey_popup.numberOfItems()):
             if self.hotkey_popup.itemAtIndex_(i).representedObject() == settings["hotkey"]:
                 self.hotkey_popup.selectItemAtIndex_(i)
+        for i in range(self.language_popup.numberOfItems()):
+            if self.language_popup.itemAtIndex_(i).representedObject() == settings["language"]:
+                self.language_popup.selectItemAtIndex_(i)
         for i in range(self.rewrite_popup.numberOfItems()):
             if self.rewrite_popup.itemAtIndex_(i).representedObject() == settings["rewrite"]:
                 self.rewrite_popup.selectItemAtIndex_(i)
@@ -1461,6 +1502,9 @@ class SettingsWindow(AppKit.NSObject):
 
     def hotkeyChanged_(self, sender):
         apply_hotkey(sender.selectedItem().representedObject())
+
+    def languageChanged_(self, sender):
+        apply_language(sender.selectedItem().representedObject())
 
     def rewriteChanged_(self, sender):
         apply_rewrite(sender.selectedItem().representedObject())
@@ -1639,6 +1683,13 @@ def apply_hotkey(name):
     refresh_settings_ui()
 
 
+def apply_language(code):
+    settings["language"] = code
+    save_settings()
+    log(f"language: {LANGUAGES[code]}")
+    refresh_settings_ui()
+
+
 def apply_rewrite(mode):
     settings["rewrite"] = mode
     save_settings()
@@ -1724,6 +1775,12 @@ class StatusItem(AppKit.NSObject):
         )
         menu.addItem_(
             build_submenu(
+                self, "Language", [(l, c) for c, l in LANGUAGES.items()],
+                settings["language"], "setLanguage:",
+            )
+        )
+        menu.addItem_(
+            build_submenu(
                 self, "Rewrite", [(l, m) for m, l in REWRITE_MODES.items()],
                 settings["rewrite"], "setRewrite:",
             )
@@ -1736,6 +1793,9 @@ class StatusItem(AppKit.NSObject):
 
     def setHotkey_(self, sender):
         apply_hotkey(sender.representedObject())
+
+    def setLanguage_(self, sender):
+        apply_language(sender.representedObject())
 
     def setRewrite_(self, sender):
         apply_rewrite(sender.representedObject())
