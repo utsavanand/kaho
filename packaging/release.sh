@@ -141,6 +141,29 @@ if [[ "$STATUS" != "Accepted" ]]; then
 fi
 
 echo "==> stapling"
+# Both the app and the DMG, and the app FIRST — then the image is rebuilt
+# around the stapled copy. Notarizing the DMG approves the app inside it too,
+# but the ticket only lands on whatever stapler is pointed at: shipping only
+# the DMG ticket leaves the installed Kaho.app relying on an online check,
+# so a first launch offline or behind a slow network stalls on Gatekeeper.
+xcrun stapler staple "$APP"
+xcrun stapler validate "$APP"
+
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/"
+ln -s /Applications "$STAGE/Applications"
+hdiutil detach "/Volumes/Kaho Installer" -force >/dev/null 2>&1 || true
+rm -f "$DMG"
+hdiutil create -volname "Kaho Installer" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+
+# The rebuilt image is a new file, so it needs its own trip through the
+# notary service; the app inside already carries its ticket.
+xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" \
+    2>&1 | tee "$BUILD/notarytool-dmg.txt"
+DMG_ID="$(awk '/^  id:/ {print $2; exit}' "$BUILD/notarytool-dmg.txt")"
+[[ -n "$DMG_ID" ]] || { echo "no submission id for the rebuilt dmg"; exit 1; }
+xcrun notarytool wait "$DMG_ID" --keychain-profile "$NOTARY_PROFILE"
 xcrun stapler staple "$DMG"
 xcrun stapler validate "$DMG"
 
