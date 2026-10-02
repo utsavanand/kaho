@@ -732,6 +732,7 @@ class TestRewriterLoading(KahoTestCase):
         """
         real_thread = threading.Thread
         created, was_blocked = [], []
+        contender = []
 
         def factory(target=None, daemon=None):
             handle = mock.MagicMock()
@@ -740,6 +741,7 @@ class TestRewriterLoading(KahoTestCase):
             if len(created) == 1:
                 other = real_thread(target=kaho.ensure_rewriter, daemon=True)
                 other.start()
+                contender.append(other)
                 other.join(timeout=0.3)
                 # Still alive = still waiting on the lock, which is the point
                 was_blocked.append(other.is_alive())
@@ -747,8 +749,18 @@ class TestRewriterLoading(KahoTestCase):
 
         with mock.patch("kaho.threading.Thread", factory):
             kaho.ensure_rewriter()
+            # Joined inside the patch, so when the contender finally takes the
+            # lock it gets the mock factory too. Letting it escape to the real
+            # threading.Thread starts a live _load_rewriter that imports
+            # mlx_lm against the stubbed huggingface_hub, which prints a
+            # traceback into the test output and races the next test.
+            for t in contender:
+                t.join(timeout=2.0)
+                self.assertFalse(t.is_alive(), "the second caller never finished")
 
         self.assertEqual(was_blocked, [True], "the second caller was not held at the lock")
+        # Still one: once it has the lock the contender sees a live loader
+        # and declines, which is the behaviour being proved
         self.assertEqual(len(created), 1, "two loaders were started for one model")
 
     def test_nothing_starts_once_the_model_is_loaded(self):
