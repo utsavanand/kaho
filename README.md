@@ -42,12 +42,16 @@ telemetry.
 Recent transcripts (click to copy), your hotkey, rewrite mode, history,
 log, and one-click bug reports:
 
-<img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey, Language and Rewrite submenus, Settings, History, Open Log, Report a Bug">
+<img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey, Trigger, Language and Rewrite submenus, Settings, History, Open Log, Report a Bug">
 
-- **Settings…** — a real window (⌘,) for hotkey, language and rewrite mode
+- **Settings…** — a real window (⌘,) for hotkey, trigger, language and rewrite
 - **Edit Dictionary…** — names and jargon the model should spell your way
 - **Hotkey** — right Option (default), right Command, right Control, or right
   Shift. Right-side only: the left keys are needed for typing.
+- **Trigger** — hold the key while you speak (default), or tap once to start
+  and once to stop. Holding is self-limiting, so a forgotten recording cannot
+  run for minutes; tapping is easier through a long prompt, and is the only
+  usable mode if you cannot hold a modifier down.
 - **Language** — detected automatically by default. Pin yours if short
   dictations come back in the wrong script: Whisper guesses per 30-second
   window, and on brief or noisy audio it guesses wrong.

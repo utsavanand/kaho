@@ -81,6 +81,15 @@ LANGUAGES = {
     "zh": "Chinese",
 }
 
+# Hold is the default because it is self-limiting: let go and it stops, so a
+# forgotten recording cannot run for minutes. Toggle exists because holding a
+# key through a 200-word prompt is tiring, and for anyone who cannot hold a
+# modifier down at all it is the difference between usable and not.
+TRIGGERS = {
+    "hold": "Hold to dictate",
+    "toggle": "Tap to start, tap to stop",
+}
+
 REWRITE_MODES = {
     "off": "Off",
     "clean": "Clean up",
@@ -308,7 +317,8 @@ cancel_recording = False
 press_time = 0.0
 last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
-settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto"}
+settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto",
+            "trigger": "hold"}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
@@ -361,6 +371,8 @@ def load_settings():
         settings["rewrite"] = mode
     if saved.get("language") in LANGUAGES:
         settings["language"] = saved["language"]
+    if saved.get("trigger") in TRIGGERS:
+        settings["trigger"] = saved["trigger"]
 
 
 def save_settings():
@@ -762,6 +774,25 @@ def handle_flags_changed(event):
     if event.keyCode() != keycode:
         return
     now = time.monotonic()
+    if settings["trigger"] == "toggle":
+        # One tap starts, the next stops. Only key-down matters, so the hold
+        # and double-tap timing below is skipped entirely rather than being
+        # made conditional in six places.
+        if event.modifierFlags() & device_mask:
+            if state == "recording":
+                locked = False
+                stop_recording()
+            else:
+                start_recording()
+                # Only latch if it actually started: start_recording declines
+                # when the audio device is wedged, and a stale lock would then
+                # make the next tap try to stop a recording that never began
+                if state == "recording":
+                    # Reuses the hands-free flag so the recording outlives the
+                    # key release, which is the whole point of toggle mode
+                    locked = True
+                    lock_time = now
+        return
     if event.modifierFlags() & device_mask:  # key down
         if locked:
             # A tap arriving within the grace period is the tail of the
@@ -1577,16 +1608,16 @@ class SettingsWindow(AppKit.NSObject):
             | AppKit.NSWindowStyleMaskMiniaturizable
         )
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (460, 432)), mask, AppKit.NSBackingStoreBuffered, False
+            ((0, 0), (460, 492)), mask, AppKit.NSBackingStoreBuffered, False
         )
         window.setTitle_("Kaho Settings")
         window.setReleasedWhenClosed_(False)
         window.center()
         content = window.contentView()
 
-        content.addSubview_(make_label("Hotkey", 24, 384, 13, bold=True))
+        content.addSubview_(make_label("Hotkey", 24, 444, 13, bold=True))
         self.hotkey_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 352), (412, 26)), False
+            ((24, 412), (412, 26)), False
         )
         for name, (_, _, label) in HOTKEYS.items():
             self.hotkey_popup.addItemWithTitle_(label)
@@ -1595,8 +1626,20 @@ class SettingsWindow(AppKit.NSObject):
         self.hotkey_popup.setAction_("hotkeyChanged:")
         content.addSubview_(self.hotkey_popup)
         content.addSubview_(
-            make_label("Hold to dictate. Right-side keys only.", 24, 330, 11, dim=True)
+            make_label("Right-side keys only: the left ones are for typing.",
+                       24, 390, 11, dim=True)
         )
+
+        content.addSubview_(make_label("Trigger", 24, 356, 13, bold=True))
+        self.trigger_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            ((24, 324), (412, 26)), False
+        )
+        for mode, label in TRIGGERS.items():
+            self.trigger_popup.addItemWithTitle_(label)
+            self.trigger_popup.lastItem().setRepresentedObject_(mode)
+        self.trigger_popup.setTarget_(self)
+        self.trigger_popup.setAction_("triggerChanged:")
+        content.addSubview_(self.trigger_popup)
 
         content.addSubview_(make_label("Language", 24, 302, 13, bold=True))
         self.language_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
@@ -1659,6 +1702,9 @@ class SettingsWindow(AppKit.NSObject):
         for i in range(self.hotkey_popup.numberOfItems()):
             if self.hotkey_popup.itemAtIndex_(i).representedObject() == settings["hotkey"]:
                 self.hotkey_popup.selectItemAtIndex_(i)
+        for i in range(self.trigger_popup.numberOfItems()):
+            if self.trigger_popup.itemAtIndex_(i).representedObject() == settings["trigger"]:
+                self.trigger_popup.selectItemAtIndex_(i)
         for i in range(self.language_popup.numberOfItems()):
             if self.language_popup.itemAtIndex_(i).representedObject() == settings["language"]:
                 self.language_popup.selectItemAtIndex_(i)
@@ -1695,6 +1741,9 @@ class SettingsWindow(AppKit.NSObject):
 
     def hotkeyChanged_(self, sender):
         apply_hotkey(sender.selectedItem().representedObject())
+
+    def triggerChanged_(self, sender):
+        apply_trigger(sender.selectedItem().representedObject())
 
     def languageChanged_(self, sender):
         apply_language(sender.selectedItem().representedObject())
@@ -1905,6 +1954,19 @@ def apply_hotkey(name):
     refresh_settings_ui()
 
 
+def apply_trigger(mode):
+    global locked
+    settings["trigger"] = mode
+    save_settings()
+    # A mode switch mid-recording would strand the lock in the other mode's
+    # meaning, so end any recording in flight first
+    if state == "recording":
+        locked = False
+        stop_recording()
+    log(f"trigger: {TRIGGERS[mode]}")
+    refresh_settings_ui()
+
+
 def apply_language(code):
     settings["language"] = code
     save_settings()
@@ -1997,6 +2059,12 @@ class StatusItem(AppKit.NSObject):
         )
         menu.addItem_(
             build_submenu(
+                self, "Trigger", [(l, m) for m, l in TRIGGERS.items()],
+                settings["trigger"], "setTrigger:",
+            )
+        )
+        menu.addItem_(
+            build_submenu(
                 self, "Language", [(l, c) for c, l in LANGUAGES.items()],
                 settings["language"], "setLanguage:",
             )
@@ -2015,6 +2083,9 @@ class StatusItem(AppKit.NSObject):
 
     def setHotkey_(self, sender):
         apply_hotkey(sender.representedObject())
+
+    def setTrigger_(self, sender):
+        apply_trigger(sender.representedObject())
 
     def setLanguage_(self, sender):
         apply_language(sender.representedObject())

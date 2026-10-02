@@ -1,5 +1,13 @@
 # Changelog
-## 2.2.0 — 2026-10-01
+## 2.2.0 — 2026-10-02
+
+- Tap to start, tap to stop. Holding the hotkey is still the default and
+  is self-limiting — let go and it ends, so a forgotten recording cannot
+  run for minutes — but holding a key through a 200-word prompt is
+  tiring, and for anyone who cannot hold a modifier down at all it was
+  the difference between usable and not. Menu bar and Settings both
+  offer the choice.
+
 
 - Transcription moves from Whisper large-v3-turbo (mlx-whisper) to
   Qwen3-ASR 1.7B 8-bit (mlx-audio). Latency from `tools/benchmark.py`

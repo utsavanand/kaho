@@ -150,7 +150,8 @@ class KahoTestCase(unittest.TestCase):
         ):
             self.enterContext(mock.patch.object(kaho, name, value))
         self.enterContext(mock.patch.object(
-            kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto"}
+            kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto",
+             "trigger": "hold"}
         ))
         self.enterContext(mock.patch.object(kaho, "overlay", mock.MagicMock()))
 
@@ -376,7 +377,8 @@ class TestSettings(KahoTestCase):
         kaho.load_settings()
         self.assertEqual(
             kaho.settings,
-            {"hotkey": "right_option", "rewrite": "off", "language": "auto"},
+            {"hotkey": "right_option", "rewrite": "off", "language": "auto",
+             "trigger": "hold"},
         )
 
     def test_malformed_json_keeps_the_defaults(self):
@@ -397,7 +399,8 @@ class TestSettings(KahoTestCase):
         kaho.load_settings()
         self.assertEqual(
             kaho.settings,
-            {"hotkey": "right_option", "rewrite": "off", "language": "auto"},
+            {"hotkey": "right_option", "rewrite": "off", "language": "auto",
+             "trigger": "hold"},
         )
 
     def test_saved_settings_round_trip_and_stay_private(self):
@@ -888,6 +891,59 @@ class TestLanguage(KahoTestCase):
 
 
 @unittest.skipUnless(HAVE_NUMPY, "cancel tests need real audio buffers")
+class TestToggleTrigger(KahoTestCase):
+    """Tap to start, tap to stop — for anyone who cannot hold a key down."""
+
+    def setUp(self):
+        super().setUp()
+        kaho.settings["trigger"] = "toggle"
+
+    def test_one_tap_starts_and_the_recording_outlives_the_key(self):
+        self.down()
+        self.up()
+        self.assertEqual(kaho.state, "recording")
+        self.assertTrue(kaho.locked, "the recording must survive the key release")
+
+    def test_the_next_tap_stops_it(self):
+        self.down()
+        self.up()
+        self.clock.advance(5.0)
+        self.down()
+        self.assertEqual(kaho.state, "ready")
+        self.assertFalse(kaho.locked)
+
+    def test_a_long_hold_is_still_one_tap_not_a_stop(self):
+        """Key-up is ignored, so holding the key does not end the recording."""
+        self.down()
+        self.clock.advance(3.0)
+        self.up()
+        self.assertEqual(kaho.state, "recording")
+
+    def test_a_wedged_device_does_not_latch_the_lock(self):
+        # start_recording declines; a stale lock would make the next tap try
+        # to stop a recording that never began
+        kaho.audio_op_started = self.clock.now - 10
+        self.down()
+        self.assertEqual(kaho.state, "ready")
+        self.assertFalse(kaho.locked)
+
+    def test_hold_mode_is_unaffected(self):
+        kaho.settings["trigger"] = "hold"
+        self.down()
+        self.clock.advance(2.0)
+        self.up()
+        self.assertEqual(kaho.state, "ready")
+        self.assertFalse(kaho.locked)
+
+    def test_switching_mode_mid_recording_ends_it(self):
+        self.down()
+        self.up()
+        self.assertEqual(kaho.state, "recording")
+        kaho.apply_trigger("hold")
+        self.assertEqual(kaho.state, "ready")
+        self.assertFalse(kaho.locked)
+
+
 class TestCancel(KahoTestCase):
     """Escape has to stop an unwanted dictation from landing in the document."""
 
