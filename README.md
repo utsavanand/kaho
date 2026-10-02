@@ -48,6 +48,14 @@ log, and one-click bug reports:
 - **Edit Dictionary…** — names and jargon the model should spell your way
 - **Hotkey** — right Option (default), right Command, right Control, or right
   Shift. Right-side only: the left keys are needed for typing.
+- **Say how you want it written** — while still holding the hotkey, press
+  right Shift and keep talking. Everything after that press is an instruction,
+  not part of the message: *"tell Mark I can't make the offsite, suggest
+  November"* → ⇧ → *"formal, two sentences"* becomes "Mark, I am unable to
+  attend the offsite; I recommend scheduling it in November." The same words
+  with *"casual, like texting a friend"* come out as "Hey Mark, I'm sorry but
+  I can't make the offsite…". Nothing to configure and nothing stored — the
+  instruction is spoken once and forgotten.
 - **Trigger** — hold the key while you speak (default), or tap once to start
   and once to stop. Holding is self-limiting, so a forgotten recording cannot
   run for minutes; tapping is easier through a long prompt, and is the only

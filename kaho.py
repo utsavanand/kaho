@@ -42,6 +42,29 @@ HOTKEYS = {  # name -> (keycode, device-specific modifier bit, label)
     "right_shift": (60, 0x0004, "Right Shift (⇧)"),
 }
 
+# Pressing a second right-side modifier mid-dictation splits the recording:
+# everything before it is the message, everything after is an instruction for
+# how to write it. Whichever modifier is not serving as the hotkey is used,
+# so the two can never collide.
+INSTRUCTION_FALLBACK = "right_shift"
+
+
+def instruction_key():
+    """(keycode, device mask) of the modifier that starts an instruction."""
+    name = INSTRUCTION_FALLBACK
+    if settings["hotkey"] == name:
+        name = "right_command"
+    keycode, mask, _ = HOTKEYS[name]
+    return keycode, mask
+
+
+def instruction_label():
+    name = INSTRUCTION_FALLBACK
+    if settings["hotkey"] == name:
+        name = "right_command"
+    return HOTKEYS[name][2]
+
+
 # Replaced Whisper large-v3-turbo in 2.2.0. On an M4 Max (tools/benchmark.py):
 # 0.12 s vs 0.51 s on a 1.4 s clip, 0.42 vs 0.60 at 10 s, but 1.06 vs 0.78 at
 # 30 s — Whisper pads every clip to 30 s, this model's cost grows with length,
@@ -102,6 +125,28 @@ REWRITE_HINTS = {
     "structured": "Give the dictation the shape it needs — crisp sentences, steps, or bullets.",
     "caveman": "Compress hard for prompting an LLM — every instruction kept, words minimised.",
 }
+# The instruction is spoken, so it arrives as loose speech ("uh, make this
+# formal, short") rather than a tidy directive. The prompt says to follow its
+# intent, and spells out the two failure modes seen in testing: answering the
+# instruction as if it were a question, and treating it as new content to
+# include in the output.
+INSTRUCTION_PROMPT = (
+    "You rewrite dictated speech according to a spoken instruction.\n\n"
+    "INSTRUCTION (how the user wants it written):\n{instruction}\n\n"
+    "MESSAGE (what the user dictated):\n{text}\n\n"
+    "Rewrite MESSAGE following INSTRUCTION. Rules:\n"
+    "- Output only the rewritten message. No preamble, no explanation, no "
+    "quotes around it.\n"
+    "- Never answer or comment on the instruction. It describes how to "
+    "write, it is not a question and not part of the message.\n"
+    "- Keep every fact, name, number and request from MESSAGE. You are "
+    "changing how it reads, not what it says.\n"
+    "- The instruction was spoken, so ignore its filler words and follow "
+    "what it means.\n"
+    "- If the instruction asks for something the message cannot support, "
+    "write the message as well as you can and change nothing else."
+)
+
 REWRITE_PROMPTS = {
     "clean": (
         "You clean up dictated speech. Rewrite the transcript below:\n"
@@ -314,6 +359,11 @@ job_generation = 0
 # generation counter cannot cover this case: _finish_recording reads the
 # counter on the audio thread after the bump has landed.
 cancel_recording = False
+# Frame index where the instruction started, or None for a plain dictation.
+# The split is recorded as a position in the audio rather than two recordings:
+# stopping and reopening the stream loses ~60 ms of speech, which is exactly
+# the moment the user is mid-sentence.
+instruction_at = None
 press_time = 0.0
 last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
@@ -606,7 +656,7 @@ def relaunch():
 
 
 def start_recording():
-    global state, record_buf
+    global state, record_buf, instruction_at
     if state != "ready":
         return
     if audio_wedged():
@@ -624,6 +674,7 @@ def start_recording():
         if state != "ready":
             return
         state = "recording"
+        instruction_at = None
         buf = []
         record_buf = buf
     overlay.show()
@@ -747,7 +798,7 @@ def _finish_recording(s, buf):
     if audio is None:
         AppHelper.callAfter(overlay.hide)
         return
-    jobs.put((audio, job_generation))
+    jobs.put((audio, job_generation, instruction_at))
 
 
 def schedule_deferred_stop(tap_time):
@@ -769,8 +820,19 @@ def schedule_deferred_stop(tap_time):
 
 
 def handle_flags_changed(event):
-    global locked, press_time, last_tap, lock_time
+    global locked, press_time, last_tap, lock_time, instruction_at
     keycode, device_mask, _ = HOTKEYS[settings["hotkey"]]
+    instr_code, instr_mask = instruction_key()
+    if event.keyCode() == instr_code and state == "recording":
+        # Mark the split once per recording. A second press is ignored rather
+        # than moving the mark, so a fumbled key cannot silently swallow the
+        # instruction the user already gave.
+        if event.modifierFlags() & instr_mask and instruction_at is None:
+            buf = record_buf
+            instruction_at = sum(len(chunk) for chunk in buf) if buf else 0
+            overlay.setPhase_("instructing")
+            log("instruction started")
+        return
     if event.keyCode() != keycode:
         return
     now = time.monotonic()
@@ -1028,6 +1090,39 @@ def rewrite(text, mode):
     return out
 
 
+def rewrite_with_instruction(text, instruction):
+    """Rewrite the dictation the way the spoken instruction asked.
+
+    Returns None to paste the transcript unchanged, matching rewrite().
+    """
+    if rewriter is None:
+        log("instruction ignored: rewrite model not loaded — pasted as-is")
+        return None
+    model, tokenizer = rewriter
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": INSTRUCTION_PROMPT.format(
+            instruction=instruction, text=text)}],
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    t0 = time.monotonic()
+    try:
+        out = mlx_lm.generate(
+            model, tokenizer, prompt=prompt,
+            # Room to expand: "make it a formal email" legitimately produces
+            # more words than were dictated
+            max_tokens=3 * len(tokenizer.encode(text)) + 128,
+        ).strip()
+    except Exception as e:  # noqa: BLE001
+        log(f"instructed rewrite failed: {e!r} — pasted the raw transcript")
+        return None
+    if not out:
+        log("instructed rewrite returned nothing — pasted the raw transcript")
+        return None
+    log(f'[instructed {time.monotonic() - t0:.2f}s] "{instruction}"')
+    return out
+
+
 def set_clipboard(text):
     subprocess.run("pbcopy", input=text.encode(), check=True)
 
@@ -1124,13 +1219,26 @@ def paste(text):
 
 # All slow work happens here: the hotkey handler runs on the main run loop,
 # and blocking it would freeze the menu bar and delay key handling.
-def run_job(audio, generation, t0):
+def run_job(audio, generation, split, t0):
     """Transcribe, optionally rewrite, and paste one recording.
 
     Split out of worker() so the cancel path can be tested against the real
     code rather than a copy of it. `continue` in the loop becomes `return`.
     """
     global last_inference
+    instruction = None
+    if split is not None:
+        # Two transcriptions, not two recordings: the stream stayed open
+        # across the split, so no speech is lost at the boundary.
+        message_audio, instruction_audio = audio[:split], audio[split:]
+        if len(instruction_audio) < SAMPLE_RATE * MIN_SECONDS:
+            log("instruction too short to use — pasting the dictation as-is")
+            split = None
+        else:
+            audio = message_audio
+            instruction = transcribe(instruction_audio).strip()
+            if not instruction:
+                log("instruction was empty — pasting the dictation as-is")
     text = transcribe(audio)
     if generation != job_generation:
         # The models did run, so this still counts against idle warmup
@@ -1142,7 +1250,16 @@ def run_job(audio, generation, t0):
         AppHelper.callAfter(overlay.hide)
         return
     mode = settings["rewrite"]
-    if text and mode != "off":
+    if text and instruction:
+        # A spoken instruction overrides the configured mode: the user just
+        # said what they want, which is more specific than a saved setting.
+        AppHelper.callAfter(overlay.setPhase_, "rewriting")
+        text = rewrite_with_instruction(text, instruction) or text
+        if generation != job_generation:
+            last_inference = time.monotonic()
+            log("cancelled during rewriting — nothing pasted")
+            return
+    elif text and mode != "off":
         AppHelper.callAfter(overlay.setPhase_, "rewriting")
         text = rewrite(text, mode) or text
         if generation != job_generation:
@@ -1298,6 +1415,7 @@ PHASE_LABELS = {
     "done": "Pasted",
     "blocked": "Not pasted — ⌘V",
     "wedged": "Mic stuck — Restart Kaho",
+    "instructing": "Instruction…",
 }
 
 # Secure input (password fields, Terminal's "Secure Keyboard Entry", sudo
@@ -1367,7 +1485,8 @@ def draw_elapsed(view, bounds):
 def draw_phase(phase, ticks, bounds):
     # Three dots cycling left-to-right: cheap to draw, reads as "working"
     # without a spinner's implication of a known duration
-    r, g, b = (1.0, 0.72, 0.30) if phase in ("blocked", "wedged") else (0.48, 0.64, 0.97)
+    r, g, b = ((1.0, 0.72, 0.30) if phase in ("blocked", "wedged", "instructing")
+               else (0.48, 0.64, 0.97))
     for i in range(3):
         alpha = 0.9 if phase in ("done", "blocked", "wedged") else 0.25 + 0.65 * (
             0.5 + 0.5 * np.sin(ticks * 0.28 - i * 0.9)

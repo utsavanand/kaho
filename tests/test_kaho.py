@@ -145,6 +145,7 @@ class KahoTestCase(unittest.TestCase):
             ("stream", None),
             ("record_buf", None),
             ("audio_op_started", None),
+            ("instruction_at", None),
             ("history_version", 0),
             ("rewriter", None),
         ):
@@ -847,7 +848,8 @@ class TestConstantsAgree(unittest.TestCase):
     def test_every_post_release_phase_has_a_label(self):
         self.assertEqual(
             set(kaho.PHASE_LABELS),
-            {"transcribing", "rewriting", "done", "blocked", "wedged"},
+            {"transcribing", "rewriting", "done", "blocked", "wedged",
+             "instructing"},
         )
 
     def test_hotkeys_are_distinct_and_labelled(self):
@@ -944,6 +946,121 @@ class TestToggleTrigger(KahoTestCase):
         self.assertFalse(kaho.locked)
 
 
+@unittest.skipUnless(HAVE_NUMPY, "the split needs real audio buffers")
+class TestSpokenInstruction(KahoTestCase):
+    """Press a second modifier mid-dictation to say how it should be written."""
+
+    def setUp(self):
+        super().setUp()
+        kaho.overlay.is_working.return_value = False
+
+    def press_instruction_key(self):
+        code, mask = kaho.instruction_key()
+        kaho.handle_flags_changed(FakeEvent(code, mask))
+
+    def speak(self, seconds=1.0):
+        loud = REAL_NUMPY.full((int(kaho.SAMPLE_RATE * seconds), 1), 0.5, dtype="float32")
+        kaho.record_buf.append(loud)
+
+    def test_the_key_marks_where_the_instruction_starts(self):
+        self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        self.press_instruction_key()
+        self.assertEqual(kaho.instruction_at, kaho.SAMPLE_RATE)
+
+    def test_a_second_press_does_not_move_the_mark(self):
+        # A fumbled key must not silently swallow the instruction already given
+        self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        self.press_instruction_key()
+        self.speak(1.0)
+        self.press_instruction_key()
+        self.assertEqual(kaho.instruction_at, kaho.SAMPLE_RATE)
+
+    def test_the_key_does_nothing_when_not_recording(self):
+        self.press_instruction_key()
+        self.assertIsNone(kaho.instruction_at)
+
+    def test_the_mark_is_cleared_for_the_next_dictation(self):
+        self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        self.press_instruction_key()
+        self.clock.advance(2.0)
+        self.up()
+        self.run_audio_ops()
+
+        self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
+        self.down()
+        self.assertIsNone(kaho.instruction_at, "a stale mark would split the next one")
+
+    def test_the_split_reaches_the_job(self):
+        self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        self.press_instruction_key()
+        self.speak(1.0)
+        self.clock.advance(2.0)
+        self.up()
+        self.run_audio_ops()
+
+        _, _, split = kaho.jobs.get()
+        self.assertEqual(split, kaho.SAMPLE_RATE)
+
+    def test_the_instruction_rewrites_the_message(self):
+        # Instruction half is transcribed first, then the message
+        with mock.patch.object(kaho, "transcribe",
+                               side_effect=["make it formal", "cant make the offsite"]), \
+             mock.patch.object(kaho, "rewrite_with_instruction",
+                               return_value="I am unable to attend.") as rw, \
+             mock.patch.object(kaho, "paste") as paste, \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None), \
+             mock.patch.object(kaho, "rewriter", (mock.MagicMock(), mock.MagicMock())):
+            audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 2, dtype="float32")
+            kaho.run_job(audio, kaho.job_generation, kaho.SAMPLE_RATE, self.clock.now)
+
+        rw.assert_called_once_with("cant make the offsite", "make it formal")
+        paste.assert_called_once_with("I am unable to attend.")
+
+    def test_a_spoken_instruction_overrides_the_configured_mode(self):
+        kaho.settings["rewrite"] = "caveman"
+        with mock.patch.object(kaho, "transcribe",
+                               side_effect=["make it formal", "cant make it"]), \
+             mock.patch.object(kaho, "rewrite_with_instruction",
+                               return_value="I cannot attend."), \
+             mock.patch.object(kaho, "rewrite") as plain, \
+             mock.patch.object(kaho, "paste"), \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None), \
+             mock.patch.object(kaho, "rewriter", (mock.MagicMock(), mock.MagicMock())):
+            audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 2, dtype="float32")
+            kaho.run_job(audio, kaho.job_generation, kaho.SAMPLE_RATE, self.clock.now)
+
+        plain.assert_not_called()
+
+    def test_an_instruction_too_short_to_be_speech_is_ignored(self):
+        with mock.patch.object(kaho, "transcribe", return_value="the whole thing"), \
+             mock.patch.object(kaho, "rewrite_with_instruction") as rw, \
+             mock.patch.object(kaho, "paste") as paste, \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE, dtype="float32")
+            # Split 0.1 s from the end: below MIN_SECONDS
+            kaho.run_job(audio, kaho.job_generation,
+                         int(kaho.SAMPLE_RATE * 0.9), self.clock.now)
+
+        rw.assert_not_called()
+        paste.assert_called_once_with("the whole thing")
+
+    def test_the_instruction_key_is_never_the_hotkey(self):
+        for name in kaho.HOTKEYS:
+            kaho.settings["hotkey"] = name
+            self.assertNotEqual(kaho.instruction_key()[0], kaho.HOTKEYS[name][0], name)
+
+
 class TestCancel(KahoTestCase):
     """Escape has to stop an unwanted dictation from landing in the document."""
 
@@ -977,7 +1094,7 @@ class TestCancel(KahoTestCase):
         MLX inference cannot be interrupted, so this is what cancelling
         actually buys: the text is computed and then thrown away.
         """
-        kaho.jobs.put((mock.MagicMock(), 0))
+        kaho.jobs.put((mock.MagicMock(), 0, None))
         kaho.job_generation = 1
         self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
         kaho.asr.generate.return_value.text = "unwanted text"
@@ -991,7 +1108,7 @@ class TestCancel(KahoTestCase):
         self.assertTrue(any("cancelled" in m for m in self.logged))
 
     def test_an_uncancelled_job_still_pastes(self):
-        kaho.jobs.put((mock.MagicMock(), 0))
+        kaho.jobs.put((mock.MagicMock(), 0, None))
         self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
         kaho.asr.generate.return_value.text = "wanted text"
 
@@ -1058,8 +1175,8 @@ class TestCancel(KahoTestCase):
 
     def run_one_job(self):
         """The real worker body, minus its `while True`."""
-        audio, generation = kaho.jobs.get()
-        kaho.run_job(audio, generation, self.clock.now)
+        audio, generation, split = kaho.jobs.get()
+        kaho.run_job(audio, generation, split, self.clock.now)
 
 
 class TestRelaunch(KahoTestCase):

@@ -1,6 +1,23 @@
 # Changelog
 ## 2.2.0 — 2026-10-02
 
+- Say how you want it written, in the same breath. Press right Shift
+  while still holding the hotkey and everything after it is an
+  instruction rather than part of the message — "formal, two sentences",
+  "casual, like texting a friend", "turn this into bullet points". The
+  instruction overrides the configured rewrite mode for that dictation
+  only.
+
+  Every other tool solves this with stored configuration: per-app rules,
+  saved modes, prompt libraries. The same app needs a different voice
+  for a leader, a junior and family, so the context cannot predict the
+  intent — only the speaker knows, and only at that moment. Here the
+  instruction is speech: said once, used once, never stored.
+
+  It is one recording, not two. The split is recorded as a position in
+  the audio, because stopping and reopening the stream loses about 60 ms
+  of speech at exactly the moment the user is mid-sentence.
+
 - Tap to start, tap to stop. Holding the hotkey is still the default and
   is self-limiting — let go and it ends, so a forgotten recording cannot
   run for minutes — but holding a key through a 200-word prompt is
