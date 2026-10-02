@@ -727,7 +727,7 @@ class TestRewriterLoading(KahoTestCase):
         critical section when the second arrives.
         """
         real_thread = threading.Thread
-        created, was_blocked = [], []
+        created, was_blocked, callers = [], [], []
 
         def factory(target=None, daemon=None):
             handle = mock.MagicMock()
@@ -735,6 +735,7 @@ class TestRewriterLoading(KahoTestCase):
             created.append(handle)
             if len(created) == 1:
                 other = real_thread(target=kaho.ensure_rewriter, daemon=True)
+                callers.append(other)
                 other.start()
                 other.join(timeout=0.3)
                 # Still alive = still waiting on the lock, which is the point
@@ -743,6 +744,12 @@ class TestRewriterLoading(KahoTestCase):
 
         with mock.patch("kaho.threading.Thread", factory):
             kaho.ensure_rewriter()
+            # Let the waiting caller finish while the factory and per-test
+            # globals are still patched. Otherwise it can outlive teardown,
+            # start a real model loader, and write into the user's app log.
+            for caller in callers:
+                caller.join(timeout=1)
+                self.assertFalse(caller.is_alive(), "the second caller did not finish")
 
         self.assertEqual(was_blocked, [True], "the second caller was not held at the lock")
         self.assertEqual(len(created), 1, "two loaders were started for one model")
