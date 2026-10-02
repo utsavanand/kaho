@@ -9,7 +9,7 @@
 #   1. developer.apple.com -> Certificates -> "+" -> Developer ID Application
 #      Install the downloaded .cer by double-clicking it.
 #   2. appleid.apple.com -> Sign-In and Security -> App-Specific Passwords
-#   3. xcrun notarytool store-credentials sotto-notary \
+#   3. xcrun notarytool store-credentials kaho-notary \
 #        --apple-id "you@example.com" --team-id "TEAMID" --password "app-specific-password"
 #
 # Then:  ./packaging/release.sh 2.0.0
@@ -21,9 +21,11 @@ VERSION="${1:-}"
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$SRC/build-release"
-# The keychain profile keeps its original name: renaming it would require
-# re-entering the app-specific password for zero benefit.
-NOTARY_PROFILE="${KAHO_NOTARY_PROFILE:-sotto-notary}"
+# Named for this app, not shared. The profile was called "sotto-notary" through
+# 2.1.0, which another project on this machine also used — each store-credentials
+# overwrote the other, and notarization then failed with "No Keychain password
+# item found" on a profile that had existed minutes earlier.
+NOTARY_PROFILE="${KAHO_NOTARY_PROFILE:-kaho-notary}"
 
 # Resolve the Developer ID automatically: hardcoding it means every machine
 # needs an edit, and the hash changes when the certificate is renewed
