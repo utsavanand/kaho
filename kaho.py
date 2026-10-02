@@ -359,11 +359,14 @@ job_generation = 0
 # generation counter cannot cover this case: _finish_recording reads the
 # counter on the audio thread after the bump has landed.
 cancel_recording = False
-# Frame index where the instruction started, or None for a plain dictation.
-# The split is recorded as a position in the audio rather than two recordings:
-# stopping and reopening the stream loses ~60 ms of speech, which is exactly
-# the moment the user is mid-sentence.
-instruction_at = None
+# Frame ranges of the recording that were spoken as instruction rather than
+# message, as [start, end) pairs; the open range has end None. Held, not
+# latched: the key can be pressed and released as often as the user likes,
+# so a thought can be interrupted with "make this formal" and then continue.
+# Recorded as positions in one recording rather than separate ones, because
+# stopping and reopening the stream loses ~60 ms at exactly the moment the
+# user is mid-sentence.
+instruction_spans = []
 press_time = 0.0
 last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
@@ -656,7 +659,7 @@ def relaunch():
 
 
 def start_recording():
-    global state, record_buf, instruction_at
+    global state, record_buf
     if state != "ready":
         return
     if audio_wedged():
@@ -674,7 +677,7 @@ def start_recording():
         if state != "ready":
             return
         state = "recording"
-        instruction_at = None
+        instruction_spans.clear()
         buf = []
         record_buf = buf
     overlay.show()
@@ -798,7 +801,11 @@ def _finish_recording(s, buf):
     if audio is None:
         AppHelper.callAfter(overlay.hide)
         return
-    jobs.put((audio, job_generation, instruction_at))
+    # Close an unterminated span: the user released the hotkey while still
+    # holding the instruction key
+    total = sum(len(chunk) for chunk in buf) if buf else 0
+    spans = [[a, total if b is None else b] for a, b in instruction_spans]
+    jobs.put((audio, job_generation, spans))
 
 
 def schedule_deferred_stop(tap_time):
@@ -820,18 +827,22 @@ def schedule_deferred_stop(tap_time):
 
 
 def handle_flags_changed(event):
-    global locked, press_time, last_tap, lock_time, instruction_at
+    global locked, press_time, last_tap, lock_time
     keycode, device_mask, _ = HOTKEYS[settings["hotkey"]]
     instr_code, instr_mask = instruction_key()
     if event.keyCode() == instr_code and state == "recording":
-        # Mark the split once per recording. A second press is ignored rather
-        # than moving the mark, so a fumbled key cannot silently swallow the
-        # instruction the user already gave.
-        if event.modifierFlags() & instr_mask and instruction_at is None:
-            buf = record_buf
-            instruction_at = sum(len(chunk) for chunk in buf) if buf else 0
+        buf = record_buf
+        frame = sum(len(chunk) for chunk in buf) if buf else 0
+        held = bool(event.modifierFlags() & instr_mask)
+        open_span = instruction_spans and instruction_spans[-1][1] is None
+        if held and not open_span:
+            instruction_spans.append([frame, None])
             overlay.setPhase_("instructing")
-            log("instruction started")
+        elif not held and open_span:
+            instruction_spans[-1][1] = frame
+            # Back to dictating: the pill returns to the level meter so the
+            # two halves are always distinguishable on screen
+            overlay.setPhase_("recording")
         return
     if event.keyCode() != keycode:
         return
@@ -1219,7 +1230,31 @@ def paste(text):
 
 # All slow work happens here: the hotkey handler runs on the main run loop,
 # and blocking it would freeze the menu bar and delay key handling.
-def run_job(audio, generation, split, t0):
+def split_audio(audio, spans):
+    """Separate the dictated message from the spoken instruction.
+
+    Returns (message, instruction), either of which may be empty. The key can
+    be pressed and released repeatedly, so both halves are gathered from
+    however many pieces the user produced.
+    """
+    if not spans:
+        return audio, None
+    message, instruction = [], []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            message.append(audio[cursor:start])
+        instruction.append(audio[start:end])
+        cursor = end
+    if cursor < len(audio):
+        message.append(audio[cursor:])
+    return (
+        np.concatenate(message) if message else audio[:0],
+        np.concatenate(instruction) if instruction else None,
+    )
+
+
+def run_job(audio, generation, spans, t0):
     """Transcribe, optionally rewrite, and paste one recording.
 
     Split out of worker() so the cancel path can be tested against the real
@@ -1227,14 +1262,15 @@ def run_job(audio, generation, split, t0):
     """
     global last_inference
     instruction = None
-    if split is not None:
-        # Two transcriptions, not two recordings: the stream stayed open
-        # across the split, so no speech is lost at the boundary.
-        message_audio, instruction_audio = audio[:split], audio[split:]
+    message_audio, instruction_audio = split_audio(audio, spans)
+    if instruction_audio is not None:
         if len(instruction_audio) < SAMPLE_RATE * MIN_SECONDS:
             log("instruction too short to use — pasting the dictation as-is")
-            split = None
+        elif len(message_audio) < SAMPLE_RATE * MIN_SECONDS:
+            log("nothing dictated to apply the instruction to — pasting as-is")
         else:
+            # Two transcriptions, one recording: the stream stayed open across
+            # every toggle, so no speech is lost at the boundaries.
             audio = message_audio
             instruction = transcribe(instruction_audio).strip()
             if not instruction:

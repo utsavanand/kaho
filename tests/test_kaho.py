@@ -145,7 +145,7 @@ class KahoTestCase(unittest.TestCase):
             ("stream", None),
             ("record_buf", None),
             ("audio_op_started", None),
-            ("instruction_at", None),
+            
             ("history_version", 0),
             ("rewriter", None),
         ):
@@ -954,60 +954,97 @@ class TestSpokenInstruction(KahoTestCase):
         super().setUp()
         kaho.overlay.is_working.return_value = False
 
-    def press_instruction_key(self):
+    def hold_instruction(self):
         code, mask = kaho.instruction_key()
         kaho.handle_flags_changed(FakeEvent(code, mask))
+
+    def release_instruction(self):
+        code, _ = kaho.instruction_key()
+        kaho.handle_flags_changed(FakeEvent(code, 0))
 
     def speak(self, seconds=1.0):
         loud = REAL_NUMPY.full((int(kaho.SAMPLE_RATE * seconds), 1), 0.5, dtype="float32")
         kaho.record_buf.append(loud)
 
-    def test_the_key_marks_where_the_instruction_starts(self):
+    def test_holding_the_key_opens_a_span_and_releasing_closes_it(self):
         self.down()
         self.run_audio_ops()
         self.speak(1.0)
-        self.press_instruction_key()
-        self.assertEqual(kaho.instruction_at, kaho.SAMPLE_RATE)
+        self.hold_instruction()
+        self.speak(1.0)
+        self.release_instruction()
+        self.assertEqual(kaho.instruction_spans,
+                         [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE]])
 
-    def test_a_second_press_does_not_move_the_mark(self):
-        # A fumbled key must not silently swallow the instruction already given
+    def test_it_can_be_toggled_more_than_once(self):
+        """Releasing goes back to dictating — the whole point of holding."""
         self.down()
         self.run_audio_ops()
         self.speak(1.0)
-        self.press_instruction_key()
+        self.hold_instruction()
         self.speak(1.0)
-        self.press_instruction_key()
-        self.assertEqual(kaho.instruction_at, kaho.SAMPLE_RATE)
+        self.release_instruction()
+        self.speak(1.0)
+        self.hold_instruction()
+        self.speak(1.0)
+        self.release_instruction()
+        self.assertEqual(
+            kaho.instruction_spans,
+            [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE],
+             [3 * kaho.SAMPLE_RATE, 4 * kaho.SAMPLE_RATE]],
+        )
+
+    def test_the_pill_goes_back_to_recording_on_release(self):
+        self.down()
+        self.run_audio_ops()
+        self.hold_instruction()
+        kaho.overlay.setPhase_.assert_called_with("instructing")
+        self.release_instruction()
+        kaho.overlay.setPhase_.assert_called_with("recording")
 
     def test_the_key_does_nothing_when_not_recording(self):
-        self.press_instruction_key()
-        self.assertIsNone(kaho.instruction_at)
+        self.hold_instruction()
+        self.assertEqual(kaho.instruction_spans, [])
 
-    def test_the_mark_is_cleared_for_the_next_dictation(self):
+    def test_spans_are_cleared_for_the_next_dictation(self):
         self.down()
         self.run_audio_ops()
         self.speak(1.0)
-        self.press_instruction_key()
+        self.hold_instruction()
+        self.speak(1.0)
         self.clock.advance(2.0)
         self.up()
         self.run_audio_ops()
 
         self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
         self.down()
-        self.assertIsNone(kaho.instruction_at, "a stale mark would split the next one")
+        self.assertEqual(kaho.instruction_spans, [],
+                         "a stale span would split the next dictation")
 
-    def test_the_split_reaches_the_job(self):
+    def test_a_span_left_open_is_closed_at_the_end(self):
+        """The hotkey can be released while the instruction key is still down."""
         self.down()
         self.run_audio_ops()
         self.speak(1.0)
-        self.press_instruction_key()
+        self.hold_instruction()
         self.speak(1.0)
         self.clock.advance(2.0)
         self.up()
         self.run_audio_ops()
 
-        _, _, split = kaho.jobs.get()
-        self.assertEqual(split, kaho.SAMPLE_RATE)
+        _, _, spans = kaho.jobs.get()
+        self.assertEqual(spans, [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE]])
+
+    def test_the_halves_are_gathered_from_every_piece(self):
+        audio = REAL_NUMPY.arange(100, dtype="float32")
+        message, instruction = kaho.split_audio(audio, [[20, 30], [60, 70]])
+        self.assertEqual(len(message), 80)
+        self.assertEqual(len(instruction), 20)
+        # Order preserved: message is 0-20, 30-60, 70-100
+        self.assertEqual(message[0], 0)
+        self.assertEqual(message[20], 30)
+        self.assertEqual(instruction[0], 20)
+        self.assertEqual(instruction[10], 60)
 
     def test_the_instruction_rewrites_the_message(self):
         # Instruction half is transcribed first, then the message
@@ -1020,7 +1057,7 @@ class TestSpokenInstruction(KahoTestCase):
              mock.patch.object(kaho, "paste_blocked_reason", return_value=None), \
              mock.patch.object(kaho, "rewriter", (mock.MagicMock(), mock.MagicMock())):
             audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 2, dtype="float32")
-            kaho.run_job(audio, kaho.job_generation, kaho.SAMPLE_RATE, self.clock.now)
+            kaho.run_job(audio, kaho.job_generation, [[kaho.SAMPLE_RATE, len(audio)]], self.clock.now)
 
         rw.assert_called_once_with("cant make the offsite", "make it formal")
         paste.assert_called_once_with("I am unable to attend.")
@@ -1037,7 +1074,7 @@ class TestSpokenInstruction(KahoTestCase):
              mock.patch.object(kaho, "paste_blocked_reason", return_value=None), \
              mock.patch.object(kaho, "rewriter", (mock.MagicMock(), mock.MagicMock())):
             audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 2, dtype="float32")
-            kaho.run_job(audio, kaho.job_generation, kaho.SAMPLE_RATE, self.clock.now)
+            kaho.run_job(audio, kaho.job_generation, [[kaho.SAMPLE_RATE, len(audio)]], self.clock.now)
 
         plain.assert_not_called()
 
@@ -1050,7 +1087,7 @@ class TestSpokenInstruction(KahoTestCase):
             audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE, dtype="float32")
             # Split 0.1 s from the end: below MIN_SECONDS
             kaho.run_job(audio, kaho.job_generation,
-                         int(kaho.SAMPLE_RATE * 0.9), self.clock.now)
+                         [[int(kaho.SAMPLE_RATE * 0.9), len(audio)]], self.clock.now)
 
         rw.assert_not_called()
         paste.assert_called_once_with("the whole thing")
@@ -1094,7 +1131,7 @@ class TestCancel(KahoTestCase):
         MLX inference cannot be interrupted, so this is what cancelling
         actually buys: the text is computed and then thrown away.
         """
-        kaho.jobs.put((mock.MagicMock(), 0, None))
+        kaho.jobs.put((mock.MagicMock(), 0, []))
         kaho.job_generation = 1
         self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
         kaho.asr.generate.return_value.text = "unwanted text"
@@ -1108,7 +1145,7 @@ class TestCancel(KahoTestCase):
         self.assertTrue(any("cancelled" in m for m in self.logged))
 
     def test_an_uncancelled_job_still_pastes(self):
-        kaho.jobs.put((mock.MagicMock(), 0, None))
+        kaho.jobs.put((mock.MagicMock(), 0, []))
         self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
         kaho.asr.generate.return_value.text = "wanted text"
 
@@ -1175,8 +1212,8 @@ class TestCancel(KahoTestCase):
 
     def run_one_job(self):
         """The real worker body, minus its `while True`."""
-        audio, generation, split = kaho.jobs.get()
-        kaho.run_job(audio, generation, split, self.clock.now)
+        audio, generation, spans = kaho.jobs.get()
+        kaho.run_job(audio, generation, spans, self.clock.now)
 
 
 class TestRelaunch(KahoTestCase):

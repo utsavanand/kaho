@@ -3,7 +3,9 @@
 
 - Say how you want it written, in the same breath. Press right Shift
   while still holding the hotkey and everything after it is an
-  instruction rather than part of the message — "formal, two sentences",
+  instruction rather than part of the message. The key is held, not
+  latched: release it and you are dictating again, so a thought can be
+  interrupted with an aside and then carry on — "formal, two sentences",
   "casual, like texting a friend", "turn this into bullet points". The
   instruction overrides the configured rewrite mode for that dictation
   only.

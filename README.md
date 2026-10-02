@@ -49,8 +49,9 @@ log, and one-click bug reports:
 - **Hotkey** — right Option (default), right Command, right Control, or right
   Shift. Right-side only: the left keys are needed for typing.
 - **Say how you want it written** — while still holding the hotkey, press
-  right Shift and keep talking. Everything after that press is an instruction,
-  not part of the message: *"tell Mark I can't make the offsite, suggest
+  right Shift and keep talking. It is *held*, not latched — release it and you
+  are dictating again, so a thought can be interrupted with an aside and then
+  carry on. Everything said while it is down is an instruction, not message: *"tell Mark I can't make the offsite, suggest
   November"* → ⇧ → *"formal, two sentences"* becomes "Mark, I am unable to
   attend the offsite; I recommend scheduling it in November." The same words
   with *"casual, like texting a friend"* come out as "Hey Mark, I'm sorry but
