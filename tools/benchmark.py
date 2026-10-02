@@ -13,7 +13,7 @@ took 2.9 s but not whether that was the audio, the model, or a cold cache.
 
 Reported per stage, in the order a real dictation hits them:
 
-  transcribe   Whisper. Scales with clip length, in 30 s windows.
+  transcribe   Qwen3-ASR. Cost grows with clip length.
   clean-check  One forward pass asking "already clean?" (1.7.11).
   rewrite      Generation, only when the check says it is needed.
 
@@ -36,8 +36,8 @@ sys.path.insert(0, str(ROOT))
 
 BASELINE_DIR = ROOT / "build-bench"
 
-# Short, medium and long: Whisper pads to 30 s windows, so cost is a step
-# function of length, not a line. One clip per side of the first step.
+# Short, medium and long: Qwen3-ASR's cost grows with length (Whisper's was
+# a step function of 30 s windows), so three lengths show the slope.
 CLIPS = {
     "short": "Move the launch to Thursday.",
     "medium": (
@@ -91,8 +91,10 @@ def timed(fn):
 def measure(repeats):
     import kaho
 
-    kaho.model_path = kaho.huggingface_hub.snapshot_download(
-        kaho.MODEL_REPO, revision=kaho.MODEL_REVISION
+    # Loaded up front, as backend() does, so "cold" is the first inference
+    # (Metal kernel compilation) without the weight load folded in
+    kaho.asr = kaho.load_model(
+        kaho.huggingface_hub.snapshot_download(kaho.MODEL_REPO, revision=kaho.MODEL_REVISION)
     )
     results = {}
     with tempfile.TemporaryDirectory() as tmp:

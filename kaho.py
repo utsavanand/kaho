@@ -3,6 +3,7 @@ locally transcribed text is pasted into the focused app. See DESIGN.md."""
 
 import collections
 import ctypes
+import difflib
 import json
 import multiprocessing
 import os
@@ -17,10 +18,10 @@ import urllib.parse
 
 import AppKit
 import huggingface_hub
-import mlx_whisper
 import numpy as np
 import Quartz
 import sounddevice as sd
+from mlx_audio.stt.utils import load_model
 from PyObjCTools import AppHelper
 
 # kVK_* keycodes from Carbon's Events.h. Raw keycodes, not characters: pynput
@@ -41,21 +42,31 @@ HOTKEYS = {  # name -> (keycode, device-specific modifier bit, label)
     "right_shift": (60, 0x0004, "Right Shift (⇧)"),
 }
 
-MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+# Replaced Whisper large-v3-turbo in 2.2.0. On an M4 Max (tools/benchmark.py):
+# 0.12 s vs 0.51 s on a 1.4 s clip, 0.42 vs 0.60 at 10 s, but 1.06 vs 0.78 at
+# 30 s — Whisper pads every clip to 30 s, this model's cost grows with length,
+# and they cross around 15-20 s. Most dictations are well under that (median
+# 6.3 s over 677 logged). Lower WER too (1.3% vs 1.5% LibriSpeech clean, 3.4%
+# vs 4.4% on jargon with the dictionary). Parakeet v3 was faster still but
+# takes no vocabulary, so it spelled names wrong and the Dictionary would
+# have been dead weight.
+MODEL_REPO = "mlx-community/Qwen3-ASR-1.7B-8bit"
 # Pinned HF revision: the repo name is a mutable reference, the commit is not.
 # Update deliberately (huggingface.co/api/models/<repo> -> "sha") after
 # checking the diff, since the model runs inside an app holding mic and
 # Accessibility permissions.
-MODEL_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
+MODEL_REVISION = "a8379a2e2f9e313c9292cdf1af4055ab56d50d55"
+MODEL_SIZE_LABEL = "~2.3 GB"
 # The Instruct-2507 (non-thinking) variant: the 1.7B model echoed long rambly
 # transcripts back unchanged in clean mode, and thinking-mode Qwen3 burned 7+
 # seconds per dictation. 4B-Instruct rewrites reliably in ~0.3-0.8s on M-series.
 REWRITE_REPO = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 REWRITE_REVISION = "50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b"
 REWRITE_SIZE_LABEL = "~2.3 GB"
-# Whisper detects the language per 30 s window when it is not told one, and
-# on short or noisy audio it guesses wrong — an English sentence comes back
-# transliterated into Hindi or Spanish. Pinning it removes that failure mode.
+# Left to detect, a speech model can guess wrong on short or noisy audio —
+# Whisper sent English sentences back transliterated into Hindi or Spanish.
+# Pinning the language removes that failure mode. The names double as what
+# Qwen3-ASR expects, and all nine are in its supported list.
 # "auto" stays the default so multilingual users are not forced to choose.
 LANGUAGES = {
     "auto": "Detect automatically",
@@ -77,7 +88,7 @@ REWRITE_MODES = {
     "caveman": "Caveman",
 }
 REWRITE_HINTS = {
-    "off": "Paste exactly what Whisper heard.",
+    "off": "Paste exactly what was heard.",
     "clean": "Remove filler words and fix punctuation. Your wording is kept.",
     "structured": "Give the dictation the shape it needs — crisp sentences, steps, or bullets.",
     "caveman": "Compress hard for prompting an LLM — every instruction kept, words minimised.",
@@ -175,7 +186,7 @@ REWRITE_PROMPTS = {
         "Transcript:\n{text}"
     ),
 }
-# Whisper often returns a transcript Clean up would leave untouched, and
+# The speech model often returns a transcript Clean up would leave untouched, and
 # generating it anyway costs 0.7-1.4 s. One forward pass reads how likely the
 # first answer token is A vs B: a decision, not generation. The direction
 # matters — asked "does it need cleanup?" Qwen3-4B answered yes to every
@@ -194,9 +205,11 @@ CLEAN_CHECK_PROMPT = (
 SKIP_REWRITE_CONFIDENCE = 0.9
 SAMPLE_RATE = 16_000
 MIN_SECONDS = 0.3
-# Whisper invents fluent text from near-silence — 0.6s at peak 0.005 produced
-# a paragraph of German, and 0.013 produced "videos" 400 times. Every real
-# dictation in practice peaks at 0.05+, every hallucination under 0.02.
+# Speech models invent fluent text from near-silence. Measured on Whisper,
+# the model before 2.2.0: 0.6s at peak 0.005 produced a paragraph of German,
+# and 0.013 produced "videos" 400 times. Every real dictation in practice
+# peaks at 0.05+, every hallucination under 0.02. Kept for the current model:
+# the floor costs nothing on real speech.
 MIN_PEAK = 0.025
 # Delay before handing the clipboard back after a paste. Slow apps read the
 # pasteboard well after the Cmd+V keystroke; restoring too early makes them
@@ -209,8 +222,8 @@ TAP_MAX_SECONDS = 0.45  # a press shorter than this counts as a tap
 DOUBLE_TAP_SECONDS = 0.9
 # Ignore a stop tap arriving right after locking. Without it, the release of
 # the second tap — or a third from an over-eager double-tap — cancelled the
-# lock instantly, recording a fraction of a second of silence that Whisper
-# then hallucinated a paragraph from.
+# lock instantly, recording a fraction of a second of silence that the
+# speech model then hallucinated a paragraph from.
 LOCK_GRACE_SECONDS = 0.6
 HISTORY_SIZE = 10
 LONG_RECORDING_SECONDS = 60  # elapsed counter turns amber past this
@@ -228,14 +241,19 @@ SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/Kaho")
 HISTORY_PATH = os.path.join(SUPPORT_DIR, "history.jsonl")
 SETTINGS_PATH = os.path.join(SUPPORT_DIR, "settings.json")
 DICTIONARY_PATH = os.path.join(SUPPORT_DIR, "dictionary.txt")
-# Whisper's decoder context is 224 tokens; anything past that is silently
-# dropped, and a bloated glossary dilutes the bias on the words you do say.
+# The terms ride in the model's prompt on every dictation. There is no hard
+# window any more (Whisper's was 224 tokens), but each term is prefill paid
+# per dictation, and a bloated list dilutes the bias on the words you do say.
 DICTIONARY_MAX_TERMS = 120
+# "soto" vs "sotto" scores 0.89; "sato" (a real surname) 0.67 and is left alone
+RESPELL_MIN_SIMILARITY = 0.85
+# Ships with macOS: 236k words, the guard that keeps respell() off real words
+ENGLISH_WORDS_PATH = "/usr/share/dict/words"
 DICTIONARY_TEMPLATE = """\
 # Kaho dictionary — one term per line.
 #
-# Whisper picks the likeliest spelling when audio is ambiguous, so listing
-# your names, products, and jargon here biases it toward yours. Lines
+# The speech model picks the likeliest spelling when audio is ambiguous, so
+# listing your names, products, and jargon here biases it toward yours. Lines
 # starting with # are ignored. Edits apply to the next dictation; no
 # restart needed.
 #
@@ -248,7 +266,7 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 # it from here, and tools/check_docs_sync.py fails the build when the top of
 # CHANGELOG.md disagrees — the Kaho.spec copy had silently sat at 1.7.3 for six
 # releases, which is what a bundle built without KAHO_VERSION would have shipped.
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
@@ -297,6 +315,8 @@ rewriter_thread = None
 last_inference = 0.0  # monotonic time of the last real or warmup inference
 WARMUP = object()  # sentinel job: page the models back in before the audio lands
 rewriter_lock = threading.Lock()  # see ensure_rewriter
+asr = None  # the speech model, loaded by backend
+_english_words = None  # see english_words
 
 
 # Transcripts are sensitive: create log/history files 0600 instead of the
@@ -367,16 +387,104 @@ def read_dictionary():
     if len(terms) > DICTIONARY_MAX_TERMS:
         log(
             f"dictionary has {len(terms)} terms; using the first "
-            f"{DICTIONARY_MAX_TERMS} (Whisper's prompt window is 224 tokens)"
+            f"{DICTIONARY_MAX_TERMS} (every term is prompt the model reads per dictation)"
         )
         terms = terms[:DICTIONARY_MAX_TERMS]
     return terms
 
 
-def dictionary_prompt(terms):
-    """Whisper conditions on this text, so it reads as a sentence rather than
-    a bare list — a list of nouns biases it toward transcribing lists."""
-    return "Glossary of terms used in this recording: " + ", ".join(terms) + "."
+def english_words():
+    """Lowercased macOS word list, loaded once. Empty if the file is missing —
+    respell() then relies on its similarity and length rules alone."""
+    global _english_words
+    if _english_words is None:
+        try:
+            with open(ENGLISH_WORDS_PATH) as f:
+                _english_words = {line.strip().lower() for line in f}
+        except OSError:
+            _english_words = set()
+    return _english_words
+
+
+def is_english(word):
+    """True for a listed word or a regular inflection of one. The macOS list
+    is mostly base forms: it has "motion" but not "motions" or "reviewed"."""
+    low = word.lower()
+    words = english_words()
+    if low in words:
+        return True
+    return any(
+        low.endswith(end) and low[: -len(end)] in words
+        for end in ("s", "es", "ed", "d", "ing", "er", "ers", "ly")
+    )
+
+
+def _compact(s):
+    return re.sub(r"[\s-]", "", s).lower()
+
+
+def respell(text, terms):
+    """Replace near-misses of dictionary terms with the dictionary's spelling.
+
+    The model takes the dictionary as hotwords yet still wrote "Soto" for
+    "Sotto" in 8 of 12 benchmark clips. Deliberately narrow, because a wrong
+    "fix" is worse than the miss: a word is only replaced when it is within
+    one letter of the term's length, at least RESPELL_MIN_SIMILARITY alike,
+    not itself an English word ("motto" stays "motto"), and capitalized as
+    the name the model took it for — the word list misses irregular forms,
+    and "the postmen came" must not become "the Postman came". Exact matches
+    also get the dictionary's casing ("PostgresQL" -> "PostgreSQL"), and two
+    words that join into a term are merged ("Postgre SQL" -> "PostgreSQL").
+    """
+    if not terms:
+        return text
+    by_compact = {_compact(t): t for t in terms}
+    single = [t for t in terms if " " not in t]
+    words = list(re.finditer(r"[A-Za-z][A-Za-z'-]*", text))
+    out, pos, i = [], 0, 0
+    while i < len(words):
+        m = words[i]
+        # Two words the model split apart, separated by one space
+        if i + 1 < len(words):
+            nxt = words[i + 1]
+            joined = text[m.start():nxt.end()]
+            if nxt.start() - m.end() == 1 and _compact(joined) in by_compact:
+                out += [text[pos:m.start()], by_compact[_compact(joined)]]
+                pos, i = nxt.end(), i + 2
+                continue
+        word = m.group()
+        # Respell the stem and keep a possessive: "Soto's" -> "Sotto's"
+        stem, suffix = (word[:-2], word[-2:]) if word.lower().endswith("'s") else (word, "")
+        # An English word is left as spoken, even an exact match: with "Swift"
+        # in the dictionary, "a swift reply" must not become "a Swift reply"
+        if is_english(stem):
+            replacement = None
+        else:
+            replacement = by_compact.get(stem.lower()) or _near_miss(stem, single)
+        if replacement and replacement != stem:
+            out += [text[pos:m.start()], replacement + suffix]
+            pos = m.end()
+        i += 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _near_miss(word, terms):
+    low = word.lower()
+    if len(low) < 4:
+        return None
+    best, best_ratio = None, RESPELL_MIN_SIMILARITY
+    for term in terms:
+        if abs(len(term) - len(low)) > 1:
+            continue
+        # A capitalized term ("Postman") only claims a word the model also
+        # capitalized; a lowercase one ("kubectl") claims either
+        if term[0].isupper() and not word[0].isupper():
+            continue
+        ratio = difflib.SequenceMatcher(None, low, term.lower()).ratio()
+        if ratio >= best_ratio:
+            best, best_ratio = term, ratio
+    return best
 
 
 def ensure_dictionary_file():
@@ -764,11 +872,8 @@ def install_hotkey_monitors():
     ]
 
 
-model_path = None  # local snapshot dir of the pinned revision, set by backend
-
-
 def looks_hallucinated(text):
-    """True when Whisper has fallen into a repetition loop.
+    """True when the model has fallen into a repetition loop.
 
     Even above the silence floor it sometimes emits one word hundreds of
     times ("videos videos videos..."). Pasting that into the user's editor
@@ -784,18 +889,16 @@ def looks_hallucinated(text):
 
 def transcribe(audio, use_dictionary=True):
     terms = read_dictionary() if use_dictionary else []
-    return mlx_whisper.transcribe(
+    # Whisper needed condition_on_previous_text=False to stop one 30 s
+    # window's bad guess seeding the next. This model decodes the whole
+    # dictation in one pass, so there is no window-to-window context to cut.
+    text = asr.generate(
         audio,
-        path_or_hf_repo=model_path,
-        # Whisper normally feeds each 30 s window's output forward as context
-        # for the next one. That compounds errors on long dictation: one bad
-        # guess becomes the context that produces the next. The glossary gives
-        # every window the same bias instead, without the feedback loop.
-        condition_on_previous_text=False,
-        initial_prompt=dictionary_prompt(terms) if terms else None,
-        # None lets Whisper detect; a code pins it
-        language=None if settings["language"] == "auto" else settings["language"],
-    )["text"].strip()
+        hotwords=terms or None,
+        # None lets the model detect; it takes the language's name, not its code
+        language=None if settings["language"] == "auto" else LANGUAGES[settings["language"]],
+    ).text.strip()
+    return respell(text, terms)
 
 
 def ensure_rewriter():
@@ -1064,13 +1167,13 @@ def backend():
     global state, input_device, input_name, last_inference
     # Without this boundary a failed download/device/model init leaves the
     # menu bar stuck on "…" forever with no explanation
-    global model_path
+    global asr
     try:
         input_device, input_name = pick_input_device()
         log(f"mic: {input_name}")
-        log(f"loading {MODEL_REPO}@{MODEL_REVISION[:8]} (first run downloads ~1.6 GB)...")
+        log(f"loading {MODEL_REPO}@{MODEL_REVISION[:8]} (first run downloads {MODEL_SIZE_LABEL})...")
         t0 = time.monotonic()
-        model_path = huggingface_hub.snapshot_download(MODEL_REPO, revision=MODEL_REVISION)
+        asr = load_model(huggingface_hub.snapshot_download(MODEL_REPO, revision=MODEL_REVISION))
         # Warmup on silence: pays model load + Metal kernel compilation now
         # instead of on the first real dictation
         transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), use_dictionary=False)
@@ -1210,7 +1313,7 @@ def draw_elapsed(view, bounds):
         return
     secs = int(time.monotonic() - started)
     # Amber past the soft limit: a nudge to wrap up, not a hard stop —
-    # Whisper's accuracy holds, but very long holds are usually accidental
+    # accuracy holds, but very long holds are usually accidental
     color = (
         AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(1.0, 0.72, 0.30, 0.95)
         if secs >= LONG_RECORDING_SECONDS
@@ -1542,7 +1645,7 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(self.dict_button)
         content.addSubview_(
             make_label(
-                "Names and jargon Whisper should spell your way.", 232, 52, 11, dim=True
+                "Names and jargon to spell your way.", 232, 52, 11, dim=True
             )
         )
 
@@ -1944,7 +2047,7 @@ class StatusItem(AppKit.NSObject):
             f"Python {platform.python_version()}\n"
             f"mic: {input_name} · state: {state}\n"
             f"hotkey: {hotkey_label()} · rewrite: {settings['rewrite']}\n"
-            f"whisper: {MODEL_REPO}@{MODEL_REVISION[:8]}\n"
+            f"speech model: {MODEL_REPO}@{MODEL_REVISION[:8]}\n"
             f"rewrite model: {REWRITE_REPO}@{REWRITE_REVISION[:8]} "
             f"(loaded: {rewriter is not None})\n\n"
             "The attached Kaho.log includes recent transcripts — delete "

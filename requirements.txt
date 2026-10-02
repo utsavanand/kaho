@@ -5,8 +5,8 @@
 # only as transitive deps of the others, which meant an upstream dropping one
 # would have broken the dev install with nothing in the lock changing.
 huggingface_hub>=1.29,<2
+mlx-audio>=0.5.7,<0.6
 mlx-lm>=0.31.3,<0.32
-mlx-whisper>=0.4.3,<0.5
 numpy>=2.5,<3
 pyobjc-framework-Cocoa>=11,<13
 pyobjc-framework-Quartz>=11,<13

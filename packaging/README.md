@@ -48,9 +48,9 @@ a stock Mac with no Gatekeeper warning and no terminal.
 
 ### Size
 
-The bundle is large — roughly 700 MB–1 GB. `mlx-whisper` requires `torch`
-(529 MB on its own), so it cannot be dropped. The Whisper and rewrite models are
-**not** bundled; they download on first use and cache in `~/.cache/huggingface`,
+The bundle is about 360 MB (measured for 2.2.0; 478 MB for 1.7.x, before
+mlx-whisper and the torch it declared were dropped). The speech and rewrite
+models are **not** bundled; they download on first use and cache in `~/.cache/huggingface`,
 which keeps the DMG under GitHub's 2 GB release limit.
 
 ### Verifying before you publish

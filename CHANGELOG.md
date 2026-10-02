@@ -1,4 +1,40 @@
 # Changelog
+## 2.2.0 — 2026-10-01
+
+- Transcription moves from Whisper large-v3-turbo (mlx-whisper) to
+  Qwen3-ASR 1.7B 8-bit (mlx-audio). Latency from `tools/benchmark.py`
+  on an M4 Max, both models run back to back on the same clips (warm);
+  accuracy from a 109-clip benchmark with the dictionary:
+
+  | | Whisper | Qwen3-ASR 1.7B |
+  |---|---|---|
+  | 1.4 s clip | 0.51 s | 0.12 s |
+  | 10.3 s clip | 0.60 s | 0.42 s |
+  | 29.6 s clip | 0.78 s | 1.06 s |
+  | WER, LibriSpeech clean / other | 1.5% / 1.6% | 1.3% / 0.6% |
+  | WER, jargon dictations | 4.4% | 3.4% |
+  | dictionary terms spelled right | 87% | 87% |
+
+  Whisper pads every clip to a 30 s window, so its cost barely moves with
+  length; this model's grows with it. They cross at roughly 15-20 s.
+  Across 677 logged dictations the median is 6.3 s and 84% are under
+  20 s, so most get faster and the longest ~15% get slower. An earlier
+  run showed a larger gain (0.88 s vs 0.30 s); it was measured while the
+  app was dictating on the same GPU, which slowed Whisper more. Parakeet v3 was faster still but takes
+  no vocabulary, so it spelled names wrong (44% of terms). Costs: a
+  ~2.3 GB first download instead of ~1.6 GB, ~1.1 GB more memory, and a
+  slower first load (about 4 s).
+- The dictionary is passed to the model as hotwords, and a new spelling
+  pass fixes close misses afterwards: the model still wrote "Soto" for
+  "Sotto" (the old name) in 8 of 12 clips despite the hotword. A word is replaced only
+  when it is within one letter of a term's length, at least 85% similar,
+  not an English word (or a regular inflection of one), and capitalized as
+  the name the model took it for, so "motto", "a swift reply" and "the
+  postmen came" are left alone.
+- Dependencies shrink: dropping mlx-whisper removes torch, numba,
+  llvmlite, sympy and tiktoken from the lock; mlx-audio adds itself and
+  miniaudio.
+
 ## 2.1.0 — 2026-09-30
 
 - Escape cancels a dictation. During recording the audio is dropped and

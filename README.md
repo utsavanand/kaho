@@ -25,13 +25,14 @@ telemetry.
 ![How Kaho works](assets/flow.svg)
 
 - **Works everywhere** — any app that accepts paste
-- **Fast** — under 1.5 s from key-release to text (0.5 s typical on an M4 Max),
-  with Whisper large-v3-turbo accuracy
+- **Fast** — under 1.5 s from key-release to text (about 0.15 s to transcribe a
+  short dictation on an M4 Max), with Qwen3-ASR 1.7B, which beat Whisper
+  large-v3-turbo on accuracy in our benchmark
 - **Hands-free** — double-tap the hotkey to lock recording, tap to stop
 - **Recording pill** — floating mic-level indicator with an elapsed timer,
   then live progress ("Transcribing…", "Rewriting…", "Pasted") so you always
   know what it's doing
-- **Dictionary** — list your names, products, and jargon; Whisper stops
+- **Dictionary** — list your names, products, and jargon; the model stops
   guessing "cow" for "Kaho"
 - **On-device** — audio never leaves the machine; works offline
 - **Small** — one Python file, seven dependencies
@@ -44,7 +45,7 @@ log, and one-click bug reports:
 <img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey, Language and Rewrite submenus, Settings, History, Open Log, Report a Bug">
 
 - **Settings…** — a real window (⌘,) for hotkey, language and rewrite mode
-- **Edit Dictionary…** — names and jargon Whisper should spell your way
+- **Edit Dictionary…** — names and jargon the model should spell your way
 - **Hotkey** — right Option (default), right Command, right Control, or right
   Shift. Right-side only: the left keys are needed for typing.
 - **Language** — detected automatically by default. Pin yours if short
@@ -111,7 +112,7 @@ permissions in System Settings → Privacy & Security, then relaunch:
 | Microphone | recording while the hotkey is held |
 | Accessibility | observing the global hotkey, sending the paste |
 
-First launch downloads the Whisper model (~1.6 GB; watch progress via
+First launch downloads the speech model (~2.3 GB; watch progress via
 🎙 → Open Log). To run at login: System Settings → General → Login Items.
 
 ## Usage
@@ -158,8 +159,9 @@ audio during the switch, garbling the start of every dictation.
 <details>
 <summary><strong>It typed "Thank you." when I said nothing.</strong></summary>
 
-Whisper hallucinates on silence. Holds under 0.3 s are dropped, but a longer
-silent hold can still produce one of these.
+Speech models hallucinate on silence. Holds under 0.3 s and audio below a
+loudness floor are dropped, but a longer silent hold can still produce one
+of these.
 </details>
 
 <details>
@@ -176,9 +178,9 @@ transcript is marked transient, so clipboard managers that honour that flag
 <details>
 <summary><strong>Can I change the models?</strong></summary>
 
-The Whisper and rewrite models are constants at the top of `kaho.py`; re-run
-`./install.sh` after editing. Smaller models (e.g.
-`mlx-community/whisper-small-mlx`) trade accuracy for speed and memory.
+The speech and rewrite models are constants at the top of `kaho.py`; re-run
+`./install.sh` after editing. `mlx-community/Qwen3-ASR-0.6B-8bit` is about
+twice as fast again (0.94 GB), a little worse on names and jargon.
 </details>
 
 ## Architecture
@@ -190,7 +192,7 @@ flowchart LR
     M -.-> O["Overlay pill — live mic level"]
     R --> Q[["audio queue"]]
     Q --> W["Worker thread"]
-    W --> T["mlx-whisper — large-v3-turbo on the Apple GPU"]
+    W --> T["mlx-audio — Qwen3-ASR 1.7B on the Apple GPU"]
     T --> RW["optional rewrite — Qwen3-4B via mlx-lm"]
     RW --> P["Clipboard + synthetic Cmd+V"]
     P --> A["Focused app"]
@@ -231,7 +233,7 @@ The cached models live in `~/.cache/huggingface` if you want those gone too.
 
 ## Acknowledgments
 
-Built on [mlx-whisper](https://github.com/ml-explore/mlx-examples),
+Built on [mlx-audio](https://github.com/Blaizzy/mlx-audio),
 [mlx-lm](https://github.com/ml-explore/mlx-lm),
 [sounddevice](https://github.com/spatialaudio/python-sounddevice), and
 [PyObjC](https://github.com/ronaldoussoren/pyobjc). Interaction model
