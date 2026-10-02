@@ -15,6 +15,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import urllib.request
 
 import AppKit
 import huggingface_hub
@@ -47,6 +48,30 @@ HOTKEYS = {  # name -> (keycode, device-specific modifier bit, label)
 # how to write it. Whichever modifier is not serving as the hotkey is used,
 # so the two can never collide.
 INSTRUCTION_FALLBACK = "right_shift"
+
+# On-device is the default and the fallback: a key only ever adds a better
+# rewrite, it never becomes load-bearing. Nothing degrades without one, and
+# the audio never leaves the Mac either way — only the transcript is sent,
+# and only when a key is set.
+REWRITE_BACKENDS = {
+    "local": "On this Mac (Qwen3 4B)",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "custom": "Custom (OpenAI-compatible)",
+}
+
+# Defaults chosen so the common case needs only a key. Overridable for
+# self-hosted and proxy endpoints, which is the point of "custom".
+BACKEND_DEFAULTS = {
+    "openai": ("https://api.openai.com/v1/chat/completions", "gpt-5"),
+    "anthropic": ("https://api.anthropic.com/v1/messages", "claude-sonnet-5"),
+    "custom": ("", ""),
+}
+
+KEYCHAIN_SERVICE = "com.utsavanand.kaho.apikey"
+# Generous, because a frontier model on a long dictation is not fast; the
+# fallback to on-device matters more than the exact number
+API_TIMEOUT_SECONDS = 30
 
 
 def instruction_key():
@@ -310,8 +335,12 @@ DICTIONARY_TEMPLATE = """\
 # listing your names, products, and jargon here biases it toward yours. Lines
 # starting with # are ignored. Edits apply to the next dictation; no
 # restart needed.
-#
-# Kaho
+
+# Uncommented because the app cannot say its own name without it: the
+# speech model hears "Kaho" and writes "Kahoot".
+Kaho
+
+# Your own names, products and jargon go below.
 # Duckterm
 # Kubernetes
 """
@@ -371,7 +400,8 @@ press_time = 0.0
 last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
 settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto",
-            "trigger": "hold"}
+            "trigger": "hold", "rewrite_backend": "local",
+            "api_url": "", "api_model": ""}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
@@ -426,6 +456,11 @@ def load_settings():
         settings["language"] = saved["language"]
     if saved.get("trigger") in TRIGGERS:
         settings["trigger"] = saved["trigger"]
+    if saved.get("rewrite_backend") in REWRITE_BACKENDS:
+        settings["rewrite_backend"] = saved["rewrite_backend"]
+    for key in ("api_url", "api_model"):
+        if isinstance(saved.get(key), str):
+            settings[key] = saved[key]
 
 
 def save_settings():
@@ -1061,6 +1096,15 @@ def clean_as_is_probability(text):
 
 def rewrite(text, mode):
     """Returns the rewritten text, or None to paste the transcript as-is."""
+    # Checked before the local model, not after: a cloud backend has to work
+    # even when the on-device model never loaded
+    backend = settings["rewrite_backend"]
+    if backend != "local":
+        t0 = time.monotonic()
+        out = call_rewrite_api(backend, REWRITE_PROMPTS[mode].format(text=text))
+        if out:
+            log(f"[rewrite {mode} via {backend} {time.monotonic() - t0:.2f}s]")
+            return out
     if rewriter is None:
         log("rewrite skipped: model not loaded yet — pasted the raw transcript")
         return None
@@ -1101,11 +1145,100 @@ def rewrite(text, mode):
     return out
 
 
+def get_api_key(backend):
+    """The stored key for a backend, or "" if there is none.
+
+    Keychain rather than settings.json: the settings file is plain JSON in
+    Application Support, and an API key sitting in it is a credential leaked
+    to anything that can read the user's home directory.
+    """
+    out = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+         "-a", backend, "-w"],
+        capture_output=True, text=True, check=False,
+    )
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def set_api_key(backend, key):
+    if not key:
+        subprocess.run(
+            ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE,
+             "-a", backend],
+            capture_output=True, check=False,
+        )
+        return
+    # -U updates in place rather than erroring when one already exists
+    subprocess.run(
+        ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE,
+         "-a", backend, "-w", key],
+        capture_output=True, check=False,
+    )
+
+
+def call_rewrite_api(backend, prompt):
+    """Send one prompt to a cloud model. Returns the text, or None on failure.
+
+    Returning None rather than raising is deliberate: every caller falls back
+    to the on-device model, so a dead network or a bad key costs latency and
+    quality, never the user's words.
+    """
+    key = get_api_key(backend)
+    if not key:
+        log(f"{backend}: no API key stored — using the on-device model")
+        return None
+    url = settings.get("api_url") or BACKEND_DEFAULTS[backend][0]
+    model = settings.get("api_model") or BACKEND_DEFAULTS[backend][1]
+    if not url or not model:
+        log(f"{backend}: endpoint or model not set — using the on-device model")
+        return None
+
+    if backend == "anthropic":
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01",
+                   "content-type": "application/json"}
+        body = {"model": model, "max_tokens": 2048,
+                "messages": [{"role": "user", "content": prompt}]}
+    else:
+        # OpenAI's shape, which Groq, OpenRouter, Ollama and most proxies
+        # also speak — hence one "custom" option rather than one per vendor
+        headers = {"Authorization": f"Bearer {key}",
+                   "content-type": "application/json"}
+        body = {"model": model,
+                "messages": [{"role": "user", "content": prompt}]}
+
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
+            data = json.loads(r.read())
+    except Exception as e:  # noqa: BLE001
+        # Never log the key, and never log the response body: both can carry
+        # the transcript or the credential into a file the user may share
+        log(f"{backend} request failed: {type(e).__name__} — using the on-device model")
+        return None
+    try:
+        if backend == "anthropic":
+            return "".join(b.get("text", "") for b in data["content"]).strip()
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        log(f"{backend}: unexpected response shape — using the on-device model")
+        return None
+
+
 def rewrite_with_instruction(text, instruction):
     """Rewrite the dictation the way the spoken instruction asked.
 
     Returns None to paste the transcript unchanged, matching rewrite().
     """
+    backend = settings["rewrite_backend"]
+    if backend != "local":
+        t0 = time.monotonic()
+        out = call_rewrite_api(
+            backend, INSTRUCTION_PROMPT.format(instruction=instruction, text=text))
+        if out:
+            log(f'[instructed via {backend} {time.monotonic() - t0:.2f}s] "{instruction}"')
+            return out
+        # call_rewrite_api already said why; fall through to on-device
     if rewriter is None:
         log("instruction ignored: rewrite model not loaded — pasted as-is")
         return None
@@ -2122,6 +2255,59 @@ def apply_trigger(mode):
     refresh_settings_ui()
 
 
+def apply_rewrite_backend(name):
+    """Switch the rewrite model, prompting for a key the first time."""
+    settings["rewrite_backend"] = name
+    if name != "local":
+        settings["api_url"], settings["api_model"] = BACKEND_DEFAULTS[name]
+    save_settings()
+    log(f"rewrite model: {REWRITE_BACKENDS[name]}")
+    if name != "local" and not get_api_key(name):
+        prompt_for_api_key(name)
+    refresh_settings_ui()
+
+
+def prompt_for_api_key(backend):
+    """Ask for the key in a secure field, so it is never on screen or on disk.
+
+    NSSecureTextField rather than a text file: the whole reason the key lives
+    in the Keychain is that a plaintext copy in Application Support is a
+    credential anything can read.
+    """
+    alert = AppKit.NSAlert.alloc().init()
+    alert.setMessageText_(f"{REWRITE_BACKENDS[backend]} API key")
+    alert.setInformativeText_(
+        "Stored in your Keychain, never in Kaho's settings file.\n\n"
+        "Your dictated text is sent to this service to be rewritten. Audio "
+        "always stays on this Mac. Leave empty to keep using the on-device "
+        "model."
+    )
+    field = AppKit.NSSecureTextField.alloc().initWithFrame_(((0, 0), (300, 24)))
+    alert.setAccessoryView_(field)
+    alert.addButtonWithTitle_("Save")
+    alert.addButtonWithTitle_("Cancel")
+    # Same as ask(): without this the alert can open on another Space and the
+    # user never sees it. Safe to run modally here because this is reached
+    # from a menu click while idle — runModal starves NSTimers, which is why
+    # nothing on the recording path may ever show an alert.
+    alert.window().setCollectionBehavior_(
+        AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+        | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+    )
+    AppKit.NSApp.activateIgnoringOtherApps_(True)
+    if alert.runModal() == AppKit.NSAlertFirstButtonReturn:
+        key = field.stringValue().strip()
+        set_api_key(backend, key)
+        if key:
+            log(f"{backend}: API key saved to the Keychain")
+            return
+    # No key: a cloud backend without one silently falls back on every
+    # dictation, which reads as the setting not working
+    settings["rewrite_backend"] = "local"
+    save_settings()
+    log("no key given — staying on the on-device model")
+
+
 def apply_language(code):
     settings["language"] = code
     save_settings()
@@ -2214,6 +2400,13 @@ class StatusItem(AppKit.NSObject):
         )
         menu.addItem_(
             build_submenu(
+                self, "Rewrite model",
+                [(l, b) for b, l in REWRITE_BACKENDS.items()],
+                settings["rewrite_backend"], "setRewriteBackend:",
+            )
+        )
+        menu.addItem_(
+            build_submenu(
                 self, "Trigger", [(l, m) for m, l in TRIGGERS.items()],
                 settings["trigger"], "setTrigger:",
             )
@@ -2238,6 +2431,9 @@ class StatusItem(AppKit.NSObject):
 
     def setHotkey_(self, sender):
         apply_hotkey(sender.representedObject())
+
+    def setRewriteBackend_(self, sender):
+        apply_rewrite_backend(sender.representedObject())
 
     def setTrigger_(self, sender):
         apply_trigger(sender.representedObject())

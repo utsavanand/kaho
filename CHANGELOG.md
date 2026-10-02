@@ -1,6 +1,22 @@
 # Changelog
 ## 2.2.0 — 2026-10-02
 
+- Bring your own key for the rewrite step. On-device stays the default
+  and the fallback; a key only ever adds quality, and nothing degrades
+  without one. OpenAI, Anthropic, or any OpenAI-compatible endpoint —
+  Groq, OpenRouter, a local Ollama — so one setting covers all of them.
+
+  Speech-to-text stays on-device and is not configurable. It is fast
+  and accurate enough now that sending audio to a server would cost
+  latency, money and the privacy claim for no real gain. Only the
+  transcript is ever sent, and only when a key is set.
+
+  The key lives in the Keychain, not in settings.json, which is plain
+  JSON that anything able to read the home directory can open. Every
+  failure path — no key, no network, bad endpoint, unexpected response
+  — falls back to the on-device model and says so, so a cloud problem
+  can never cost the user their words.
+
 - Say how you want it written, in the same breath. Press right Shift
   while still holding the hotkey and everything after it is an
   instruction rather than part of the message. The key is held, not

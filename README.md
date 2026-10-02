@@ -34,7 +34,9 @@ telemetry.
   know what it's doing
 - **Dictionary** — list your names, products, and jargon; the model stops
   guessing "cow" for "Kaho"
-- **On-device** — audio never leaves the machine; works offline
+- **On-device** — audio never leaves the machine; works offline. (Optional:
+  point the *rewrite* step at a cloud model with your own key — transcript
+  only, never audio.)
 - **Small** — one Python file, seven dependencies
 
 ## The menu
@@ -57,6 +59,14 @@ log, and one-click bug reports:
   with *"casual, like texting a friend"* come out as "Hey Mark, I'm sorry but
   I can't make the offsite…". Nothing to configure and nothing stored — the
   instruction is spoken once and forgotten.
+- **Rewrite model** — on this Mac by default. You can point the rewrite step
+  at OpenAI, Anthropic, or any OpenAI-compatible endpoint (Groq, OpenRouter,
+  a local Ollama) with your own key, which is worth it for "turn this ramble
+  into a paragraph" where a 4B model has a ceiling. The key is stored in your
+  Keychain, never in Kaho's settings file. **Your audio never leaves the Mac
+  either way** — only the transcript is sent, and only when a key is set. If
+  the request fails for any reason, Kaho falls back to the on-device model
+  rather than losing your words.
 - **Trigger** — hold the key while you speak (default), or tap once to start
   and once to stop. Holding is self-limiting, so a forgotten recording cannot
   run for minutes; tapping is easier through a long prompt, and is the only

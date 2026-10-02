@@ -152,7 +152,8 @@ class KahoTestCase(unittest.TestCase):
             self.enterContext(mock.patch.object(kaho, name, value))
         self.enterContext(mock.patch.object(
             kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto",
-             "trigger": "hold"}
+             "trigger": "hold", "rewrite_backend": "local",
+             "api_url": "", "api_model": ""}
         ))
         self.enterContext(mock.patch.object(kaho, "overlay", mock.MagicMock()))
 
@@ -379,7 +380,8 @@ class TestSettings(KahoTestCase):
         self.assertEqual(
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
-             "trigger": "hold"},
+             "trigger": "hold", "rewrite_backend": "local",
+             "api_url": "", "api_model": ""},
         )
 
     def test_malformed_json_keeps_the_defaults(self):
@@ -401,7 +403,8 @@ class TestSettings(KahoTestCase):
         self.assertEqual(
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
-             "trigger": "hold"},
+             "trigger": "hold", "rewrite_backend": "local",
+             "api_url": "", "api_model": ""},
         )
 
     def test_saved_settings_round_trip_and_stay_private(self):
@@ -1096,6 +1099,75 @@ class TestSpokenInstruction(KahoTestCase):
         for name in kaho.HOTKEYS:
             kaho.settings["hotkey"] = name
             self.assertNotEqual(kaho.instruction_key()[0], kaho.HOTKEYS[name][0], name)
+
+
+class TestBringYourOwnKey(KahoTestCase):
+    """A key only ever adds quality; nothing may depend on it."""
+
+    def setUp(self):
+        super().setUp()
+        kaho.settings["rewrite_backend"] = "openai"
+        self.enterContext(mock.patch.object(kaho, "get_api_key", return_value="sk-test"))
+
+    def test_the_transcript_is_sent_and_the_reply_used(self):
+        reply = {"choices": [{"message": {"content": "Polished."}}]}
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = \
+                json.dumps(reply).encode()
+            out = kaho.call_rewrite_api("openai", "do the thing")
+        self.assertEqual(out, "Polished.")
+        request = urlopen.call_args.args[0]
+        self.assertIn("do the thing", request.data.decode())
+        self.assertEqual(request.headers["Authorization"], "Bearer sk-test")
+
+    def test_anthropic_uses_its_own_shape(self):
+        reply = {"content": [{"text": "Polished."}]}
+        kaho.settings["rewrite_backend"] = "anthropic"
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = \
+                json.dumps(reply).encode()
+            out = kaho.call_rewrite_api("anthropic", "do the thing")
+        self.assertEqual(out, "Polished.")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.headers["X-api-key"], "sk-test")
+
+    def test_a_dead_network_falls_back_to_the_local_model(self):
+        with mock.patch.object(kaho.urllib.request, "urlopen",
+                               side_effect=OSError("no route to host")), \
+             mock.patch.object(kaho, "rewriter", (mock.MagicMock(), mock.MagicMock())), \
+             mock.patch.object(kaho, "mlx_lm") as mlx:
+            mlx.generate.return_value = "Local rewrite."
+            out = kaho.rewrite("um so yeah", "structured")
+        self.assertEqual(out, "Local rewrite.", "a dead network must not lose the words")
+        self.assertTrue(any("using the on-device model" in m for m in self.logged))
+
+    def test_a_missing_key_falls_back_without_a_request(self):
+        with mock.patch.object(kaho, "get_api_key", return_value=""), \
+             mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            out = kaho.call_rewrite_api("openai", "do the thing")
+        self.assertIsNone(out)
+        urlopen.assert_not_called()
+
+    def test_an_unexpected_response_shape_falls_back(self):
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = b'{"oops": 1}'
+            self.assertIsNone(kaho.call_rewrite_api("openai", "x"))
+
+    def test_the_key_is_never_written_to_the_log(self):
+        with mock.patch.object(kaho.urllib.request, "urlopen",
+                               side_effect=OSError("401 Bearer sk-test rejected")):
+            kaho.call_rewrite_api("openai", "x")
+        self.assertFalse(any("sk-test" in m for m in self.logged),
+                         f"the key leaked into the log: {self.logged}")
+
+    def test_local_is_the_default_and_makes_no_request(self):
+        kaho.settings["rewrite_backend"] = "local"
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen, \
+             mock.patch.object(kaho, "rewriter", (mock.MagicMock(), mock.MagicMock())), \
+             mock.patch.object(kaho, "mlx_lm") as mlx:
+            mlx.generate.return_value = "Local."
+            kaho.rewrite("text", "structured")
+        urlopen.assert_not_called()
 
 
 class TestCancel(KahoTestCase):
