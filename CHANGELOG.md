@@ -2,21 +2,25 @@
 ## 2.2.0 — 2026-10-01
 
 - Transcription moves from Whisper large-v3-turbo (mlx-whisper) to
-  Qwen3-ASR 1.7B 8-bit (mlx-audio). Benchmarked on an M4 Max over 109
-  clips, both with the dictionary:
+  Qwen3-ASR 1.7B 8-bit (mlx-audio). Latency from `tools/benchmark.py`
+  on an M4 Max, both models run back to back on the same clips (warm);
+  accuracy from a 109-clip benchmark with the dictionary:
 
   | | Whisper | Qwen3-ASR 1.7B |
   |---|---|---|
-  | median latency, 0-5 s clip | 0.88 s | 0.30 s |
-  | median latency, 5-10 s clip | 0.98 s | 0.41 s |
-  | median latency, 20-30 s clip | 1.88 s | 1.97 s |
+  | 1.4 s clip | 0.51 s | 0.12 s |
+  | 10.3 s clip | 0.60 s | 0.42 s |
+  | 29.6 s clip | 0.78 s | 1.06 s |
   | WER, LibriSpeech clean / other | 1.5% / 1.6% | 1.3% / 0.6% |
   | WER, jargon dictations | 4.4% | 3.4% |
   | dictionary terms spelled right | 87% | 87% |
 
-  Most dictations are short, which is where the gain is; past ~20 s the
-  two are even, because Whisper padded every clip to 30 s while this
-  model's cost grows with length. Parakeet v3 was faster still but takes
+  Whisper pads every clip to a 30 s window, so its cost barely moves with
+  length; this model's grows with it. They cross at roughly 15-20 s.
+  Across 677 logged dictations the median is 6.3 s and 84% are under
+  20 s, so most get faster and the longest ~15% get slower. An earlier
+  run showed a larger gain (0.88 s vs 0.30 s); it was measured while the
+  app was dictating on the same GPU, which slowed Whisper more. Parakeet v3 was faster still but takes
   no vocabulary, so it spelled names wrong (44% of terms). Costs: a
   ~2.3 GB first download instead of ~1.6 GB, ~1.1 GB more memory, and a
   slower first load (about 4 s).

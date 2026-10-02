@@ -54,7 +54,8 @@ detail.
 - Python 3.13, single process, one file (`kaho.py`) + `run.sh`
 - **Model**: `mlx-community/Qwen3-ASR-1.7B-8bit` via `mlx-audio`, since
   2.2.0. It replaced `whisper-large-v3-turbo` (via `mlx-whisper`) after a
-  benchmark on this machine: 0.30 s vs 0.88 s median on 0-5 s clips, 1.3% vs
+  benchmark on this machine: 0.12 s vs 0.51 s on a 1.4 s clip and 0.42 vs
+  0.60 at 10 s, but slower past ~15-20 s (1.06 vs 0.78 at 30 s); 1.3% vs
   1.5% WER on LibriSpeech clean, 3.4% vs 4.4% on jargon, both with the
   dictionary. Parakeet v3 was faster still but takes no vocabulary, so it was
   out. Dictionary terms go in as `hotwords`; the model still misspells some

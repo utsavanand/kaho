@@ -25,8 +25,8 @@ telemetry.
 ![How Kaho works](assets/flow.svg)
 
 - **Works everywhere** — any app that accepts paste
-- **Fast** — under 1.5 s from key-release to text (about 0.3 s for a short
-  dictation on an M4 Max), with Qwen3-ASR 1.7B, which beat Whisper
+- **Fast** — under 1.5 s from key-release to text (about 0.15 s to transcribe a
+  short dictation on an M4 Max), with Qwen3-ASR 1.7B, which beat Whisper
   large-v3-turbo on accuracy in our benchmark
 - **Hands-free** — double-tap the hotkey to lock recording, tap to stop
 - **Recording pill** — floating mic-level indicator with an elapsed timer,

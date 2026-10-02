@@ -42,12 +42,14 @@ HOTKEYS = {  # name -> (keycode, device-specific modifier bit, label)
     "right_shift": (60, 0x0004, "Right Shift (⇧)"),
 }
 
-# Replaced Whisper large-v3-turbo in 2.2.0. Benchmarked on an M4 Max: 0.30 s vs
-# 0.88 s on 0-5 s dictations, and lower WER (1.3% vs 1.5% LibriSpeech clean,
-# 3.4% vs 4.4% on jargon with the dictionary). Parakeet v3 was faster still
-# but takes no vocabulary, so it spelled names wrong and the Dictionary would
-# have been dead weight. Past ~20 s the two are even: Whisper pads every clip
-# to 30 s, this model's cost grows with length.
+# Replaced Whisper large-v3-turbo in 2.2.0. On an M4 Max (tools/benchmark.py):
+# 0.12 s vs 0.51 s on a 1.4 s clip, 0.42 vs 0.60 at 10 s, but 1.06 vs 0.78 at
+# 30 s — Whisper pads every clip to 30 s, this model's cost grows with length,
+# and they cross around 15-20 s. Most dictations are well under that (median
+# 6.3 s over 677 logged). Lower WER too (1.3% vs 1.5% LibriSpeech clean, 3.4%
+# vs 4.4% on jargon with the dictionary). Parakeet v3 was faster still but
+# takes no vocabulary, so it spelled names wrong and the Dictionary would
+# have been dead weight.
 MODEL_REPO = "mlx-community/Qwen3-ASR-1.7B-8bit"
 # Pinned HF revision: the repo name is a mutable reference, the commit is not.
 # Update deliberately (huggingface.co/api/models/<repo> -> "sha") after

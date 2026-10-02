@@ -91,8 +91,10 @@ def timed(fn):
 def measure(repeats):
     import kaho
 
-    kaho.model_path = kaho.huggingface_hub.snapshot_download(
-        kaho.MODEL_REPO, revision=kaho.MODEL_REVISION
+    # Loaded up front, as backend() does, so "cold" is the first inference
+    # (Metal kernel compilation) without the weight load folded in
+    kaho.asr = kaho.load_model(
+        kaho.huggingface_hub.snapshot_download(kaho.MODEL_REPO, revision=kaho.MODEL_REVISION)
     )
     results = {}
     with tempfile.TemporaryDirectory() as tmp:
