@@ -40,6 +40,28 @@ if [[ -z "$IDENTITY" ]]; then
 fi
 echo "signing as: $IDENTITY"
 
+# PyInstaller bundles whatever is importable in the venv, not what the lock
+# says. A package the lock dropped stays installed until something removes
+# it — 2.2.0 replaced Whisper with mlx-audio, and a stale torch left behind
+# from before silently went on shipping, making the app 575 MB larger than
+# the release notes claimed.
+echo "==> checking the build venv matches the lock"
+EXTRA="$("$SRC/.venv/bin/pip" list --format=freeze 2>/dev/null \
+    | cut -d= -f1 | tr 'A-Z_' 'a-z-' | sort -u \
+    | comm -23 - <(grep -oE '^[A-Za-z0-9._-]+' "$SRC/requirements.lock" \
+        | tr 'A-Z_' 'a-z-' | sort -u) \
+    | grep -vxE 'pip|setuptools|wheel|pyinstaller|pyinstaller-hooks-contrib|ruff|altgraph|macholib|packaging|pefile')"
+if [[ -n "$EXTRA" ]]; then
+    echo "The build venv has packages the lock does not list:"
+    echo "$EXTRA" | sed 's/^/  /'
+    echo ""
+    echo "PyInstaller will bundle them. Recreate the venv:"
+    echo "  rm -rf .venv && python3.13 -m venv .venv"
+    echo "  .venv/bin/pip install --require-hashes --no-deps -r requirements.lock"
+    echo "  .venv/bin/pip install pyinstaller ruff"
+    exit 1
+fi
+
 echo "==> building the bundle"
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
