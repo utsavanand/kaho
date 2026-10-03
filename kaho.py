@@ -803,27 +803,31 @@ def stop_recording():
 
 
 def _audio_or_drop_reason(buf):
-    """Returns (audio, log line), exactly one of which is None.
+    """Returns (audio, log line, pill message); exactly one of audio/pill is set.
 
-    Either the recording is usable and the line describes it, or it is dropped
-    and the line says why — every case ends with one log call and one hide, so
-    a future rule cannot forget either.
+    The pill message is what makes a drop visible. Writing only to the log
+    meant a mic turned down read as the app being dead: the owner had the
+    system input volume at 27, so speech peaked around 0.048 against a 0.025
+    floor, and a run of quiet dictations vanished with nothing on screen.
+    A too-short press is excluded on purpose — that is a stray keypress, and
+    flashing a complaint at it would be noise.
     """
     if not buf:
-        return None, "dropped: no audio captured"
+        return None, "dropped: no audio captured", "No audio — check the mic"
     audio = np.concatenate(buf)[:, 0]
     secs = len(audio) / SAMPLE_RATE
     if secs < MIN_SECONDS:
-        return None, f"dropped: {secs:.2f}s is under the {MIN_SECONDS}s minimum"
+        return None, f"dropped: {secs:.2f}s is under the {MIN_SECONDS}s minimum", None
     peak = float(np.abs(audio).max())
     if peak < 1e-6:
         return None, (
             f"dropped: {secs:.1f}s of pure silence — macOS delivered no mic signal "
             "(check System Settings > Privacy & Security > Microphone)"
-        )
+        ), "No mic signal — check permissions"
     if peak < MIN_PEAK:
-        return None, f"dropped: {secs:.1f}s too quiet to be speech (peak {peak:.3f})"
-    return audio, f"recorded {secs:.1f}s on '{input_name}' (peak {peak:.3f}), transcribing..."
+        return None, f"dropped: {secs:.1f}s too quiet to be speech (peak {peak:.3f})", \
+            "Too quiet — turn up input volume"
+    return audio, f"recorded {secs:.1f}s on '{input_name}' (peak {peak:.3f}), transcribing...", None
 
 
 def _finish_recording(s, buf):
@@ -840,10 +844,13 @@ def _finish_recording(s, buf):
         cancel_recording = False
         AppHelper.callAfter(overlay.hide)
         return
-    audio, message = _audio_or_drop_reason(buf)
+    audio, message, pill = _audio_or_drop_reason(buf)
     log(message)
     if audio is None:
-        AppHelper.callAfter(overlay.hide)
+        if pill:
+            AppHelper.callAfter(overlay.showProblem_, pill)
+        else:
+            AppHelper.callAfter(overlay.hide)
         return
     # Close an unterminated span: the user released the hotkey while still
     # holding the instruction key
@@ -1629,7 +1636,7 @@ class LevelView(AppKit.NSView):
                 bar.fill()
             draw_elapsed(self, bounds)
             return
-        draw_phase(phase, ticks, bounds)
+        draw_phase(phase, ticks, bounds, getattr(self, "message", None))
 
 
 # Module-level, not LevelView methods: PyObjC maps every method on an NSObject
@@ -1660,7 +1667,7 @@ def draw_elapsed(view, bounds):
     )
 
 
-def draw_phase(phase, ticks, bounds):
+def draw_phase(phase, ticks, bounds, message=None):
     # Three dots cycling left-to-right: cheap to draw, reads as "working"
     # without a spinner's implication of a known duration
     r, g, b = ((1.0, 0.72, 0.30) if phase in ("blocked", "wedged", "instructing")
@@ -1680,7 +1687,7 @@ def draw_phase(phase, ticks, bounds):
         ),
     }
     text = AppKit.NSAttributedString.alloc().initWithString_attributes_(
-        PHASE_LABELS.get(phase, ""), attrs
+        message or PHASE_LABELS.get(phase, ""), attrs
     )
     size = text.size()
     text.drawAtPoint_((52, (bounds.size.height - size.height) / 2))
@@ -1758,6 +1765,10 @@ class Overlay(AppKit.NSObject):
         tolerate arriving after hide() — a fast dictation can finish before
         the phase change is delivered.
         """
+        if phase != "blocked":
+            # Cleared here rather than in hide(): a message that outlived its
+            # phase would caption the next recording
+            self.view.message = None
         self.view.phase = phase
         self.view.setNeedsDisplay_(True)
         if not self.panel.isVisible():
@@ -1789,6 +1800,22 @@ class Overlay(AppKit.NSObject):
         if self.panel.isVisible():
             log("overlay timed out waiting for the pipeline — hiding it")
             self.hide()
+
+    def showProblem_(self, message):
+        """Say on the pill why a recording produced nothing.
+
+        Lingers like blocked() rather than flashing: a dropped recording used
+        to leave no trace on screen at all, which reads as the app being
+        broken rather than the mic being turned down.
+        """
+        self.view.message = message
+        self.setPhase_("blocked")
+        self.panel.orderFrontRegardless()
+        if self.done_timer:
+            self.done_timer.invalidate()
+        self.done_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            3.5, self, "hideTimer:", None, False
+        )
 
     def blocked(self):
         """Warn that the transcript did not paste. Lingers longer than the

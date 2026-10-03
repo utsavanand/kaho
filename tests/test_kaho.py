@@ -576,40 +576,54 @@ class TestAudioDropRules(KahoTestCase):
         return [wave.reshape(-1, 1)]
 
     def test_no_frames_at_all(self):
-        audio, message = kaho._audio_or_drop_reason([])
+        audio, message, pill = kaho._audio_or_drop_reason([])
         self.assertIsNone(audio)
         self.assertEqual(message, "dropped: no audio captured")
 
     def test_a_hold_too_short_to_be_speech(self):
-        audio, message = kaho._audio_or_drop_reason(self.frames(0.1, 0.5))
+        audio, message, pill = kaho._audio_or_drop_reason(self.frames(0.1, 0.5))
         self.assertIsNone(audio)
         self.assertIn(f"under the {kaho.MIN_SECONDS}s minimum", message)
 
     def test_pure_silence_names_the_permission(self):
-        audio, message = kaho._audio_or_drop_reason(self.frames(1.0, 0.0))
+        audio, message, pill = kaho._audio_or_drop_reason(self.frames(1.0, 0.0))
         self.assertIsNone(audio)
         self.assertIn("macOS delivered no mic signal", message)
         self.assertIn("Microphone", message)
 
     def test_audio_under_the_speech_floor(self):
-        audio, message = kaho._audio_or_drop_reason(self.frames(1.0, kaho.MIN_PEAK / 2))
+        audio, message, pill = kaho._audio_or_drop_reason(self.frames(1.0, kaho.MIN_PEAK / 2))
         self.assertIsNone(audio)
         self.assertIn("too quiet to be speech", message)
 
     def test_a_real_dictation_gets_through(self):
-        audio, message = kaho._audio_or_drop_reason(self.frames(2.0, 0.2))
+        audio, message, pill = kaho._audio_or_drop_reason(self.frames(2.0, 0.2))
         self.assertIsNotNone(audio)
         self.assertEqual(len(audio), 2 * kaho.SAMPLE_RATE)
         self.assertIn("recorded 2.0s", message)
         self.assertIn("transcribing", message)
 
-    def test_finish_recording_hides_the_pill_on_every_drop(self):
-        for buf in ([], self.frames(0.1, 0.5), self.frames(1.0, 0.0),
-                    self.frames(1.0, kaho.MIN_PEAK / 2)):
+    def test_a_drop_the_user_can_fix_is_shown_on_the_pill(self):
+        """Silence and quiet audio are actionable, so they must be visible.
+
+        These used to reach the log only, so a mic turned down looked like
+        the app being dead rather than a setting being wrong.
+        """
+        for buf, expect in ((self.frames(1.0, 0.0), "mic signal"),
+                            (self.frames(1.0, kaho.MIN_PEAK / 2), "Too quiet"),
+                            ([], "No audio")):
             kaho.AppHelper.callAfter.reset_mock()
             kaho._finish_recording(None, buf)
-            kaho.AppHelper.callAfter.assert_called_once_with(kaho.overlay.hide)
+            call = kaho.AppHelper.callAfter.call_args
+            self.assertEqual(call.args[0], kaho.overlay.showProblem_)
+            self.assertIn(expect, call.args[1])
             self.assertTrue(kaho.jobs.empty(), "dropped audio must not reach the worker")
+
+    def test_a_stray_keypress_is_dropped_silently(self):
+        """Too short to be speech is a fumbled key, not a problem to report."""
+        kaho.AppHelper.callAfter.reset_mock()
+        kaho._finish_recording(None, self.frames(0.1, 0.5))
+        kaho.AppHelper.callAfter.assert_called_once_with(kaho.overlay.hide)
 
     def test_finish_recording_queues_usable_audio(self):
         kaho._finish_recording(None, self.frames(2.0, 0.2))

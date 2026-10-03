@@ -52,3 +52,24 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install --dry-run --require-hashes --no-deps -r requirements.lock
+
+      # Importing under real PyObjC is the only way to catch a selector whose
+      # name does not match its arity: PyObjC maps each underscore in a method
+      # name to a colon, so show_problem_ becomes show:problem: and raises
+      # BadPrototypeError at class-creation time. The unit tests mock AppKit,
+      # so they pass while the app cannot start at all — which has now
+      # happened three times in this codebase.
+      - name: import under real PyObjC
+        run: |
+          pip install --quiet pyobjc-framework-Cocoa pyobjc-framework-Quartz
+          python - <<'EOF'
+          import sys, types, unittest.mock as mock
+          for name in ("mlx_audio", "mlx_audio.stt", "mlx_audio.stt.utils",
+                       "huggingface_hub", "sounddevice", "numpy"):
+              sys.modules.setdefault(name, mock.MagicMock())
+          sys.modules["mlx_audio.stt.utils"].load_model = mock.MagicMock()
+          sys.modules["sounddevice"].PortAudioError = type("PortAudioError", (Exception,), {})
+          import ctypes; ctypes.CDLL = mock.MagicMock()
+          import kaho
+          print("selectors valid")
+          EOF
