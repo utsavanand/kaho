@@ -661,9 +661,18 @@ def audio_control():
         audio_op_started = None
 
 
+# A stop that is merely slow is not a wedge. CoreAudio can take seconds to
+# release a device — observed at 4 s after cancelling a hands-free recording
+# — and the old 5 s threshold reported that as permanently stuck, sending the
+# user to Restart Kaho for something that recovered on its own a moment
+# later. A genuine deadlock never returns at all, so a minute is still
+# decisive while leaving slow releases alone.
+WEDGE_SECONDS = 60
+
+
 def audio_wedged():
     started = audio_op_started
-    return started is not None and time.monotonic() - started > 5
+    return started is not None and time.monotonic() - started > WEDGE_SECONDS
 
 
 def relaunch():

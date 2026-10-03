@@ -355,7 +355,7 @@ class TestRecordingHandoff(KahoTestCase):
         self.assertFalse(kaho.locked)
 
     def test_a_wedged_audio_device_skips_the_recording(self):
-        kaho.audio_op_started = self.clock.now - 10
+        kaho.audio_op_started = self.clock.now - (kaho.WEDGE_SECONDS + 5)
         kaho.start_recording()
         self.assertEqual(kaho.state, "ready")
         self.assertTrue(any("not responding" in m for m in self.logged))
@@ -363,12 +363,12 @@ class TestRecordingHandoff(KahoTestCase):
     def test_a_wedged_audio_device_says_so_on_screen(self):
         # It used to only reach the log, so the symptom was dictation
         # silently doing nothing at all
-        kaho.audio_op_started = self.clock.now - 10
+        kaho.audio_op_started = self.clock.now - (kaho.WEDGE_SECONDS + 5)
         kaho.start_recording()
         kaho.overlay.show_wedged.assert_called_once()
 
     def test_an_op_that_is_merely_slow_is_not_treated_as_wedged(self):
-        kaho.audio_op_started = self.clock.now - 1
+        kaho.audio_op_started = self.clock.now - (kaho.WEDGE_SECONDS - 1)
         kaho.start_recording()
         self.assertEqual(kaho.state, "recording")
         kaho.overlay.show_wedged.assert_not_called()
@@ -939,7 +939,7 @@ class TestToggleTrigger(KahoTestCase):
     def test_a_wedged_device_does_not_latch_the_lock(self):
         # start_recording declines; a stale lock would make the next tap try
         # to stop a recording that never began
-        kaho.audio_op_started = self.clock.now - 10
+        kaho.audio_op_started = self.clock.now - (kaho.WEDGE_SECONDS + 5)
         self.down()
         self.assertEqual(kaho.state, "ready")
         self.assertFalse(kaho.locked)
