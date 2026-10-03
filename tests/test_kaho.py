@@ -1126,6 +1126,26 @@ class TestSpokenInstruction(KahoTestCase):
         rw.assert_not_called()
         paste.assert_called_once_with("the whole thing")
 
+    def test_a_too_short_instruction_is_still_kept_out_of_the_message(self):
+        """Marked as instruction means never transcribed as message.
+
+        The branch that gives up on a brief instruction used to leave the
+        full recording in place, so Kaho spoke the instruction back at the
+        user inside their own text.
+        """
+        audio = REAL_NUMPY.arange(kaho.SAMPLE_RATE, dtype="float32")
+        with mock.patch.object(kaho, "transcribe", return_value="msg") as tr, \
+             mock.patch.object(kaho, "paste"), \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            # Final 0.1 s marked as instruction: under MIN_SECONDS
+            kaho.run_job(audio, kaho.job_generation,
+                         [[int(kaho.SAMPLE_RATE * 0.9), kaho.SAMPLE_RATE]], self.clock.now)
+
+        sent = tr.call_args.args[0]
+        self.assertEqual(len(sent), int(kaho.SAMPLE_RATE * 0.9),
+                         "the instruction audio was transcribed into the message")
+
     def test_the_instruction_key_is_never_the_hotkey(self):
         for name in kaho.HOTKEYS:
             kaho.settings["hotkey"] = name

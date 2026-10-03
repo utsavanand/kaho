@@ -1413,10 +1413,15 @@ def run_job(audio, generation, spans, t0):
     instruction = None
     message_audio, instruction_audio = split_audio(audio, spans)
     if instruction_audio is not None:
-        if len(instruction_audio) < SAMPLE_RATE * MIN_SECONDS:
-            log("instruction too short to use — pasting the dictation as-is")
-        elif len(message_audio) < SAMPLE_RATE * MIN_SECONDS:
+        if len(message_audio) < SAMPLE_RATE * MIN_SECONDS:
+            # Nothing to apply it to; the whole recording was instruction
             log("nothing dictated to apply the instruction to — pasting as-is")
+        elif len(instruction_audio) < SAMPLE_RATE * MIN_SECONDS:
+            # Too brief to be an instruction, but the user still marked it as
+            # one, so it must not be transcribed into their message. Keeping
+            # the full audio here spoke the instruction back at them.
+            audio = message_audio
+            log("instruction too short to use — pasting the dictation as-is")
         else:
             # Two transcriptions, one recording: the stream stayed open across
             # every toggle, so no speech is lost at the boundaries.
