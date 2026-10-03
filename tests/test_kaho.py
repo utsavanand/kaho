@@ -579,26 +579,31 @@ class TestAudioDropRules(KahoTestCase):
         audio, message, pill = kaho._audio_or_drop_reason([])
         self.assertIsNone(audio)
         self.assertEqual(message, "dropped: no audio captured")
+        self.assertIn("No audio", pill)
 
     def test_a_hold_too_short_to_be_speech(self):
         audio, message, pill = kaho._audio_or_drop_reason(self.frames(0.1, 0.5))
         self.assertIsNone(audio)
         self.assertIn(f"under the {kaho.MIN_SECONDS}s minimum", message)
+        self.assertIsNone(pill, "a fumbled key is not worth reporting")
 
     def test_pure_silence_names_the_permission(self):
         audio, message, pill = kaho._audio_or_drop_reason(self.frames(1.0, 0.0))
         self.assertIsNone(audio)
         self.assertIn("macOS delivered no mic signal", message)
         self.assertIn("Microphone", message)
+        self.assertIn("mic signal", pill)
 
     def test_audio_under_the_speech_floor(self):
         audio, message, pill = kaho._audio_or_drop_reason(self.frames(1.0, kaho.MIN_PEAK / 2))
         self.assertIsNone(audio)
         self.assertIn("too quiet to be speech", message)
+        self.assertIn("Too quiet", pill)
 
     def test_a_real_dictation_gets_through(self):
         audio, message, pill = kaho._audio_or_drop_reason(self.frames(2.0, 0.2))
         self.assertIsNotNone(audio)
+        self.assertIsNone(pill, "a good recording has nothing to report")
         self.assertEqual(len(audio), 2 * kaho.SAMPLE_RATE)
         self.assertIn("recorded 2.0s", message)
         self.assertIn("transcribing", message)
