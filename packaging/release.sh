@@ -50,7 +50,7 @@ EXTRA="$("$SRC/.venv/bin/pip" list --format=freeze 2>/dev/null \
     | cut -d= -f1 | tr 'A-Z_' 'a-z-' | sort -u \
     | comm -23 - <(grep -oE '^[A-Za-z0-9._-]+' "$SRC/requirements.lock" \
         | tr 'A-Z_' 'a-z-' | sort -u) \
-    | grep -vxE 'pip|setuptools|wheel|pyinstaller|pyinstaller-hooks-contrib|ruff|altgraph|macholib|packaging|pefile')"
+    | grep -vxE 'pip|setuptools|wheel|pyinstaller|pyinstaller-hooks-contrib|ruff|altgraph|macholib|packaging|pefile' || true)"
 if [[ -n "$EXTRA" ]]; then
     echo "The build venv has packages the lock does not list:"
     echo "$EXTRA" | sed 's/^/  /'
