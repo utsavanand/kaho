@@ -1936,16 +1936,6 @@ class TestDownloadProgress(KahoTestCase):
             "Downloading speech model… 40% (1.0 of 2.5 GB)",
         )
 
-    def test_partial_files_count_toward_progress(self):
-        cache = pathlib.Path(self.tmp.name) / "hub"
-        blobs = cache / "models--mlx-community--Qwen3-ASR-1.7B-8bit" / "blobs"
-        blobs.mkdir(parents=True)
-        (blobs / "done").write_bytes(b"x" * 300)
-        (blobs / "abc.incomplete").write_bytes(b"x" * 200)
-        constants = types.SimpleNamespace(HF_HUB_CACHE=str(cache))
-        with mock.patch.object(kaho.huggingface_hub, "constants", constants, create=True):
-            self.assertEqual(kaho.cached_bytes(kaho.MODEL_REPO), 500)
-
     def test_the_menu_says_what_is_happening(self):
         kaho.state = "loading"
         self.assertEqual(kaho.status_line(), "Loading the speech model…")

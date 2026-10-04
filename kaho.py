@@ -1875,43 +1875,47 @@ def format_download(done, total):
             f"({done / 1e9:.1f} of {total / 1e9:.1f} GB)")
 
 
-def cached_bytes(repo):
-    """Bytes of `repo` in the Hugging Face cache so far, partial files included."""
-    blobs = os.path.join(
-        huggingface_hub.constants.HF_HUB_CACHE, "models--" + repo.replace("/", "--"), "blobs"
-    )
-    total = 0
-    try:
-        for entry in os.scandir(blobs):
-            total += entry.stat().st_size
-    except OSError:
-        pass
-    return total
+# snapshot_download's network-bytes bar (hub 1.x). Its bytes-written bar only
+# moves when a whole file finishes, and the cache folder can't be watched
+# either: with hf-xet the large files appear only once complete, so both sat
+# at 0% for most of a two-minute download.
+DOWNLOAD_BAR_NAME = "huggingface_hub.snapshot_download.transfer"
 
 
 def download_model():
     """The model snapshot, publishing download progress for the menu bar.
 
-    Returns (path, downloaded) — downloaded is True when the call took long
-    enough to have been a real download rather than a cache hit.
+    Returns (path, downloaded): downloaded is False on a cache hit.
     """
     global download_progress
-    finished = threading.Event()
-    seen = []
+    from huggingface_hub.utils import tqdm as hf_tqdm
 
-    def watch():
-        global download_progress
-        while not finished.wait(1.0):
-            download_progress = (cached_bytes(MODEL_REPO), MODEL_DOWNLOAD_BYTES)
-            seen.append(True)
+    written = [0]
 
-    threading.Thread(target=watch, daemon=True).start()
+    class ToMenu(hf_tqdm):
+        """huggingface_hub's own bar class, so its thread pool keeps working,
+        also feeding the bytes it reports into the menu bar."""
+
+        def __init__(self, *args, **kwargs):
+            self.to_menu = kwargs.get("name") == DOWNLOAD_BAR_NAME
+            super().__init__(*args, **kwargs)
+
+        def update(self, n=1):
+            # Before super(): a bar with no terminal is disabled, and a
+            # disabled tqdm ignores updates
+            if self.to_menu and n:
+                global download_progress
+                written[0] += int(n)
+                download_progress = (written[0], MODEL_DOWNLOAD_BYTES)
+            return super().update(n)
+
     try:
-        path = huggingface_hub.snapshot_download(MODEL_REPO, revision=MODEL_REVISION)
+        path = huggingface_hub.snapshot_download(
+            MODEL_REPO, revision=MODEL_REVISION, tqdm_class=ToMenu
+        )
     finally:
-        finished.set()
         download_progress = None
-    return path, bool(seen)
+    return path, written[0] > 0
 
 
 def backend():
