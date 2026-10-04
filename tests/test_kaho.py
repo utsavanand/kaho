@@ -628,6 +628,32 @@ class TestAudioDropRules(KahoTestCase):
         with mock.patch.object(kaho, "job_outstanding", False):
             self.assertFalse(kaho.Overlay.is_working(overlay))
 
+    def test_an_old_deferred_stop_cannot_end_a_newer_recording(self):
+        """QA finding: a timer left over from an abandoned tap fired later.
+
+        The guard compared last_tap, which a cancel resets to 0.0 — so the
+        stale timer could match again and stop a recording the user had
+        only just started.
+        """
+        self.down()
+        self.run_audio_ops()
+        self.clock.advance(0.1)
+        self.up()                        # a tap: schedules a deferred stop
+        stale = self.deferred_stop()
+
+        kaho.overlay.is_working.return_value = False
+        kaho.cancel_pending_job()        # abandon it; last_tap resets
+        self.run_audio_ops()
+
+        self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
+        self.down()                      # a brand new recording
+        self.run_audio_ops()
+        self.assertEqual(kaho.state, "recording")
+
+        stale(None)                      # the old timer finally fires
+        self.assertEqual(kaho.state, "recording",
+                         "a stale timer stopped a newer recording")
+
     def test_releasing_the_key_stamps_the_recording(self):
         """Without this stamp the timing silently falls back to the old,
         misleading measurement rather than failing visibly."""

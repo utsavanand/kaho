@@ -939,9 +939,15 @@ def schedule_deferred_stop(tap_time):
     first half of a double-tap must not tear the audio stream down — reopening
     it ~60ms later returns a stream that records silence.
     """
+    # Captured now: the timer must only ever stop the recording it was
+    # scheduled for. Checking last_tap alone was not enough — a cancel resets
+    # it to 0.0, so a timer left over from an abandoned tap could match again
+    # and stop a recording the user had just started.
+    session = recording
+
     def fire(_timer):
-        # A newer tap or a lock superseded this one; leave the stream alone
-        if locked or last_tap != tap_time:
+        # A newer tap, a lock, or a different recording superseded this one
+        if locked or last_tap != tap_time or recording is not session:
             return
         stop_recording()
 
