@@ -963,8 +963,8 @@ def check_install_location():
     where = classify_location(bundle, os.path.expanduser("~"))
     if where == "applications":
         return False
-    log(f"running from {where} ({bundle}) — offering to move to Applications")
     source = (translocated_original(bundle) if where == "translocated" else None) or bundle
+    log(f"running from {where} ({source}) — offering to move to Applications")
     described = LOCATION_DESCRIPTIONS.get(where, os.path.dirname(source))
     choice = run_alert(
         "Move Kaho to Applications?",
