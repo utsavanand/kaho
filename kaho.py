@@ -1571,7 +1571,7 @@ def run_job(audio, generation, spans, released, t0):
         if reason is None:
             paste(text)
             append_history(text)
-            AppHelper.callAfter(overlay.finish)
+            AppHelper.callAfter(overlay.finishStale_)
         else:
             # Leave the transcript on the clipboard (no restore) so one manual
             # Cmd+V recovers the dictation, and say so on the pill — a silent
@@ -1581,7 +1581,7 @@ def run_job(audio, generation, spans, released, t0):
             log(f"paste blocked: {reason} — transcript is on the clipboard")
             AppHelper.callAfter(overlay.blocked)
     else:
-        AppHelper.callAfter(overlay.hide)
+        AppHelper.callAfter(overlay.hideStale_)
     last_inference = time.monotonic()
     log(f"[{job_timing(released, t0)}] {text or '(empty transcription, nothing pasted)'}")
 
@@ -1979,6 +1979,23 @@ class Overlay(AppKit.NSObject):
         self.done_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             3.5, self, "hideTimer:", None, False
         )
+
+    def finishStale_(self, _arg=None):
+        """Finish, unless a newer recording already owns the pill.
+
+        Completion callbacks are posted from the worker, so a slow job can
+        land after the user has started dictating again. Taking the pill
+        down then hides the live recording's level meter and leaves them
+        with no indication that anything is being captured.
+        """
+        if state == "recording":
+            return
+        self.finish()
+
+    def hideStale_(self, _arg=None):
+        if state == "recording":
+            return
+        self.hide()
 
     def is_working(self):
         """True while a dictation is in flight and could still be cancelled.

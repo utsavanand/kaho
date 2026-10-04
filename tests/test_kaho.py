@@ -662,6 +662,26 @@ class TestAudioDropRules(KahoTestCase):
         with mock.patch.object(kaho, "job_outstanding", False):
             self.assertFalse(kaho.Overlay.is_working(overlay))
 
+    def test_an_old_completion_leaves_a_live_recording_alone(self):
+        """QA finding: a slow job finishing could hide a newer pill.
+
+        Completions are posted from the worker, so one can land after the
+        user has started dictating again — taking down the level meter and
+        leaving them with no sign anything is being captured.
+        """
+        overlay = mock.MagicMock()
+        with mock.patch.object(kaho, "state", "recording"):
+            kaho.Overlay.finishStale_(overlay)
+            kaho.Overlay.hideStale_(overlay)
+        overlay.finish.assert_not_called()
+        overlay.hide.assert_not_called()
+
+        with mock.patch.object(kaho, "state", "ready"):
+            kaho.Overlay.finishStale_(overlay)
+            kaho.Overlay.hideStale_(overlay)
+        overlay.finish.assert_called_once()
+        overlay.hide.assert_called_once()
+
     def test_an_old_deferred_stop_cannot_end_a_newer_recording(self):
         """QA finding: a timer left over from an abandoned tap fired later.
 
