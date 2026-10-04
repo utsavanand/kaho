@@ -130,6 +130,37 @@ hdiutil detach "/Volumes/Kaho Installer" -force >/dev/null 2>&1 || true
 hdiutil create -volname "Kaho Installer" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
+# Poll with short-lived `info` calls rather than one long `notarytool wait`.
+# The keychain credential vanished three times in one day, each time while a
+# long-running wait was alive, and the keychain's own mtime matched. The
+# cause is not proven, but a wait that outlives the shell holds a session
+# open for an hour or more and is the only thing correlated with it — and
+# polling costs nothing. It also means a lost credential is reported as
+# such rather than silently reading as "still in progress" forever.
+await_notarization() {
+    local id="$1" waited=0 status=""
+    while (( waited < 3600 )); do
+        status="$(xcrun notarytool info "$id" --keychain-profile "$NOTARY_PROFILE" 2>&1 \
+            | /usr/bin/awk '/^  status:/ {print $2; exit}')"
+        case "$status" in
+            Accepted) return 0 ;;
+            Invalid|Rejected)
+                echo "notarization $status — details:"
+                xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE"
+                return 1 ;;
+            "")
+                echo "could not read submission $id — is the keychain profile still there?"
+                echo "  xcrun notarytool store-credentials $NOTARY_PROFILE ..."
+                return 1 ;;
+        esac
+        sleep 30
+        (( waited += 30 ))
+    done
+    echo "still In Progress after an hour: $id"
+    echo "resume with:  xcrun notarytool info $id --keychain-profile $NOTARY_PROFILE"
+    return 1
+}
+
 echo "==> notarizing (usually minutes; large uploads can take an hour)"
 # Submit and wait separately. `submit --wait` died mid-wait when the script
 # ran detached, leaving an unstapled DMG that looked like a success. Capturing
@@ -149,12 +180,12 @@ if [[ -z "$SUBMIT_ID" ]]; then
     echo "If the upload did complete, find the id with:"
     echo "  xcrun notarytool history --keychain-profile $NOTARY_PROFILE"
     echo "then resume without re-uploading:"
-    echo "  xcrun notarytool wait <id> --keychain-profile $NOTARY_PROFILE"
+    echo "  xcrun notarytool info <id> --keychain-profile $NOTARY_PROFILE"
     echo "  xcrun stapler staple \"$DMG\""
     exit 1
 fi
 echo "submission id: $SUBMIT_ID"
-xcrun notarytool wait "$SUBMIT_ID" --keychain-profile "$NOTARY_PROFILE"
+await_notarization "$SUBMIT_ID" || exit 1
 
 STATUS="$(xcrun notarytool info "$SUBMIT_ID" --keychain-profile "$NOTARY_PROFILE" \
     | awk '/^  status:/ {print $2; exit}')"
@@ -187,7 +218,7 @@ xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" \
     2>&1 | tee "$BUILD/notarytool-dmg.txt"
 DMG_ID="$(awk '/^  id:/ {print $2; exit}' "$BUILD/notarytool-dmg.txt")"
 [[ -n "$DMG_ID" ]] || { echo "no submission id for the rebuilt dmg"; exit 1; }
-xcrun notarytool wait "$DMG_ID" --keychain-profile "$NOTARY_PROFILE"
+await_notarization "$DMG_ID" || exit 1
 xcrun stapler staple "$DMG"
 xcrun stapler validate "$DMG"
 
