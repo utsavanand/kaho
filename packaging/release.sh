@@ -9,7 +9,7 @@
 #   1. developer.apple.com -> Certificates -> "+" -> Developer ID Application
 #      Install the downloaded .cer by double-clicking it.
 #   2. appleid.apple.com -> Sign-In and Security -> App-Specific Passwords
-#   3. xcrun notarytool store-credentials kaho-notary \
+#   3. xcrun notarytool store-credentials kaho-fresh \
 #        --apple-id "you@example.com" --team-id "TEAMID" --password "app-specific-password"
 #
 # Then:  ./packaging/release.sh 2.0.0

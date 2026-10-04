@@ -38,7 +38,7 @@ if security find-identity -v -p codesigning | grep -q "Developer ID Application"
     echo ""
     echo "Signing is ready. Next, store notarization credentials once:"
     echo ""
-    echo "  xcrun notarytool store-credentials kaho-notary \\"
+    echo "  xcrun notarytool store-credentials kaho-fresh \\"
     # The Apple Developer account, which is not the address used for bug
     # reports — storing the profile under the wrong one validates at the time
     # and then fails every lookup later with "no Keychain password item found"
