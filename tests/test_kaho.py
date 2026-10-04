@@ -347,6 +347,19 @@ class TestRecordingHandoff(KahoTestCase):
         opened[0].close.assert_called_once()
         self.assertIsNone(kaho.stream)
 
+    def test_a_stream_that_fails_to_start_is_closed(self):
+        """QA finding: an unclosed stream keeps the device claimed, so one
+        bad open makes every later open fail too."""
+        opened = mock.MagicMock()
+        opened.start.side_effect = kaho.sd.PortAudioError("device busy")
+        kaho.sd.InputStream.side_effect = lambda **_: opened
+
+        kaho.start_recording()
+        self.run_audio_ops()
+
+        opened.close.assert_called_once()
+        self.assertEqual(kaho.state, "ready")
+
     def test_a_failed_open_returns_to_ready(self):
         kaho.sd.InputStream.side_effect = kaho.sd.PortAudioError("no device")
         kaho.start_recording()

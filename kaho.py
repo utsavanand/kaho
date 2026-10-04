@@ -798,6 +798,7 @@ def start_recording():
 
 def _open_stream(buf):
     global stream, state, locked
+    s = None
     try:
         s = sd.InputStream(
             device=input_device,
@@ -808,6 +809,14 @@ def _open_stream(buf):
         )
         s.start()
     except sd.PortAudioError as e:
+        # start() can fail after the stream was constructed, and an
+        # unclosed stream keeps the device claimed — which makes the next
+        # open fail too, turning one bad open into a permanent one.
+        if s is not None:
+            try:
+                s.close()
+            except sd.PortAudioError:
+                pass
         log(f"mic open failed: {e}\n(System Settings > Privacy & Security > Microphone)")
         with recording_lock:
             current = buf is record_buf and state == "recording"
