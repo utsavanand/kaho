@@ -19,7 +19,25 @@ a stock Mac with no Gatekeeper warning and no terminal.
 
 ```sh
 ./packaging/release.sh 1.7.3
+./packaging/release.sh 1.7.3 --build-only   # unsigned bundle + checks, no notarization
 ```
+
+### Requires python.org Python 3.13, not Homebrew's
+
+The interpreter is bundled, so it decides the oldest macOS the app runs on.
+Homebrew builds Python for the Mac it was installed on; 2.2.0 was built on
+macOS 15 with Homebrew's Python and an mlx wheel for 15, and on a macOS 14
+MacBook Air it died at launch before showing anything — while `Info.plist`
+still promised 14. Install the universal2 package from
+<https://www.python.org/downloads/macos/> (it targets macOS 11); `release.sh`
+uses `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13` and
+refuses to fall back.
+
+Each release builds a fresh `build-venv/` from that interpreter, installing
+wheels downloaded for the `LSMinimumSystemVersion` in `Kaho.spec` (hashes in
+`requirements.lock` cover those wheels). Before signing, every binary's
+minimum macOS is checked against that same value, and the build stops if any
+is newer.
 
 ### One-time setup
 
