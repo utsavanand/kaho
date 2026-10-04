@@ -486,6 +486,16 @@ def hotkey_label():
     return HOTKEYS[settings["hotkey"]][2]
 
 
+def _settings_key(saved, key):
+    """A saved value only if it could be one of ours.
+
+    Lists and dicts are unhashable, so testing them with `in` raises rather
+    than simply not matching.
+    """
+    value = saved.get(key)
+    return value if isinstance(value, str) else None
+
+
 def load_settings():
     """Unknown values fall back to defaults — a settings file written by a
     newer version must not brick this one."""
@@ -494,18 +504,26 @@ def load_settings():
             saved = json.load(f)
     except (OSError, ValueError):
         return
-    if saved.get("hotkey") in HOTKEYS:
+    # Valid JSON that is not an object — a list, a bare null — gives
+    # AttributeError on .get, and an unhashable value breaks the `in` tests
+    # below. Both crashed startup, which is the one thing this function
+    # exists to prevent.
+    if not isinstance(saved, dict):
+        log("settings file is not an object — using defaults")
+        return
+    if _settings_key(saved, "hotkey") in HOTKEYS:
         settings["hotkey"] = saved["hotkey"]
     # "bullets" became "structured" in 1.6.0 — without this the saved value no
     # longer matches and the mode silently reverts to Off
-    mode = {"bullets": "structured"}.get(saved.get("rewrite"), saved.get("rewrite"))
+    raw_mode = _settings_key(saved, "rewrite")
+    mode = {"bullets": "structured"}.get(raw_mode, raw_mode)
     if mode in REWRITE_MODES:
         settings["rewrite"] = mode
-    if saved.get("language") in LANGUAGES:
+    if _settings_key(saved, "language") in LANGUAGES:
         settings["language"] = saved["language"]
-    if saved.get("trigger") in TRIGGERS:
+    if _settings_key(saved, "trigger") in TRIGGERS:
         settings["trigger"] = saved["trigger"]
-    if saved.get("rewrite_backend") in REWRITE_BACKENDS:
+    if _settings_key(saved, "rewrite_backend") in REWRITE_BACKENDS:
         settings["rewrite_backend"] = saved["rewrite_backend"]
     for key in ("api_url", "api_model"):
         if isinstance(saved.get(key), str):

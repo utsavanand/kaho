@@ -398,6 +398,27 @@ class TestSettings(KahoTestCase):
              "api_url": "", "api_model": ""},
         )
 
+    def test_json_that_is_not_an_object_keeps_the_defaults(self):
+        """QA finding: valid JSON of the wrong shape crashed startup.
+
+        This function's whole job is that a bad settings file cannot brick
+        the app, and a list or a bare null got past the JSON guard.
+        """
+        for payload in ([], None, "a string", 42):
+            pathlib.Path(kaho.SETTINGS_PATH).write_text(json.dumps(payload))
+            kaho.load_settings()
+            self.assertEqual(kaho.settings["hotkey"], "right_option")
+
+    def test_values_of_the_wrong_type_are_ignored(self):
+        # Unhashable values raise on `in`, rather than simply not matching
+        pathlib.Path(kaho.SETTINGS_PATH).write_text(
+            json.dumps({"hotkey": [], "rewrite": {"a": 1}, "language": 7})
+        )
+        kaho.load_settings()
+        self.assertEqual(kaho.settings["hotkey"], "right_option")
+        self.assertEqual(kaho.settings["rewrite"], "off")
+        self.assertEqual(kaho.settings["language"], "auto")
+
     def test_malformed_json_keeps_the_defaults(self):
         pathlib.Path(kaho.SETTINGS_PATH).write_text("{not json")
         kaho.load_settings()
