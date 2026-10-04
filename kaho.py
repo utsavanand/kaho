@@ -409,12 +409,17 @@ class Recording:
     moment the user is mid-sentence.
     """
 
-    __slots__ = ("buf", "cancelled", "spans")
+    __slots__ = ("buf", "cancelled", "released_at", "spans")
 
     def __init__(self):
         self.buf = []
         self.spans = []
         self.cancelled = False
+        # When the user let go of the key. The number that matters to them
+        # starts here, not when the worker picks the job up: the old timer
+        # began after jobs.get(), so microphone shutdown and queue waiting
+        # were invisible and a four-second stall still logged 0.00s.
+        self.released_at = None
 
     def mark_instruction(self, held):
         """Open or close an instruction range at the current frame."""
@@ -849,6 +854,8 @@ def stop_recording():
         # `stream` is still None when the open is in flight; _open_stream then
         # sees the recording is gone and closes its own stream
         s, buf, session = stream, record_buf, recording
+        if session is not None:
+            session.released_at = time.monotonic()
         stream = None
         record_buf = None
     # The pill stays up: the worker switches it to "Transcribing…" and hides
@@ -913,9 +920,10 @@ def _finish_recording(s, buf, session=None):
                 AppHelper.callAfter(overlay.hide)
         else:
             spans = session.frozen_spans() if session is not None else []
+            released = session.released_at if session is not None else None
             global job_outstanding
             job_outstanding = True
-            jobs.put((audio, job_generation, spans))
+            jobs.put((audio, job_generation, spans, released))
 
     if s is not None:
         t0 = time.monotonic()
@@ -1472,7 +1480,7 @@ def split_audio(audio, spans):
     )
 
 
-def run_job(audio, generation, spans, t0):
+def run_job(audio, generation, spans, released, t0):
     """Transcribe, optionally rewrite, and paste one recording.
 
     Split out of worker() so the cancel path can be tested against the real
@@ -1542,7 +1550,28 @@ def run_job(audio, generation, spans, t0):
     else:
         AppHelper.callAfter(overlay.hide)
     last_inference = time.monotonic()
-    log(f"[{time.monotonic() - t0:.2f}s] {text or '(empty transcription, nothing pasted)'}")
+    log(f"[{job_timing(released, t0)}] {text or '(empty transcription, nothing pasted)'}")
+
+
+def job_timing(released, t0):
+    """How long the user actually waited, and where it went.
+
+    The headline number is release-to-paste, because that is the wait they
+    experience. The old one started when the worker picked the job up, so
+    microphone shutdown and queue time were invisible: the audit advanced a
+    test clock four seconds inside stop() and the job still logged 0.00s.
+
+    The queue share is only broken out when it is large enough to matter;
+    on an idle app it is a millisecond and printing it every time is noise.
+    """
+    now = time.monotonic()
+    if released is None:
+        return f"{now - t0:.2f}s"
+    waited = now - released
+    queued = t0 - released
+    if queued >= 0.25:
+        return f"{waited:.2f}s, {queued:.2f}s of it waiting"
+    return f"{waited:.2f}s"
 
 
 def worker():

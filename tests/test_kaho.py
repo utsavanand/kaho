@@ -628,6 +628,43 @@ class TestAudioDropRules(KahoTestCase):
         with mock.patch.object(kaho, "job_outstanding", False):
             self.assertFalse(kaho.Overlay.is_working(overlay))
 
+    def test_releasing_the_key_stamps_the_recording(self):
+        """Without this stamp the timing silently falls back to the old,
+        misleading measurement rather than failing visibly."""
+        self.down()
+        self.run_audio_ops()
+        session = kaho.recording
+        self.clock.advance(2.0)
+        self.up()
+        self.assertEqual(session.released_at, self.clock.now,
+                         "the release moment was never recorded")
+
+    def test_the_reported_time_includes_the_wait_before_the_worker(self):
+        """QA finding 2: a four-second stall used to log as 0.00s.
+
+        The timer began after jobs.get(), so microphone shutdown and queue
+        waiting — the parts the user actually feels — were not measured.
+        """
+        released = self.clock.now
+        self.clock.advance(4.0)          # a slow device release
+        picked_up = self.clock.now
+        self.clock.advance(0.5)          # then the real work
+
+        self.assertEqual(kaho.job_timing(released, picked_up),
+                         "4.50s, 4.00s of it waiting")
+
+    def test_a_timing_with_no_release_stamp_still_reports(self):
+        # Warmup jobs and direct calls carry no session
+        self.clock.advance(1.0)
+        self.assertEqual(kaho.job_timing(None, self.clock.now - 0.75), "0.75s")
+
+    def test_a_negligible_queue_wait_is_not_mentioned(self):
+        released = self.clock.now
+        self.clock.advance(0.01)
+        picked_up = self.clock.now
+        self.clock.advance(0.3)
+        self.assertEqual(kaho.job_timing(released, picked_up), "0.31s")
+
     def test_a_hung_device_stop_still_delivers_the_transcript(self):
         """The worst failure in this app is losing words already spoken.
 
@@ -1108,7 +1145,7 @@ class TestSpokenInstruction(KahoTestCase):
         self.up()
         self.run_audio_ops()
 
-        _, _, spans = kaho.jobs.get()
+        _, _, spans, _ = kaho.jobs.get()
         self.assertEqual(spans, [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE]])
 
     def test_the_halves_are_gathered_from_every_piece(self):
@@ -1133,7 +1170,7 @@ class TestSpokenInstruction(KahoTestCase):
              mock.patch.object(kaho, "paste_blocked_reason", return_value=None), \
              mock.patch.object(kaho, "rewriter", (mock.MagicMock(), mock.MagicMock())):
             audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 2, dtype="float32")
-            kaho.run_job(audio, kaho.job_generation, [[kaho.SAMPLE_RATE, len(audio)]], self.clock.now)
+            kaho.run_job(audio, kaho.job_generation, [[kaho.SAMPLE_RATE, len(audio)]], None, self.clock.now)
 
         rw.assert_called_once_with("cant make the offsite", "make it formal")
         paste.assert_called_once_with("I am unable to attend.")
@@ -1150,7 +1187,7 @@ class TestSpokenInstruction(KahoTestCase):
              mock.patch.object(kaho, "paste_blocked_reason", return_value=None), \
              mock.patch.object(kaho, "rewriter", (mock.MagicMock(), mock.MagicMock())):
             audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 2, dtype="float32")
-            kaho.run_job(audio, kaho.job_generation, [[kaho.SAMPLE_RATE, len(audio)]], self.clock.now)
+            kaho.run_job(audio, kaho.job_generation, [[kaho.SAMPLE_RATE, len(audio)]], None, self.clock.now)
 
         plain.assert_not_called()
 
@@ -1163,7 +1200,7 @@ class TestSpokenInstruction(KahoTestCase):
             audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE, dtype="float32")
             # Split 0.1 s from the end: below MIN_SECONDS
             kaho.run_job(audio, kaho.job_generation,
-                         [[int(kaho.SAMPLE_RATE * 0.9), len(audio)]], self.clock.now)
+                         [[int(kaho.SAMPLE_RATE * 0.9), len(audio)]], None, self.clock.now)
 
         rw.assert_not_called()
         paste.assert_called_once_with("the whole thing")
@@ -1191,7 +1228,8 @@ class TestSpokenInstruction(KahoTestCase):
              mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
             # Final 0.1 s marked as instruction: under MIN_SECONDS
             kaho.run_job(audio, kaho.job_generation,
-                         [[int(kaho.SAMPLE_RATE * 0.9), kaho.SAMPLE_RATE]], self.clock.now)
+                         [[int(kaho.SAMPLE_RATE * 0.9), kaho.SAMPLE_RATE]], None,
+                         self.clock.now)
 
         sent = tr.call_args.args[0]
         self.assertEqual(len(sent), int(kaho.SAMPLE_RATE * 0.9),
@@ -1362,7 +1400,7 @@ class TestCancel(KahoTestCase):
         MLX inference cannot be interrupted, so this is what cancelling
         actually buys: the text is computed and then thrown away.
         """
-        kaho.jobs.put((mock.MagicMock(), 0, []))
+        kaho.jobs.put((mock.MagicMock(), 0, [], None))
         kaho.job_generation = 1
         self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
         kaho.asr.generate.return_value.text = "unwanted text"
@@ -1376,7 +1414,7 @@ class TestCancel(KahoTestCase):
         self.assertTrue(any("cancelled" in m for m in self.logged))
 
     def test_an_uncancelled_job_still_pastes(self):
-        kaho.jobs.put((mock.MagicMock(), 0, []))
+        kaho.jobs.put((mock.MagicMock(), 0, [], None))
         self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
         kaho.asr.generate.return_value.text = "wanted text"
 
@@ -1443,8 +1481,8 @@ class TestCancel(KahoTestCase):
 
     def run_one_job(self):
         """The real worker body, minus its `while True`."""
-        audio, generation, spans = kaho.jobs.get()
-        kaho.run_job(audio, generation, spans, self.clock.now)
+        audio, generation, spans, released = kaho.jobs.get()
+        kaho.run_job(audio, generation, spans, released, self.clock.now)
 
 
 class TestRelaunch(KahoTestCase):
