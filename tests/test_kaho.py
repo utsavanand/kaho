@@ -398,6 +398,18 @@ class TestSettings(KahoTestCase):
              "api_url": "", "api_model": ""},
         )
 
+    def test_a_non_finite_timestamp_is_skipped_not_fatal(self):
+        """QA finding: json accepts NaN, float() accepts it, and the value
+        then crashed time.localtime() at startup rather than being skipped
+        the way this function's docstring promises."""
+        pathlib.Path(kaho.HISTORY_PATH).write_text(
+            '{"t": NaN, "text": "bad"}\n'
+            '{"t": Infinity, "text": "also bad"}\n'
+            '{"t": 1700000000.0, "text": "good"}\n'
+        )
+        self.assertEqual([t for _, t in kaho.read_history_file()], ["good"])
+        kaho.load_history()  # must not raise
+
     def test_json_that_is_not_an_object_keeps_the_defaults(self):
         """QA finding: valid JSON of the wrong shape crashed startup.
 
@@ -661,6 +673,21 @@ class TestAudioDropRules(KahoTestCase):
                             "a hidden pill made a running job uncancellable")
         with mock.patch.object(kaho, "job_outstanding", False):
             self.assertFalse(kaho.Overlay.is_working(overlay))
+
+    def test_changing_the_hotkey_mid_hold_ends_the_recording(self):
+        """QA finding: the recording was stranded.
+
+        After the switch, releasing the old key no longer matches the
+        configured one, so nothing stopped it — the microphone stayed open
+        until the user worked out what had happened.
+        """
+        self.down()
+        self.run_audio_ops()
+        self.assertEqual(kaho.state, "recording")
+        with mock.patch.object(kaho, "refresh_settings_ui"):
+            kaho.apply_hotkey("right_command")
+        self.assertEqual(kaho.state, "ready", "the recording was stranded")
+        self.assertFalse(kaho.locked)
 
     def test_an_old_completion_leaves_a_live_recording_alone(self):
         """QA finding: a slow job finishing could hide a newer pill.

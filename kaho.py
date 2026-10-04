@@ -5,6 +5,7 @@ import collections
 import ctypes
 import difflib
 import json
+import math
 import multiprocessing
 import os
 import platform
@@ -687,7 +688,13 @@ def read_history_file():
     for line in lines:
         try:
             e = json.loads(line)
-            entries.append((float(e["t"]), str(e["text"])))
+            epoch = float(e["t"])
+            # json accepts NaN and Infinity, and float() takes them happily,
+            # so a damaged timestamp passed this check and then crashed
+            # time.localtime() at startup instead of being skipped here.
+            if not math.isfinite(epoch):
+                raise ValueError("non-finite timestamp")
+            entries.append((epoch, str(e["text"])))
         except (ValueError, KeyError, TypeError):
             log("skipping a malformed history line")
     return entries
@@ -2444,6 +2451,13 @@ def refresh_settings_ui():
 
 
 def apply_hotkey(name):
+    global locked
+    # End anything in flight first, exactly as apply_trigger does: after the
+    # switch, releasing the old key no longer matches, so the recording
+    # would run until the user noticed and pressed the new key twice.
+    if state == "recording":
+        locked = False
+        stop_recording()
     settings["hotkey"] = name
     save_settings()
     log(f"hotkey: {hotkey_label()}")
