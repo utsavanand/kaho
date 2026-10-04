@@ -457,6 +457,8 @@ rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
 last_inference = 0.0  # monotonic time of the last real or warmup inference
 WARMUP = object()  # sentinel job: page the models back in before the audio lands
+# One warmup in flight at a time; see start_recording
+warmup_queued = False
 rewriter_lock = threading.Lock()  # see ensure_rewriter
 asr = None  # the speech model, loaded by backend
 _english_words = None  # see english_words
@@ -817,7 +819,13 @@ def start_recording():
     # model weights overlaps the recording instead of delaying the paste.
     # Same queue as real jobs, so it can never race the model.
     if state == "recording" and time.monotonic() - last_inference > WARM_IDLE_SECONDS:
-        jobs.put(WARMUP)
+        # One at a time: last_inference only moves when the worker actually
+        # runs it, so several quick recordings each queued another warmup
+        # and the real transcriptions waited behind the pile.
+        global warmup_queued
+        if not warmup_queued:
+            warmup_queued = True
+            jobs.put(WARMUP)
     audio_ops.put(lambda: _open_stream(buf))
 
 
@@ -833,16 +841,21 @@ def _open_stream(buf):
             callback=lambda data, *_: buf.append(data.copy()),
         )
         s.start()
-    except sd.PortAudioError as e:
-        # start() can fail after the stream was constructed, and an
+    except Exception as e:  # noqa: BLE001
+        # Not just PortAudioError: anything else escaped to audio_control,
+        # which logged it and moved on — leaving state at "recording" with
+        # the pill up and the hotkey doing nothing, because start_recording
+        # refuses to start when a recording is supposedly already running.
+        #
+        # start() can also fail after the stream was constructed, and an
         # unclosed stream keeps the device claimed — which makes the next
         # open fail too, turning one bad open into a permanent one.
         if s is not None:
             try:
                 s.close()
-            except sd.PortAudioError:
-                pass
-        log(f"mic open failed: {e}\n(System Settings > Privacy & Security > Microphone)")
+            except Exception as close_error:  # noqa: BLE001
+                log(f"could not close the failed stream: {close_error!r}")
+        log(f"mic open failed: {e!r}\n(System Settings > Privacy & Security > Microphone)")
         with recording_lock:
             current = buf is record_buf and state == "recording"
             if current:
@@ -1615,11 +1628,12 @@ def job_timing(released, t0):
 
 
 def worker():
-    global last_inference, job_outstanding
+    global last_inference, job_outstanding, warmup_queued
     while True:
         job = jobs.get()
         t0 = time.monotonic()
         if job is WARMUP:
+            warmup_queued = False
             try:
                 transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), use_dictionary=False)
                 if rewriter is not None and settings["rewrite"] != "off":

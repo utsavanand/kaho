@@ -347,6 +347,20 @@ class TestRecordingHandoff(KahoTestCase):
         opened[0].close.assert_called_once()
         self.assertIsNone(kaho.stream)
 
+    def test_an_unexpected_open_error_still_returns_to_ready(self):
+        """QA finding: only PortAudioError was handled.
+
+        Anything else escaped to audio_control, which logged it and moved
+        on — leaving state at "recording" with the pill up and the hotkey
+        dead, because start_recording will not start when one is supposedly
+        already running.
+        """
+        kaho.sd.InputStream.side_effect = RuntimeError("something unforeseen")
+        kaho.start_recording()
+        self.run_audio_ops()
+        self.assertEqual(kaho.state, "ready", "the app was left unable to record")
+        self.assertFalse(kaho.locked)
+
     def test_a_stream_that_fails_to_start_is_closed(self):
         """QA finding: an unclosed stream keeps the device claimed, so one
         bad open makes every later open fail too."""
@@ -673,6 +687,25 @@ class TestAudioDropRules(KahoTestCase):
                             "a hidden pill made a running job uncancellable")
         with mock.patch.object(kaho, "job_outstanding", False):
             self.assertFalse(kaho.Overlay.is_working(overlay))
+
+    def test_warmups_do_not_pile_up(self):
+        """QA finding: last_inference only moves when the worker runs the
+        warmup, so several quick recordings each queued another one and the
+        real transcriptions waited behind the pile."""
+        self.enterContext(mock.patch.object(kaho, "warmup_queued", False))
+        self.enterContext(
+            mock.patch.object(kaho, "last_inference",
+                              self.clock.now - kaho.WARM_IDLE_SECONDS - 10))
+        for _ in range(3):
+            kaho.start_recording()
+            self.run_audio_ops()
+            kaho.stop_recording()
+            self.run_audio_ops()
+            self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
+
+        warmups = sum(1 for _ in range(kaho.jobs.qsize())
+                      if kaho.jobs.get() is kaho.WARMUP)
+        self.assertEqual(warmups, 1, "warmups queued up behind each other")
 
     def test_changing_the_hotkey_mid_hold_ends_the_recording(self):
         """QA finding: the recording was stranded.
