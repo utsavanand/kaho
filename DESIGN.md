@@ -89,15 +89,17 @@ detail.
 ```
 right-Option down ──▶ ignore unless state is "ready"
                       else claim the recording, queue "open stream" on the
-                      audio thread, show the overlay pill
+                      audio thread, show the overlay pill, and start a
+                      background read of the focused window's names (≤150 ms)
 right-Option up   ──▶ held past TAP_MAX_SECONDS (0.45 s)? queue "stop stream"
                       a tap? defer that stop by one double-tap window
                       second tap inside DOUBLE_TAP_SECONDS (0.9 s)? lock
                       hands-free — the next tap past the grace period stops it
 stop              ──▶ under 0.3 s, or peak below the speech floor? drop it
                       else put the audio ndarray on a Queue and return
-worker thread     ──▶ loops on Queue.get(): transcribe ▸ optional rewrite ▸
-                      pbcopy ▸ Cmd+V ▸ history
+worker thread     ──▶ loops on Queue.get(): transcribe (dictionary + any
+                      screen words that arrived as hotwords) ▸ optional
+                      rewrite ▸ pbcopy ▸ Cmd+V ▸ history
                       logs one line per event (text, timing, or why dropped)
 ```
 

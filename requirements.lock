@@ -56,8 +56,12 @@ Pygments==2.21.0 \
     --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
 pyobjc-core==12.2.2 \
     --hash=sha256:950bd2d9c74634398c4e3d24ef2f213d4e23d705083697464fa67afedc53c1ad
+pyobjc-framework-ApplicationServices==12.2.2 \
+    --hash=sha256:3b5693a377480cf127caa1c8c835b8620896971029c545d99d01aa31a2c38159
 pyobjc-framework-Cocoa==12.2.2 \
     --hash=sha256:600b1723184ca094931330e79355274949965460e23de38628d601b5a967baf9
+pyobjc-framework-CoreText==12.2.2 \
+    --hash=sha256:dbd0f288a859e359ee8e7ccf45bc2c489f38ae1087c21468b61d700433e0c91b
 pyobjc-framework-Quartz==12.2.2 \
     --hash=sha256:0ec9751904ef975bf0789d760dc4fadcb400edc4ffe4a736eb54971968babe5c
 PyYAML==6.0.3 \
