@@ -1,10 +1,9 @@
 # Changelog
-## 2.3.0 — 2026-10-04
+## 2.4.0 — 2026-10-04
 
 A reliability release. An independent audit of the whole application
-found eighteen reproducible defects; this fixes its five highest
-priorities, all of which could cost the user a dictation they had
-already finished speaking.
+found eighteen reproducible defects; this fixes all of them. The worst
+could cost a dictation the user had already finished speaking.
 
 - A stuck microphone no longer loses your words. macOS's audio stack
   can block forever while releasing a device, and Kaho waited for that
@@ -38,6 +37,25 @@ already finished speaking.
   Restart Kaho for something that recovered on its own.
 - An instruction too short to use is no longer transcribed into your
   message.
+- A dictation already finished can no longer be stopped by a leftover
+  timer from an abandoned one, and starting a new one can no longer
+  hide the pill of a recording still in progress.
+- A microphone that fails to open is no longer left claimed. The stream
+  was not closed when it failed to start, so one bad open made every
+  later open fail too — and any error other than a PortAudio one left
+  the app unable to record at all until it was restarted.
+- Changing the hotkey while holding it no longer strands the recording.
+  Releasing the old key stopped matching, so the microphone stayed open
+  with nothing to end it.
+- A damaged settings file or history entry no longer stops the app
+  starting. Both checks accepted valid JSON of the wrong shape and then
+  crashed on it later.
+- Warmups no longer pile up behind each other when several dictations
+  follow in quick succession.
+
+2.3.0 was built but never published: Apple's notary service stalled on
+it for hours, and by the time that was clear the build was eight fixes
+behind. Its contents are included here.
 
 ## 2.2.0 — 2026-10-02
 
