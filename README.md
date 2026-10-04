@@ -127,16 +127,23 @@ open /Applications/Kaho.app
 ```
 
 `install.sh` builds `Kaho.app` locally (hash-verified Python environment +
-ad-hoc-signed bundle), so there are no Gatekeeper warnings. Grant both
-permissions in System Settings → Privacy & Security, then relaunch:
+ad-hoc-signed bundle), so there are no Gatekeeper warnings. On first launch
+Kaho asks for two permissions:
 
 | Permission | Why |
 |---|---|
 | Microphone | recording while the hotkey is held |
 | Accessibility | observing the global hotkey, sending the paste |
 
-First launch downloads the speech model (~2.3 GB; watch progress via
-🎙 → Open Log). To run at login: System Settings → General → Login Items.
+Until Accessibility is granted the menu bar shows ⚠️ and the first menu
+item opens the right Settings pane. Kaho notices the grant and restarts
+itself, so there's no need to quit and reopen it. The downloaded app also
+offers to move itself into Applications if it's opened from the disk image
+or Downloads, since permissions granted there don't follow the app.
+
+First launch downloads the speech model (~2.3 GB). The menu bar shows the
+percentage, and "Ready to dictate" appears when it's done. To run at login:
+System Settings → General → Login Items.
 
 ## Usage
 
@@ -151,14 +158,17 @@ Everything else lives in the 🎙 menu.
 
 🎙 → History…, or — if the menu bar icon is hidden behind the notch — just
 launch Kaho again (Launchpad, Finder, or `open /Applications/Kaho.app`)
-while it's running: the History window opens.
+while it's running: the History window opens. Only one Kaho ever runs; a
+second launch brings the running one forward and quits.
 </details>
 
 <details>
 <summary><strong>The hotkey does nothing.</strong></summary>
 
-Almost always permissions: check that *Kaho* (not your terminal) is enabled
-under Accessibility, then relaunch it. Re-running `install.sh` rebuilds the
+If the menu bar shows ⚠️, Accessibility isn't granted yet: click the first
+menu item and switch Kaho on. If it's already switched on and Kaho still
+can't paste, Kaho says so after a short wait and walks you through removing
+the old entry and adding Kaho again. Re-running `install.sh` rebuilds the
 bundle and can reset the grant. Also make sure you're pressing the key shown
 in 🎙 → Hotkey — it's the **right**-side key.
 </details>

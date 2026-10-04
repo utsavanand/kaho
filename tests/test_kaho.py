@@ -137,6 +137,10 @@ class KahoTestCase(unittest.TestCase):
             ("HISTORY_PATH", str(tmp / "history.jsonl")),
             ("SETTINGS_PATH", str(tmp / "settings.json")),
             ("DICTIONARY_PATH", str(tmp / "dictionary.txt")),
+            ("INSTANCE_LOCK_PATH", str(tmp / "instance.lock")),
+            ("RELAUNCH_MARKER_PATH", str(tmp / "relaunching")),
+            ("needs_accessibility", False),
+            ("download_progress", None),
             ("state", "ready"),
             ("locked", False),
             ("press_time", 0.0),
@@ -1102,7 +1106,7 @@ class TestConstantsAgree(unittest.TestCase):
         self.assertEqual(
             set(kaho.PHASE_LABELS),
             {"transcribing", "rewriting", "done", "blocked", "wedged",
-             "instructing"},
+             "instructing", "ready"},
         )
 
     def test_hotkeys_are_distinct_and_labelled(self):
@@ -1724,6 +1728,234 @@ class TestSottoMigration(KahoTestCase):
     def test_a_fresh_install_has_nothing_to_migrate(self):
         self.assertFalse(kaho.migrate_sotto_support_dir())
         self.assertFalse(self.new.exists())
+
+
+class TestSingleInstance(KahoTestCase):
+    """A tester reopened Kaho without quitting it, and both copies then
+    recorded and pasted every dictation."""
+
+    def test_a_second_copy_does_not_get_the_lock(self):
+        first = kaho.acquire_instance_lock(kaho.INSTANCE_LOCK_PATH)
+        self.addCleanup(os.close, first)
+        self.assertIsNotNone(first)
+        self.assertIsNone(kaho.acquire_instance_lock(kaho.INSTANCE_LOCK_PATH))
+
+    def test_the_lock_frees_when_its_holder_goes_away(self):
+        # Closing the descriptor is what process exit does — a crashed Kaho
+        # must never leave the app unable to start
+        first = kaho.acquire_instance_lock(kaho.INSTANCE_LOCK_PATH)
+        os.close(first)
+        second = kaho.acquire_instance_lock(kaho.INSTANCE_LOCK_PATH)
+        self.addCleanup(os.close, second)
+        self.assertIsNotNone(second)
+
+    def test_a_relaunch_waits_out_the_handover(self):
+        first = kaho.acquire_instance_lock(kaho.INSTANCE_LOCK_PATH)
+        threading.Timer(0.3, os.close, args=(first,)).start()
+        second = kaho.acquire_instance_lock(kaho.INSTANCE_LOCK_PATH, wait=3)
+        self.addCleanup(os.close, second)
+        self.assertIsNotNone(second)
+
+    def test_relaunch_marks_the_handover_and_it_expires(self):
+        with mock.patch.object(kaho, "__file__", "/Applications/Kaho.app/Contents/Resources/kaho.py"), \
+             mock.patch.object(kaho.subprocess, "Popen"):
+            kaho.relaunch()
+        self.assertTrue(kaho.relaunch_pending())
+        later = os.path.getmtime(kaho.RELAUNCH_MARKER_PATH) + kaho.LOCK_HANDOVER_SECONDS * 2 + 1
+        self.assertFalse(kaho.relaunch_pending(now=later))
+
+    def test_no_marker_means_no_handover(self):
+        self.assertFalse(kaho.relaunch_pending())
+
+
+class TestInstallLocation(KahoTestCase):
+    """Permissions granted to a copy run from the download don't follow it."""
+
+    def test_where_the_app_is_running_from(self):
+        home = "/Users/me"
+        cases = {
+            "/Applications/Kaho.app": "applications",
+            "/Users/me/Applications/Kaho.app": "applications",
+            "/private/var/folders/x1/T/AppTranslocation/0AB3/d/Kaho.app": "translocated",
+            "/Volumes/Kaho Installer/Kaho.app": "disk image",
+            "/Users/me/Downloads/Kaho.app": "elsewhere",
+            # A prefix match without the slash would call this Applications
+            "/Applications Old/Kaho.app": "elsewhere",
+        }
+        for path, expected in cases.items():
+            self.assertEqual(kaho.classify_location(path, home), expected, path)
+
+    def test_a_source_install_is_never_offered_a_move(self):
+        with mock.patch.object(kaho, "run_alert") as alert:
+            self.assertFalse(kaho.check_install_location())
+        alert.assert_not_called()
+
+    def test_declining_the_move_keeps_running_from_here(self):
+        with mock.patch.object(kaho.sys, "frozen", True, create=True), \
+             mock.patch.object(kaho, "bundle_path", return_value="/Users/me/Downloads/Kaho.app"), \
+             mock.patch.object(kaho, "run_alert", return_value=1), \
+             mock.patch.object(kaho, "copy_to_applications") as copy:
+            self.assertFalse(kaho.check_install_location())
+        copy.assert_not_called()
+        self.assertTrue(any("declined" in m for m in self.logged))
+
+    def test_moving_relaunches_from_the_new_copy(self):
+        with mock.patch.object(kaho.sys, "frozen", True, create=True), \
+             mock.patch.object(kaho, "bundle_path", return_value="/Volumes/Kaho Installer/Kaho.app"), \
+             mock.patch.object(kaho, "run_alert", return_value=0), \
+             mock.patch.object(kaho, "copy_to_applications", return_value="/Applications/Kaho.app"), \
+             mock.patch.object(kaho, "relaunch") as relaunch:
+            self.assertTrue(kaho.check_install_location())
+        self.assertEqual(relaunch.call_args.args[0], "/Applications/Kaho.app")
+
+    @unittest.skipUnless(sys.platform == "darwin", "ditto and xattr are macOS tools")
+    def test_the_copy_lands_and_an_older_one_goes_to_the_trash(self):
+        tmp = pathlib.Path(self.tmp.name)
+        source = tmp / "Downloads" / "Kaho.app"
+        (source / "Contents").mkdir(parents=True)
+        (source / "Contents" / "Info.plist").write_text("new")
+        unwritable = tmp / "locked"
+        unwritable.mkdir()
+        unwritable.chmod(0o500)
+        self.addCleanup(unwritable.chmod, 0o700)
+        apps = tmp / "Apps"
+        (apps / "Kaho.app").mkdir(parents=True)
+        (apps / "Kaho.app" / "old").write_text("older version")
+        trashed = tmp / "Trash"
+        trashed.mkdir()
+
+        def fake_trash(path):
+            os.rename(path, trashed / "Kaho.app")
+
+        with mock.patch.object(kaho, "trash", side_effect=fake_trash):
+            dest = kaho.copy_to_applications(str(source), destinations=(str(unwritable), str(apps)))
+
+        self.assertEqual(dest, str(apps / "Kaho.app"))
+        self.assertEqual((apps / "Kaho.app" / "Contents" / "Info.plist").read_text(), "new")
+        # Moved aside, never deleted
+        self.assertEqual((trashed / "Kaho.app" / "old").read_text(), "older version")
+
+
+class TestAccessibilityFlow(KahoTestCase):
+    """Granting the permission must be enough — no quit-and-reopen ritual."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(kaho, "permission_win", mock.MagicMock()))
+        kaho.Quartz.CGRequestPostEventAccess.reset_mock()
+
+    def test_states(self):
+        stale = kaho.STALE_GRANT_SECONDS
+        self.assertEqual(kaho.accessibility_state(True, None, 0), "granted")
+        self.assertEqual(kaho.accessibility_state(True, 0, stale * 10), "granted")
+        # Without Settings having been opened there is nothing to call stale
+        self.assertEqual(kaho.accessibility_state(False, None, stale * 10), "waiting")
+        self.assertEqual(kaho.accessibility_state(False, 100, 100 + stale - 1), "waiting")
+        self.assertEqual(kaho.accessibility_state(False, 100, 100 + stale), "stale")
+
+    def test_a_trusted_launch_asks_for_nothing(self):
+        kaho.Quartz.CGPreflightPostEventAccess.return_value = True
+        kaho.watch_accessibility()
+        self.assertFalse(kaho.needs_accessibility)
+        kaho.Quartz.CGRequestPostEventAccess.assert_not_called()
+        kaho.permission_win.show.assert_not_called()
+
+    def test_an_untrusted_launch_explains_and_watches_once(self):
+        kaho.Quartz.CGPreflightPostEventAccess.return_value = False
+        kaho.watch_accessibility()
+        kaho.watch_accessibility()  # a refused paste calls it again
+        self.assertTrue(kaho.needs_accessibility)
+        kaho.Quartz.CGRequestPostEventAccess.assert_called_once()
+        kaho.permission_win.startWatching.assert_called_once()
+
+    def test_the_grant_restarts_kaho_by_itself(self):
+        win = kaho.PermissionWindow()
+        win.timer = mock.MagicMock()
+        kaho.Quartz.CGPreflightPostEventAccess.return_value = True
+        with mock.patch.object(kaho, "relaunch") as relaunch:
+            win.tick_(None)
+        relaunch.assert_called_once()
+        self.assertIsNone(win.timer)
+
+    def test_a_grant_that_doesnt_take_switches_to_the_stale_steps_once(self):
+        win = kaho.PermissionWindow()
+        win.timer = mock.MagicMock()
+        win.opened_at = self.clock.now - kaho.STALE_GRANT_SECONDS - 1
+        kaho.Quartz.CGPreflightPostEventAccess.return_value = False
+        with mock.patch.object(win, "show", create=True) as show, \
+             mock.patch.object(kaho, "relaunch") as relaunch:
+            win.tick_(None)
+            win.tick_(None)
+        self.assertEqual(win.mode, "stale")
+        show.assert_called_once()
+        relaunch.assert_not_called()
+
+    def test_the_menu_bar_shows_the_problem_but_not_over_a_recording(self):
+        kaho.needs_accessibility = True
+        kaho.state = "ready"
+        self.assertEqual(kaho.status_title(), "⚠️")
+        kaho.state = "recording"
+        self.assertEqual(kaho.status_title(), kaho.TITLES["recording"])
+
+    def test_a_refused_paste_names_its_cause_on_the_pill(self):
+        kaho.Quartz.CGPreflightPostEventAccess.return_value = False
+        reason = kaho.paste_blocked_reason()
+        self.assertEqual(kaho.blocked_pill_text(reason), "Needs Accessibility · ⌘V")
+        self.assertEqual(
+            kaho.blocked_pill_text("secure input is active (held by iTerm2) — a password prompt"),
+            "Secure input on · ⌘V",
+        )
+
+    @unittest.skipIf(REAL_NUMPY is None, "needs real numpy to split the audio")
+    def test_a_refused_paste_keeps_the_words_and_starts_the_fix(self):
+        kaho.Quartz.CGPreflightPostEventAccess.return_value = False
+        kaho.AppHelper.callAfter.reset_mock()
+        with mock.patch.object(kaho, "transcribe", return_value="hello there"), \
+             mock.patch.object(kaho, "set_clipboard") as clip, \
+             mock.patch.object(kaho, "append_history"):
+            audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE, dtype="float32")
+            kaho.run_job(audio, kaho.job_generation, [], None, self.clock.now)
+        clip.assert_called_once_with("hello there")
+        calls = [c.args for c in kaho.AppHelper.callAfter.call_args_list]
+        self.assertIn((kaho.overlay.showProblem_, "Needs Accessibility · ⌘V"), calls)
+        self.assertIn((kaho.accessibility_lost,), calls)
+
+
+class TestDownloadProgress(KahoTestCase):
+    """A first run used to be two silent minutes of "…"."""
+
+    def test_percent_and_wording(self):
+        total = kaho.MODEL_DOWNLOAD_BYTES
+        self.assertEqual(kaho.download_percent(0, total), 0)
+        self.assertEqual(kaho.download_percent(total // 2, total), 50)
+        # Never 100 while the call is still running; leftovers can overshoot
+        self.assertEqual(kaho.download_percent(total * 2, total), 99)
+        self.assertEqual(kaho.download_percent(5, 0), 0)
+        self.assertEqual(
+            kaho.format_download(1_000_000_000, total),
+            "Downloading speech model… 40% (1.0 of 2.5 GB)",
+        )
+
+    def test_partial_files_count_toward_progress(self):
+        cache = pathlib.Path(self.tmp.name) / "hub"
+        blobs = cache / "models--mlx-community--Qwen3-ASR-1.7B-8bit" / "blobs"
+        blobs.mkdir(parents=True)
+        (blobs / "done").write_bytes(b"x" * 300)
+        (blobs / "abc.incomplete").write_bytes(b"x" * 200)
+        constants = types.SimpleNamespace(HF_HUB_CACHE=str(cache))
+        with mock.patch.object(kaho.huggingface_hub, "constants", constants, create=True):
+            self.assertEqual(kaho.cached_bytes(kaho.MODEL_REPO), 500)
+
+    def test_the_menu_says_what_is_happening(self):
+        kaho.state = "loading"
+        self.assertEqual(kaho.status_line(), "Loading the speech model…")
+        kaho.download_progress = (1_000_000_000, kaho.MODEL_DOWNLOAD_BYTES)
+        self.assertTrue(kaho.status_line().startswith("Downloading speech model… 40%"))
+        self.assertEqual(kaho.status_title(), "↓40%")
+        kaho.state = "ready"
+        kaho.download_progress = None
+        self.assertIsNone(kaho.status_line())
+        self.assertEqual(kaho.status_title(), kaho.TITLES["ready"])
 
 
 if __name__ == "__main__":
