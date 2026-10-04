@@ -1136,15 +1136,16 @@ def rewrite(text, mode):
             log(f"[rewrite skipped {time.monotonic() - t0:.2f}s] already clean (p={p:.2f})")
             return None
     model, tokenizer = rewriter
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": REWRITE_PROMPTS[mode].format(text=text)}],
-        add_generation_prompt=True,
-        enable_thinking=False,  # Qwen3: answer directly, no chain-of-thought
-    )
     t0 = time.monotonic()
     # A failed rewrite must never cost the user their words — fall back to
-    # pasting the raw transcript
+    # pasting the raw transcript. The template call is inside the try for the
+    # same reason: it raises on a tokenizer without a chat template.
     try:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": REWRITE_PROMPTS[mode].format(text=text)}],
+            add_generation_prompt=True,
+            enable_thinking=False,  # Qwen3: answer directly, no chain-of-thought
+        )
         out = mlx_lm.generate(
             model,
             tokenizer,
@@ -1222,9 +1223,12 @@ def call_rewrite_api(backend, prompt):
         body = {"model": model,
                 "messages": [{"role": "user", "content": prompt}]}
 
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode(), headers=headers, method="POST")
     try:
+        # Request() is inside the try on purpose: it raises ValueError on a
+        # malformed url, which a user typing a custom endpoint will hit, and
+        # outside it that escaped as a crash instead of falling back.
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
             data = json.loads(r.read())
     except Exception as e:  # noqa: BLE001
@@ -1236,7 +1240,9 @@ def call_rewrite_api(backend, prompt):
         if backend == "anthropic":
             return "".join(b.get("text", "") for b in data["content"]).strip()
         return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError):
+    except (KeyError, IndexError, TypeError, AttributeError):
+        # AttributeError included: a provider returning "content": null gives
+        # None.strip(), which is a shape problem like any other
         log(f"{backend}: unexpected response shape — using the on-device model")
         return None
 
@@ -1259,14 +1265,17 @@ def rewrite_with_instruction(text, instruction):
         log("instruction ignored: rewrite model not loaded — pasted as-is")
         return None
     model, tokenizer = rewriter
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": INSTRUCTION_PROMPT.format(
-            instruction=instruction, text=text)}],
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
     t0 = time.monotonic()
+    # The template call is inside the try with the generation: it can raise
+    # on a tokenizer without a chat template, and outside it that threw away
+    # a transcript the user had already successfully dictated.
     try:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": INSTRUCTION_PROMPT.format(
+                instruction=instruction, text=text)}],
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
         out = mlx_lm.generate(
             model, tokenizer, prompt=prompt,
             # Room to expand: "make it a formal email" legitimately produces

@@ -1126,6 +1126,15 @@ class TestSpokenInstruction(KahoTestCase):
         rw.assert_not_called()
         paste.assert_called_once_with("the whole thing")
 
+    def test_a_broken_chat_template_keeps_the_transcript(self):
+        """Speech already recognised must survive a rewrite that cannot run."""
+        tokenizer = mock.MagicMock()
+        tokenizer.apply_chat_template.side_effect = ValueError("bad template")
+        with mock.patch.object(kaho, "rewriter", (mock.MagicMock(), tokenizer)):
+            self.assertIsNone(kaho.rewrite("the words I said", "structured"))
+            self.assertIsNone(
+                kaho.rewrite_with_instruction("the words I said", "make it formal"))
+
     def test_a_too_short_instruction_is_still_kept_out_of_the_message(self):
         """Marked as instruction means never transcribed as message.
 
@@ -1210,6 +1219,17 @@ class TestBringYourOwnKey(KahoTestCase):
             kaho.call_rewrite_api("openai", "x")
         self.assertFalse(any("sk-test" in m for m in self.logged),
                          f"the key leaked into the log: {self.logged}")
+
+    def test_a_malformed_endpoint_falls_back_instead_of_raising(self):
+        """A user typing a custom URL can get this wrong; it must not crash."""
+        kaho.settings.update(api_url="not-a-url", api_model="qa")
+        self.assertIsNone(kaho.call_rewrite_api("custom", "text"))
+
+    def test_a_null_content_field_falls_back(self):
+        reply = b'{"choices":[{"message":{"content":null}}]}'
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = reply
+            self.assertIsNone(kaho.call_rewrite_api("openai", "text"))
 
     def test_local_is_the_default_and_makes_no_request(self):
         kaho.settings["rewrite_backend"] = "local"
