@@ -39,9 +39,11 @@ MIN_MACOS="$(sed -nE 's/.*"LSMinimumSystemVersion": "([0-9.]+)".*/\1/p' "$SRC/pa
 NOTARY_PROFILE="${KAHO_NOTARY_PROFILE:-kaho-fresh}"
 
 # Resolve the Developer ID automatically: hardcoding it means every machine
-# needs an edit, and the hash changes when the certificate is renewed
+# needs an edit, and the hash changes when the certificate is renewed.
+# grep finding nothing must not trip pipefail: --build-only runs without a
+# certificate, and without one the message below has to be reached.
 IDENTITY="$(security find-identity -v -p codesigning \
-    | grep "Developer ID Application" \
+    | { grep "Developer ID Application" || true; } \
     | head -1 \
     | sed -E 's/.*"(.*)"/\1/')"
 if [[ -z "$IDENTITY" && "$BUILD_ONLY" != "--build-only" ]]; then
