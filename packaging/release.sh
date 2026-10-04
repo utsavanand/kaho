@@ -115,6 +115,38 @@ codesign --force --deep --timestamp --options runtime \
     --entitlements "$BUILD/entitlements.plist" --sign "$IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
+# Every Mach-O in the bundle must run on the OS the bundle claims to support.
+# 2.2.0 shipped declaring macOS 14 with 64 binaries built for 15 — Homebrew's
+# Python and its libraries are compiled for the build host. LaunchServices
+# accepted the app and dyld then failed to load Python, so it died before
+# main() with no message and no permission prompt. A tester saw a dead icon.
+echo "==> checking the deployment target"
+DECLARED="$(/usr/libexec/PlistBuddy -c 'Print LSMinimumSystemVersion' "$APP/Contents/Info.plist")"
+TOO_NEW="$(find "$APP" -type f \( -name '*.so' -o -name '*.dylib' -o -perm +111 \) -print0 \
+    | xargs -0 -I {} sh -c '
+        file "$1" 2>/dev/null | grep -q Mach-O || exit 0
+        m=$(vtool -show-build "$1" 2>/dev/null | awk "/minos/{print \$2; exit}")
+        [ -n "$m" ] && printf "%s %s\n" "$m" "$1"
+      ' _ {} \
+    | awk -v want="$DECLARED" '{
+        split($1, a, "."); split(want, b, ".")
+        if (a[1] > b[1] || (a[1] == b[1] && a[2] > b[2])) print
+      }')"
+if [[ -n "$TOO_NEW" ]]; then
+    echo "The bundle declares macOS $DECLARED but contains binaries that need more:"
+    printf '%s\n' "$TOO_NEW" | sed 's|.*/Kaho.app/|  |' | sort -u | head -20
+    echo ""
+    echo "Total: $(printf '%s\n' "$TOO_NEW" | wc -l | tr -d ' ') binaries."
+    echo "Usually the venv was built with Homebrew's Python, which targets the"
+    echo "build host. Rebuild it with python.org's universal2 Python:"
+    echo "  rm -rf .venv"
+    echo "  /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -m venv .venv"
+    echo "  .venv/bin/pip install --require-hashes --no-deps -r requirements.lock"
+    echo "  .venv/bin/pip install pyinstaller ruff"
+    exit 1
+fi
+echo "all binaries run on macOS $DECLARED"
+
 echo "==> packaging the dmg"
 DMG="$BUILD/Kaho-$VERSION.dmg"
 STAGE="$BUILD/stage"
