@@ -145,6 +145,7 @@ class KahoTestCase(unittest.TestCase):
             ("stream", None),
             ("record_buf", None),
             ("audio_op_started", None),
+            ("recording", None),
             
             ("history_version", 0),
             ("rewriter", None),
@@ -1048,7 +1049,7 @@ class TestSpokenInstruction(KahoTestCase):
         self.hold_instruction()
         self.speak(1.0)
         self.release_instruction()
-        self.assertEqual(kaho.instruction_spans,
+        self.assertEqual(kaho.recording.spans,
                          [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE]])
 
     def test_it_can_be_toggled_more_than_once(self):
@@ -1064,7 +1065,7 @@ class TestSpokenInstruction(KahoTestCase):
         self.speak(1.0)
         self.release_instruction()
         self.assertEqual(
-            kaho.instruction_spans,
+            kaho.recording.spans,
             [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE],
              [3 * kaho.SAMPLE_RATE, 4 * kaho.SAMPLE_RATE]],
         )
@@ -1079,7 +1080,7 @@ class TestSpokenInstruction(KahoTestCase):
 
     def test_the_key_does_nothing_when_not_recording(self):
         self.hold_instruction()
-        self.assertEqual(kaho.instruction_spans, [])
+        self.assertEqual((kaho.recording.spans if kaho.recording else []), [])
 
     def test_spans_are_cleared_for_the_next_dictation(self):
         self.down()
@@ -1093,7 +1094,7 @@ class TestSpokenInstruction(KahoTestCase):
 
         self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
         self.down()
-        self.assertEqual(kaho.instruction_spans, [],
+        self.assertEqual((kaho.recording.spans if kaho.recording else []), [],
                          "a stale span would split the next dictation")
 
     def test_a_span_left_open_is_closed_at_the_end(self):
@@ -1196,6 +1197,53 @@ class TestSpokenInstruction(KahoTestCase):
         self.assertEqual(len(sent), int(kaho.SAMPLE_RATE * 0.9),
                          "the instruction audio was transcribed into the message")
 
+    def test_cancelling_a_second_dictation_leaves_the_first_alone(self):
+        """QA finding 3b: cancellation belonged to whichever recording was last.
+
+        Stop A, start B, cancel B before A's finalizer runs. A used to
+        consume the global cancel flag and be discarded, while B pasted.
+        """
+        self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        session_a, buf_a = kaho.recording, kaho.record_buf
+        self.clock.advance(2.0)
+        self.up()                      # A stops; its finalizer is queued
+
+        self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
+        self.down()                    # B starts
+        self.run_audio_ops()
+        self.speak(1.0)
+        kaho.overlay.is_working.return_value = False
+        kaho.cancel_pending_job()      # cancel B
+
+        self.assertFalse(session_a.cancelled, "cancelling B marked A cancelled")
+        self.assertTrue(kaho.recording.cancelled, "B was not cancelled")
+
+        before = kaho.jobs.qsize()
+        kaho._finish_recording(None, buf_a, session_a)
+        self.assertEqual(kaho.jobs.qsize(), before + 1,
+                         "A was discarded by a cancel that belonged to B")
+
+    def test_a_new_dictation_does_not_erase_the_previous_instructions(self):
+        """QA finding 3c: B used to clear A's instruction ranges."""
+        self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        self.hold_instruction()
+        self.speak(1.0)
+        self.release_instruction()
+        session_a = kaho.recording
+        spans_a = list(session_a.spans)
+        self.clock.advance(2.0)
+        self.up()
+
+        self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
+        self.down()                    # B starts before A finalizes
+        self.assertEqual(session_a.spans, spans_a,
+                         "starting B erased A's instruction ranges")
+        self.assertEqual(kaho.recording.spans, [], "B inherited A's ranges")
+
     def test_the_instruction_key_is_never_the_hotkey(self):
         for name in kaho.HOTKEYS:
             kaho.settings["hotkey"] = name
@@ -1288,7 +1336,6 @@ class TestCancel(KahoTestCase):
     def setUp(self):
         super().setUp()
         self.enterContext(mock.patch.object(kaho, "job_generation", 0))
-        self.enterContext(mock.patch.object(kaho, "cancel_recording", False))
 
     def escape(self):
         return kaho.handle_key_down(FakeEvent(kaho.ESCAPE_KEYCODE, 0))
@@ -1305,7 +1352,7 @@ class TestCancel(KahoTestCase):
         self.assertEqual(kaho.state, "ready")
         # The audio is dropped outright rather than versioned: _finish_recording
         # runs later on the audio thread and would read the post-bump counter
-        self.assertTrue(kaho.cancel_recording)
+        self.assertTrue(kaho.recording.cancelled)
         self.run_audio_ops()
         self.assertEqual(self.queued_audio(), [], "cancelled audio was queued anyway")
 
@@ -1351,7 +1398,7 @@ class TestCancel(KahoTestCase):
         self.clock.advance(kaho.DOUBLE_TAP_SECONDS + 1.0)
         self.down()
         self.run_audio_ops()
-        self.assertFalse(kaho.cancel_recording)
+        self.assertFalse(kaho.recording.cancelled)
         self.speak()
         self.clock.advance(2.0)
         self.up()

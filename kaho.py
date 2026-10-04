@@ -384,23 +384,62 @@ locked = False
 # rather than stopping the work — which is the part that matters, since the
 # damage is unwanted text landing in the user's document.
 job_generation = 0
-# Set by Escape during a recording, cleared when the audio is dropped. The
-# generation counter cannot cover this case: _finish_recording reads the
-# counter on the audio thread after the bump has landed.
-cancel_recording = False
 # Set when a recording is handed to the worker, cleared when that job is
 # finished with. Cancellability has to come from this rather than from
 # whether the pill is on screen: the watchdog used to hide the pill, which
 # silently made Escape stop working on a job that was still running.
 job_outstanding = False
-# Frame ranges of the recording that were spoken as instruction rather than
-# message, as [start, end) pairs; the open range has end None. Held, not
-# latched: the key can be pressed and released as often as the user likes,
-# so a thought can be interrupted with "make this formal" and then continue.
-# Recorded as positions in one recording rather than separate ones, because
-# stopping and reopening the stream loses ~60 ms at exactly the moment the
-# user is mid-sentence.
-instruction_spans = []
+
+
+class Recording:
+    """One dictation's own state, from key-down to paste.
+
+    Cancellation and instruction ranges used to be module globals, which
+    meant they belonged to whichever recording touched them last. Starting a
+    second dictation before the first finished let B clear A's instruction
+    ranges, and cancelling B discarded A instead. Each recording now carries
+    its own, and every queued operation holds the session it came from.
+
+    `spans` are frame ranges spoken as instruction rather than message, as
+    [start, end) pairs with the open range ending in None. Held, not latched:
+    the key can be pressed and released as often as the user likes, so a
+    thought can be interrupted with "make this formal" and then continue.
+    They are positions within one recording rather than separate recordings,
+    because stopping and reopening the stream loses ~60 ms at exactly the
+    moment the user is mid-sentence.
+    """
+
+    __slots__ = ("buf", "cancelled", "spans")
+
+    def __init__(self):
+        self.buf = []
+        self.spans = []
+        self.cancelled = False
+
+    def mark_instruction(self, held):
+        """Open or close an instruction range at the current frame."""
+        frame = sum(len(chunk) for chunk in self.buf)
+        open_span = self.spans and self.spans[-1][1] is None
+        if held and not open_span:
+            self.spans.append([frame, None])
+            return "opened"
+        if not held and open_span:
+            self.spans[-1][1] = frame
+            return "closed"
+        return None
+
+    def frozen_spans(self):
+        """Ranges with any still-open one closed at the end of the audio.
+
+        The hotkey can be released while the instruction key is still down.
+        """
+        total = sum(len(chunk) for chunk in self.buf)
+        return [[a, total if b is None else b] for a, b in self.spans]
+
+
+# The recording being captured right now, or None. Replaced rather than
+# mutated when a new one starts, so an in-flight finalizer keeps its own.
+recording = None
 press_time = 0.0
 last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
@@ -720,7 +759,7 @@ def relaunch():
 
 
 def start_recording():
-    global state, record_buf
+    global state, record_buf, recording
     if state != "ready":
         return
     if audio_wedged():
@@ -738,8 +777,10 @@ def start_recording():
         if state != "ready":
             return
         state = "recording"
-        instruction_spans.clear()
-        buf = []
+        # A fresh object, not a reset: a finalizer still running for the
+        # previous recording keeps the one it was given
+        recording = Recording()
+        buf = recording.buf
         record_buf = buf
     overlay.show()
     # Fire a warmup while the user is still speaking: the page-in of idle
@@ -807,7 +848,7 @@ def stop_recording():
         state = "ready"
         # `stream` is still None when the open is in flight; _open_stream then
         # sees the recording is gone and closes its own stream
-        s, buf = stream, record_buf
+        s, buf, session = stream, record_buf, recording
         stream = None
         record_buf = None
     # The pill stays up: the worker switches it to "Transcribing…" and hides
@@ -816,7 +857,7 @@ def stop_recording():
     # in CoreAudio and _finish_recording never runs at all.
     overlay.setPhase_("transcribing")
     overlay.armWatchdog()
-    audio_ops.put(lambda: _finish_recording(s, buf))
+    audio_ops.put(lambda: _finish_recording(s, buf, session))
 
 
 def _audio_or_drop_reason(buf):
@@ -847,7 +888,7 @@ def _audio_or_drop_reason(buf):
     return audio, f"recorded {secs:.1f}s on '{input_name}' (peak {peak:.3f}), transcribing...", None
 
 
-def _finish_recording(s, buf):
+def _finish_recording(s, buf, session=None):
     """Hand the recording to the worker, then release the device.
 
     Enqueue first, shut down second. The buffer is already complete by the
@@ -858,12 +899,9 @@ def _finish_recording(s, buf):
     FinishStoppingStream), and doing it first meant a hung device threw away
     speech the user had already finished saying.
     """
-    global cancel_recording
-    # Consume the flag at the single point the job is queued. An earlier check
-    # can be bypassed: when the key is released before the open lands,
-    # _open_stream finishes the recording itself, on its own queued op.
-    if cancel_recording:
-        cancel_recording = False
+    # This recording's own cancel flag, not a global one: cancelling a later
+    # dictation used to discard whichever recording finalized next.
+    if session is not None and session.cancelled:
         AppHelper.callAfter(overlay.hide)
     else:
         audio, message, pill = _audio_or_drop_reason(buf)
@@ -874,10 +912,7 @@ def _finish_recording(s, buf):
             else:
                 AppHelper.callAfter(overlay.hide)
         else:
-            # Close an unterminated span: the user released the hotkey while
-            # still holding the instruction key
-            total = sum(len(chunk) for chunk in buf) if buf else 0
-            spans = [[a, total if b is None else b] for a, b in instruction_spans]
+            spans = session.frozen_spans() if session is not None else []
             global job_outstanding
             job_outstanding = True
             jobs.put((audio, job_generation, spans))
@@ -911,16 +946,11 @@ def handle_flags_changed(event):
     global locked, press_time, last_tap, lock_time
     keycode, device_mask, _ = HOTKEYS[settings["hotkey"]]
     instr_code, instr_mask = instruction_key()
-    if event.keyCode() == instr_code and state == "recording":
-        buf = record_buf
-        frame = sum(len(chunk) for chunk in buf) if buf else 0
-        held = bool(event.modifierFlags() & instr_mask)
-        open_span = instruction_spans and instruction_spans[-1][1] is None
-        if held and not open_span:
-            instruction_spans.append([frame, None])
+    if event.keyCode() == instr_code and state == "recording" and recording:
+        changed = recording.mark_instruction(bool(event.modifierFlags() & instr_mask))
+        if changed == "opened":
             overlay.setPhase_("instructing")
-        elif not held and open_span:
-            instruction_spans[-1][1] = frame
+        elif changed == "closed":
             # Back to dictating: the pill returns to the level meter so the
             # two halves are always distinguishable on screen
             overlay.setPhase_("recording")
@@ -1005,16 +1035,16 @@ def cancel_pending_job():
     worker throw the result away when it finishes. Recording, by contrast,
     really is stopped.
     """
-    global job_generation, locked, cancel_recording
+    global job_generation, locked
     if state != "recording" and not overlay.is_working():
         return False
     job_generation += 1
     if state == "recording":
-        # NOT a generation bump: _finish_recording runs later, on the audio
-        # thread, and reads job_generation at that point — so any bump made
-        # here is already folded in by the time it queues the job, and the
-        # recording pastes anyway. The audio has to be dropped outright.
-        cancel_recording = True
+        # Marked on this recording, not on a global: the generation counter
+        # cannot cover it either, because _finish_recording runs later on the
+        # audio thread and reads the counter after the bump has landed.
+        if recording is not None:
+            recording.cancelled = True
         locked = False
         stop_recording()
         log("cancelled the recording")
