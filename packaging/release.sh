@@ -36,7 +36,7 @@ MIN_MACOS="$(sed -nE 's/.*"LSMinimumSystemVersion": "([0-9.]+)".*/\1/p' "$SRC/pa
 # 2.1.0, which another project on this machine also used — each store-credentials
 # overwrote the other, and notarization then failed with "No Keychain password
 # item found" on a profile that had existed minutes earlier.
-NOTARY_PROFILE="${KAHO_NOTARY_PROFILE:-kaho-notary}"
+NOTARY_PROFILE="${KAHO_NOTARY_PROFILE:-kaho-fresh}"
 
 # Resolve the Developer ID automatically: hardcoding it means every machine
 # needs an edit, and the hash changes when the certificate is renewed
