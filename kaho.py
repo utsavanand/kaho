@@ -388,6 +388,11 @@ job_generation = 0
 # generation counter cannot cover this case: _finish_recording reads the
 # counter on the audio thread after the bump has landed.
 cancel_recording = False
+# Set when a recording is handed to the worker, cleared when that job is
+# finished with. Cancellability has to come from this rather than from
+# whether the pill is on screen: the watchdog used to hide the pill, which
+# silently made Escape stop working on a job that was still running.
+job_outstanding = False
 # Frame ranges of the recording that were spoken as instruction rather than
 # message, as [start, end) pairs; the open range has end None. Held, not
 # latched: the key can be pressed and released as often as the user likes,
@@ -675,6 +680,18 @@ def audio_wedged():
     return started is not None and time.monotonic() - started > WEDGE_SECONDS
 
 
+def audio_stalling():
+    """True while an audio op has run long enough to be worth mentioning.
+
+    Short of the wedge threshold, so the pill can say the device is being
+    slow before it says to restart. A thread blocked inside CoreAudio cannot
+    be interrupted from Python — no timeout, no signal, no kill — so saying
+    so early is the only honest option between "fine" and "restart".
+    """
+    started = audio_op_started
+    return started is not None and time.monotonic() - started > WEDGE_SECONDS / 6
+
+
 def relaunch():
     """Quit and start a fresh copy.
 
@@ -831,11 +848,16 @@ def _audio_or_drop_reason(buf):
 
 
 def _finish_recording(s, buf):
-    if s is not None:
-        t0 = time.monotonic()
-        _shutdown_stream(s)
-        if time.monotonic() - t0 > 3:
-            log("audio device was slow to release — another audio app may be fighting for the mic")
+    """Hand the recording to the worker, then release the device.
+
+    Enqueue first, shut down second. The buffer is already complete by the
+    time this runs — the callback stopped appending when stop_recording took
+    the stream — so nothing about the transcript depends on the device
+    closing. CoreAudio's stop can block forever on a HAL mutex (seen in
+    process samples, and both stop() and abort() route through
+    FinishStoppingStream), and doing it first meant a hung device threw away
+    speech the user had already finished saying.
+    """
     global cancel_recording
     # Consume the flag at the single point the job is queued. An earlier check
     # can be bypassed: when the key is released before the open lands,
@@ -843,20 +865,28 @@ def _finish_recording(s, buf):
     if cancel_recording:
         cancel_recording = False
         AppHelper.callAfter(overlay.hide)
-        return
-    audio, message, pill = _audio_or_drop_reason(buf)
-    log(message)
-    if audio is None:
-        if pill:
-            AppHelper.callAfter(overlay.showProblem_, pill)
+    else:
+        audio, message, pill = _audio_or_drop_reason(buf)
+        log(message)
+        if audio is None:
+            if pill:
+                AppHelper.callAfter(overlay.showProblem_, pill)
+            else:
+                AppHelper.callAfter(overlay.hide)
         else:
-            AppHelper.callAfter(overlay.hide)
-        return
-    # Close an unterminated span: the user released the hotkey while still
-    # holding the instruction key
-    total = sum(len(chunk) for chunk in buf) if buf else 0
-    spans = [[a, total if b is None else b] for a, b in instruction_spans]
-    jobs.put((audio, job_generation, spans))
+            # Close an unterminated span: the user released the hotkey while
+            # still holding the instruction key
+            total = sum(len(chunk) for chunk in buf) if buf else 0
+            spans = [[a, total if b is None else b] for a, b in instruction_spans]
+            global job_outstanding
+            job_outstanding = True
+            jobs.put((audio, job_generation, spans))
+
+    if s is not None:
+        t0 = time.monotonic()
+        _shutdown_stream(s)
+        if time.monotonic() - t0 > 3:
+            log("audio device was slow to release — another audio app may be fighting for the mic")
 
 
 def schedule_deferred_stop(tap_time):
@@ -1486,7 +1516,7 @@ def run_job(audio, generation, spans, t0):
 
 
 def worker():
-    global last_inference
+    global last_inference, job_outstanding
     while True:
         job = jobs.get()
         t0 = time.monotonic()
@@ -1508,6 +1538,10 @@ def worker():
         except Exception as e:  # noqa: BLE001
             AppHelper.callAfter(overlay.hide)
             log(f"transcription failed: {e!r} — dictation continues")
+        finally:
+            # In a finally: a job that raised is still finished with, and
+            # leaving this set would arm Escape against nothing forever
+            job_outstanding = False
 
 
 def backend():
@@ -1810,10 +1844,23 @@ class Overlay(AppKit.NSObject):
         self.watchdog = None
 
     def watchdogFired_(self, _timer):
+        """Say the pipeline is stuck rather than quietly erasing the evidence.
+
+        Hiding the pill made an unfinished job invisible AND stopped Escape
+        from reaching it, because is_working() reads panel visibility. The
+        user was left with no indication and no way to cancel. When the
+        audio thread is the cause, name that, since Restart Kaho is the only
+        cure for a thread blocked inside CoreAudio.
+        """
         self.watchdog = None
-        if self.panel.isVisible():
-            log("overlay timed out waiting for the pipeline — hiding it")
-            self.hide()
+        if not self.panel.isVisible():
+            return
+        if audio_wedged():
+            log("pipeline stuck on the audio device — restart needed")
+            self.showProblem_("Mic stuck — Restart Kaho")
+        else:
+            log("pipeline timed out — nothing was pasted")
+            self.showProblem_("Took too long — nothing pasted")
 
     def showProblem_(self, message):
         """Say on the pill why a recording produced nothing.
@@ -1842,11 +1889,13 @@ class Overlay(AppKit.NSObject):
         )
 
     def is_working(self):
-        """True while a dictation is in flight and could still be cancelled."""
-        return self.panel.isVisible() and getattr(self.view, "phase", None) in (
-            "transcribing",
-            "rewriting",
-        )
+        """True while a dictation is in flight and could still be cancelled.
+
+        Reads the job flag, not the panel: the watchdog hides the pill, and
+        tying this to visibility meant Escape silently stopped working on a
+        job that was still running.
+        """
+        return job_outstanding
 
     def show_wedged(self):
         """Report a stuck audio device, and stay up until it is dealt with.

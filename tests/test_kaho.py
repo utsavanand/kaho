@@ -608,6 +608,47 @@ class TestAudioDropRules(KahoTestCase):
         self.assertIn("recorded 2.0s", message)
         self.assertIn("transcribing", message)
 
+    def test_escape_still_cancels_a_job_the_pill_is_no_longer_showing(self):
+        """A timeout must not silently disarm cancellation.
+
+        Cancellability used to be read off panel visibility, so the watchdog
+        hiding the pill made Escape stop reaching a job that was still
+        running: no indication, and no way out.
+        """
+        # The real method, with a panel that reports itself hidden — exactly
+        # the state the watchdog leaves behind
+        panel = mock.MagicMock()
+        panel.isVisible.return_value = False
+        overlay = mock.MagicMock(panel=panel)
+
+        with mock.patch.object(kaho, "job_outstanding", True):
+            self.assertTrue(kaho.Overlay.is_working(overlay),
+                            "a hidden pill made a running job uncancellable")
+        with mock.patch.object(kaho, "job_outstanding", False):
+            self.assertFalse(kaho.Overlay.is_working(overlay))
+
+    def test_a_hung_device_stop_still_delivers_the_transcript(self):
+        """The worst failure in this app is losing words already spoken.
+
+        CoreAudio's stop can block forever on a HAL mutex. Shutting the
+        device down before enqueueing meant that hang discarded a finished
+        recording, so the order is now enqueue first, release second.
+        """
+        stream = mock.MagicMock()
+        stopped = threading.Event()
+
+        def hang():
+            stopped.set()
+            raise AssertionError("the test must not actually block here")
+
+        stream.stop.side_effect = hang
+        # The job has to be on the queue BEFORE stop() is ever reached
+        with self.assertRaises(AssertionError):
+            kaho._finish_recording(stream, self.frames(2.0, 0.2))
+        self.assertTrue(stopped.is_set(), "stop() was never attempted")
+        self.assertFalse(kaho.jobs.empty(),
+                         "the transcript was lost to a hung device stop")
+
     def test_a_drop_the_user_can_fix_is_shown_on_the_pill(self):
         """Silence and quiet audio are actionable, so they must be visible.
 
