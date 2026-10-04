@@ -1,4 +1,44 @@
 # Changelog
+## 2.3.0 — 2026-10-04
+
+A reliability release. An independent audit of the whole application
+found eighteen reproducible defects; this fixes its five highest
+priorities, all of which could cost the user a dictation they had
+already finished speaking.
+
+- A stuck microphone no longer loses your words. macOS's audio stack
+  can block forever while releasing a device, and Kaho waited for that
+  release before handing the recording to the model — so a hang
+  discarded speech that had already been captured. The transcript is
+  now submitted first and the device released afterwards. (Swapping
+  stop for abort would not have helped: both route through the same
+  blocking call.)
+- A dictation that takes too long says so instead of vanishing. The
+  watchdog used to hide the pill, which erased the only sign that
+  anything was still running — and because cancellability was read off
+  whether the pill was visible, it also silently stopped Escape from
+  working on that job.
+- Cancelling one dictation can no longer discard another. Cancellation
+  and spoken-instruction ranges were shared between recordings, so
+  stopping one dictation and cancelling the next threw away the first,
+  and starting a new one erased the previous one's instruction
+  boundaries.
+- A failed rewrite never costs you the transcript. Three paths could
+  throw away recognised speech: a tokenizer without a chat template, a
+  malformed custom endpoint, and a provider returning a null response.
+  All three now fall back to pasting what you said.
+- The reported time is the time you actually waited. It used to start
+  after the worker picked the job up, so microphone shutdown and queue
+  waiting were invisible — a four-second stall logged as 0.00s.
+- Audio that is too quiet, silent, or missing now says so on the pill
+  rather than only in a log file. A microphone turned down read as the
+  app being broken.
+- A slow device release is no longer reported as a wedged one. The old
+  five-second threshold fired on healthy recordings and sent people to
+  Restart Kaho for something that recovered on its own.
+- An instruction too short to use is no longer transcribed into your
+  message.
+
 ## 2.2.0 — 2026-10-02
 
 - Bring your own key for the rewrite step. On-device stays the default
