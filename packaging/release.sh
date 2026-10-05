@@ -176,10 +176,10 @@ codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 # polling costs nothing. It also means a lost credential is reported as
 # such rather than silently reading as "still in progress" forever.
 await_notarization() {
-    local id="$1" waited=0 status=""
+    local id="$1" waited=0 status="" info=""
     while (( waited < 3600 )); do
-        status="$(xcrun notarytool info "$id" --keychain-profile "$NOTARY_PROFILE" 2>&1 \
-            | /usr/bin/awk '/^  status:/ {print $2; exit}')"
+        info="$(xcrun notarytool info "$id" --keychain-profile "$NOTARY_PROFILE" 2>&1 || true)"
+        status="$(/usr/bin/awk '/^  status:/ {print $2; exit}' <<< "$info")"
         case "$status" in
             Accepted) return 0 ;;
             Invalid|Rejected)
@@ -187,8 +187,13 @@ await_notarization() {
                 xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE"
                 return 1 ;;
             "")
-                echo "could not read submission $id — is the keychain profile still there?"
-                echo "  xcrun notarytool store-credentials $NOTARY_PROFILE ..."
+                # Not always the credential: Apple has also dropped a submission
+                # that sat In Progress for hours ("does not exist"), and the
+                # fix for that is a fresh submit, not store-credentials
+                echo "could not read submission $id. notarytool said:"
+                echo "$info" | tail -3
+                echo "a 401 means the keychain profile needs store-credentials;"
+                echo "\"does not exist\" means Apple dropped it: submit the DMG again"
                 return 1 ;;
         esac
         sleep 30
