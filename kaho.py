@@ -4,6 +4,7 @@ locally transcribed text is pasted into the focused app. See DESIGN.md."""
 import collections
 import ctypes
 import difflib
+import fcntl
 import json
 import math
 import multiprocessing
@@ -12,6 +13,7 @@ import platform
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -107,6 +109,10 @@ MODEL_REPO = "mlx-community/Qwen3-ASR-1.7B-8bit"
 # Accessibility permissions.
 MODEL_REVISION = "a8379a2e2f9e313c9292cdf1af4055ab56d50d55"
 MODEL_SIZE_LABEL = "~2.3 GB"
+# Exact size of that pinned revision, so the first run can show a real
+# percentage. A tester waited two minutes on a bare "…" and took the app for
+# dead. Re-measure when MODEL_REVISION changes.
+MODEL_DOWNLOAD_BYTES = 2_467_859_030
 # The Instruct-2507 (non-thinking) variant: the 1.7B model echoed long rambly
 # transcripts back unchanged in clean mode, and thinking-mode Qwen3 burned 7+
 # seconds per dictation. 4B-Instruct rewrites reliably in ~0.3-0.8s on M-series.
@@ -366,6 +372,21 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 APP_VERSION = "2.4.0"
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+# One Kaho per user. A tester reopened Kaho to "apply" the Accessibility grant
+# without quitting it, and two copies then recorded, transcribed and tried to
+# paste every dictation. flock is released by the kernel when a process dies,
+# so a crash can never leave the app locked out.
+INSTANCE_LOCK_PATH = os.path.join(SUPPORT_DIR, "instance.lock")
+# Touched by relaunch(). The replacement starts while this copy is still
+# exiting, so for a few seconds the lock being held means "handover", not
+# "another Kaho is running".
+RELAUNCH_MARKER_PATH = os.path.join(SUPPORT_DIR, "relaunching")
+LOCK_HANDOVER_SECONDS = 8
+SHOW_NOTIFICATION = "com.utsavanand.kaho.show"
+# How long after opening Privacy Settings an ungranted permission stops
+# looking like "still clicking" and starts looking like a stale entry: one
+# left by an older or moved copy, which macOS shows switched on but ignores.
+STALE_GRANT_SECONDS = 45
 
 jobs = queue.Queue()
 audio_ops = queue.Queue()  # serialized PortAudio operations, see audio_control()
@@ -391,7 +412,14 @@ overlay = None
 history_win = None
 settings_win = None
 status_item = None  # StatusItem delegate, so windows can refresh the menu
+permission_win = None
 locked = False
+# True from launch until Accessibility is granted. While it is, the hotkey
+# monitor never fires and paste is refused, so the menu bar says so.
+needs_accessibility = False
+# (bytes so far, total) during the first-run model download, else None
+download_progress = None
+instance_lock = None  # the held lock file descriptor; see acquire_instance_lock
 # Bumped by Escape. A job carries the value it was queued with; when they no
 # longer match, the result is dropped instead of pasted. MLX inference is one
 # blocking call that cannot be interrupted, so cancelling suppresses the paste
@@ -856,31 +884,208 @@ def audio_stalling():
     return started is not None and time.monotonic() - started > WEDGE_SECONDS / 6
 
 
-def relaunch():
-    """Quit and start a fresh copy.
-
-    The only way out of a wedged audio device: PortAudio's stop can block
-    forever inside CoreAudio (observed in FinishStoppingStream after a long
-    dictation), and that thread cannot be interrupted from here.
-    """
-    # NOT NSBundle.mainBundle(): the process runs out of Homebrew's
+def bundle_path():
+    """The Kaho.app this code runs from (it may not end in .app from source)."""
+    # NOT NSBundle.mainBundle(): a source install runs out of Homebrew's
     # Python.app, so that returns the Python framework and reopening it does
     # nothing at all — the app would quit and never come back. This file
-    # lives in Kaho.app/Contents/Resources, so walk up to the bundle.
+    # lives in Kaho.app/Contents/Resources (Contents/Frameworks when frozen),
+    # so walk up to the bundle.
     resources = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.dirname(os.path.dirname(resources))
+    return os.path.dirname(os.path.dirname(resources))
+
+
+def relaunch(target=None, reason="to clear the wedged audio device"):
+    """Quit and start a fresh copy — of this bundle, or of `target`.
+
+    First written as the only way out of a wedged audio device: PortAudio's
+    stop can block forever inside CoreAudio (observed in FinishStoppingStream
+    after a long dictation), and that thread cannot be interrupted from here.
+    Also used once Accessibility is granted and after moving to Applications.
+    """
+    path = target or bundle_path()
     if not path.endswith(".app"):
         log(f"not running from an app bundle ({path}) — quit and start it again by hand")
         AppKit.NSApp.terminate_(None)
         return
+    try:
+        with open(RELAUNCH_MARKER_PATH, "w"):
+            pass
+    except OSError:
+        pass  # without it the replacement waits less; it still starts
     # `open -n` after a delay: the replacement has to start once this copy is
     # gone, or macOS just activates the dying instance instead of launching one
     subprocess.Popen(
         ["/bin/sh", "-c", f'sleep 1; open -n "{path}"'],
         start_new_session=True,
     )
-    log(f"relaunching {path} to clear the wedged audio device")
+    log(f"relaunching {path} {reason}")
     AppKit.NSApp.terminate_(None)
+
+
+def relaunch_pending(now=None):
+    """True if a relaunch started in the last few seconds (see RELAUNCH_MARKER_PATH)."""
+    try:
+        age = (now or time.time()) - os.path.getmtime(RELAUNCH_MARKER_PATH)
+    except OSError:
+        return False
+    return age < LOCK_HANDOVER_SECONDS * 2
+
+
+def acquire_instance_lock(path, wait=0.0):
+    """Hold the single-instance lock: the open file descriptor, or None if
+    another Kaho holds it for longer than `wait` seconds."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.2)
+
+
+def classify_location(bundle, home):
+    """Where the app is running from: applications, translocated, disk image
+    or elsewhere. Only the first keeps its permissions reliably."""
+    if "/AppTranslocation/" in bundle:
+        # Gatekeeper runs a quarantined app that was never moved from a
+        # random read-only path, and a grant made there doesn't follow it
+        return "translocated"
+    if bundle.startswith("/Volumes/"):
+        return "disk image"
+    for apps in ("/Applications/", os.path.join(home, "Applications") + "/"):
+        if bundle.startswith(apps):
+            return "applications"
+    return "elsewhere"
+
+
+def translocated_original(path):
+    """Where a translocated bundle really lives, or None if it can't be told.
+
+    Security.framework's SecTranslocate SPI — what Sparkle and LetsMove use;
+    there is no public API for this.
+    """
+    try:
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        sec = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+        cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+        cf.CFURLGetFileSystemRepresentation.restype = ctypes.c_bool
+        cf.CFURLGetFileSystemRepresentation.argtypes = [
+            ctypes.c_void_p, ctypes.c_bool, ctypes.c_char_p, ctypes.c_long]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        sec.SecTranslocateCreateOriginalPathForURL.restype = ctypes.c_void_p
+        sec.SecTranslocateCreateOriginalPathForURL.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        raw = path.encode()
+        url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), True)
+        if not url:
+            return None
+        original = sec.SecTranslocateCreateOriginalPathForURL(url, None)
+        cf.CFRelease(url)
+        if not original:
+            return None
+        buf = ctypes.create_string_buffer(4096)
+        ok = cf.CFURLGetFileSystemRepresentation(original, True, buf, len(buf))
+        cf.CFRelease(original)
+        return buf.value.decode() if ok else None
+    except (OSError, AttributeError):
+        return None
+
+
+def trash(path):
+    """Move to the Trash — never delete: an older Kaho.app may be one the
+    user wants back."""
+    ok, _, error = AppKit.NSFileManager.defaultManager().trashItemAtURL_resultingItemURL_error_(
+        AppKit.NSURL.fileURLWithPath_(path), None, None
+    )
+    if not ok:
+        raise OSError(f"could not move {path} to the Trash: {error}")
+
+
+APPLICATIONS_DIRS = ("/Applications", "~/Applications")
+
+
+def copy_to_applications(source, destinations=APPLICATIONS_DIRS):
+    """Copy the bundle into Applications and return where it went, or None.
+
+    /Applications first, ~/Applications for accounts that can't write
+    there. Quarantine is cleared on the copy: Gatekeeper already assessed
+    this notarized app, and a still-quarantined copy that was never moved by
+    the Finder gets translocated all over again.
+    """
+    for apps in destinations:
+        apps = os.path.expanduser(apps)
+        dest = os.path.join(apps, "Kaho.app")
+        try:
+            os.makedirs(apps, exist_ok=True)
+            if os.path.exists(dest):
+                if os.path.realpath(dest) == os.path.realpath(source):
+                    return dest
+                trash(dest)
+            subprocess.run(["ditto", source, dest], check=True, capture_output=True, timeout=180)
+            subprocess.run(["xattr", "-dr", "com.apple.quarantine", dest],
+                           check=False, capture_output=True, timeout=60)
+            return dest
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"could not copy Kaho into {apps}: {e}")
+    return None
+
+
+LOCATION_DESCRIPTIONS = {
+    "translocated": "a temporary copy macOS made of the download",
+    "disk image": "the disk image",
+}
+
+
+def check_install_location():
+    """Offer to move a downloaded Kaho into Applications, before anything
+    asks for a permission. Returns True when this copy is quitting so the
+    moved one can start.
+
+    Only the frozen app: a source install is built straight into
+    /Applications by install.sh.
+    """
+    if not getattr(sys, "frozen", False):
+        return False
+    bundle = bundle_path()
+    where = classify_location(bundle, os.path.expanduser("~"))
+    if where == "applications":
+        return False
+    source = (translocated_original(bundle) if where == "translocated" else None) or bundle
+    log(f"running from {where} ({source}) — offering to move to Applications")
+    described = LOCATION_DESCRIPTIONS.get(where, os.path.dirname(source))
+    choice = run_alert(
+        "Move Kaho to Applications?",
+        f"Kaho is running from {described}. macOS ties Kaho's permissions to "
+        "where the app lives, so a copy run from here can lose them and stop "
+        "pasting.\n\nKaho will copy itself to Applications and reopen from there.",
+        ["Move to Applications", "Not Now"],
+    )
+    if choice != 0:
+        log("move to Applications declined — continuing from here")
+        return False
+    dest = copy_to_applications(source)
+    if dest:
+        relaunch(dest, "from Applications")
+        return True
+    choice = run_alert(
+        "Kaho couldn't move itself",
+        "Drag Kaho into the Applications folder yourself, then open it from "
+        "there. It will keep its permissions once it lives in Applications.",
+        ["Show Kaho", "Open Applications", "Not Now"],
+    )
+    if choice == 0:
+        AppKit.NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_(
+            [AppKit.NSURL.fileURLWithPath_(source)]
+        )
+    elif choice == 1:
+        subprocess.run(["open", "/Applications"], check=False)
+    return False
 
 
 def start_screen_read(session):
@@ -1761,7 +1966,9 @@ def run_job(audio, generation, spans, released, t0, session=None):
             set_clipboard(text)
             append_history(text)
             log(f"paste blocked: {reason} — transcript is on the clipboard")
-            AppHelper.callAfter(overlay.blocked)
+            AppHelper.callAfter(overlay.showProblem_, blocked_pill_text(reason))
+            if "Accessibility" in reason:
+                AppHelper.callAfter(accessibility_lost)
     else:
         AppHelper.callAfter(overlay.hideStale_)
     last_inference = time.monotonic()
@@ -1820,6 +2027,60 @@ def worker():
             job_outstanding = False
 
 
+def download_percent(done, total):
+    # 99 until the call returns: the blob directory can also hold leftovers
+    # from other revisions, so bytes on disk can pass the total early
+    return min(99, int(done * 100 / total)) if total else 0
+
+
+def format_download(done, total):
+    return (f"Downloading speech model… {download_percent(done, total)}% "
+            f"({done / 1e9:.1f} of {total / 1e9:.1f} GB)")
+
+
+# snapshot_download's network-bytes bar (hub 1.x). Its bytes-written bar only
+# moves when a whole file finishes, and the cache folder can't be watched
+# either: with hf-xet the large files appear only once complete, so both sat
+# at 0% for most of a two-minute download.
+DOWNLOAD_BAR_NAME = "huggingface_hub.snapshot_download.transfer"
+
+
+def download_model():
+    """The model snapshot, publishing download progress for the menu bar.
+
+    Returns (path, downloaded): downloaded is False on a cache hit.
+    """
+    global download_progress
+    from huggingface_hub.utils import tqdm as hf_tqdm
+
+    written = [0]
+
+    class ToMenu(hf_tqdm):
+        """huggingface_hub's own bar class, so its thread pool keeps working,
+        also feeding the bytes it reports into the menu bar."""
+
+        def __init__(self, *args, **kwargs):
+            self.to_menu = kwargs.get("name") == DOWNLOAD_BAR_NAME
+            super().__init__(*args, **kwargs)
+
+        def update(self, n=1):
+            # Before super(): a bar with no terminal is disabled, and a
+            # disabled tqdm ignores updates
+            if self.to_menu and n:
+                global download_progress
+                written[0] += int(n)
+                download_progress = (written[0], MODEL_DOWNLOAD_BYTES)
+            return super().update(n)
+
+    try:
+        path = huggingface_hub.snapshot_download(
+            MODEL_REPO, revision=MODEL_REVISION, tqdm_class=ToMenu
+        )
+    finally:
+        download_progress = None
+    return path, written[0] > 0
+
+
 def backend():
     global state, input_device, input_name, last_inference
     # Without this boundary a failed download/device/model init leaves the
@@ -1830,13 +2091,17 @@ def backend():
         log(f"mic: {input_name}")
         log(f"loading {MODEL_REPO}@{MODEL_REVISION[:8]} (first run downloads {MODEL_SIZE_LABEL})...")
         t0 = time.monotonic()
-        asr = load_model(huggingface_hub.snapshot_download(MODEL_REPO, revision=MODEL_REVISION))
+        path, downloaded = download_model()
+        asr = load_model(path)
         # Warmup on silence: pays model load + Metal kernel compilation now
         # instead of on the first real dictation
         transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), use_dictionary=False)
         last_inference = time.monotonic()
         log(f"model ready in {time.monotonic() - t0:.1f}s — hold {hotkey_label()} to dictate")
         state = "ready"
+        if downloaded and not needs_accessibility:
+            # After minutes of a progress counter, say plainly that it's done
+            AppHelper.callAfter(overlay.announce_, "Ready to dictate")
         threading.Thread(target=worker, daemon=True).start()
         if settings["rewrite"] != "off":
             ensure_rewriter()
@@ -1876,22 +2141,181 @@ def run_alert(title, text, buttons):
     return alert.runModal() - AppKit.NSAlertFirstButtonReturn
 
 
-def prompt_missing_permissions():
-    """Trigger the native macOS permission prompt, then explain the relaunch."""
-    if Quartz.CGPreflightPostEventAccess():
+def accessibility_state(trusted, opened_at, now):
+    """granted, waiting, or stale — stale once Privacy Settings has been open
+    for a while without the grant taking, the signature of an entry left by
+    an older or moved copy that macOS shows switched on but ignores."""
+    if trusted:
+        return "granted"
+    if opened_at is not None and now - opened_at >= STALE_GRANT_SECONDS:
+        return "stale"
+    return "waiting"
+
+
+def blocked_pill_text(reason):
+    """The pill's few words for why a paste didn't land. The transcript is on
+    the clipboard either way, hence the ⌘V."""
+    if "Accessibility" in reason:
+        return "Needs Accessibility · ⌘V"
+    if "secure input" in reason:
+        return "Secure input on · ⌘V"
+    return PHASE_LABELS["blocked"]
+
+
+def watch_accessibility():
+    """Ask for Accessibility, and restart into it the moment it's granted.
+
+    Replaces a modal alert that told the user to quit and reopen: it blocked
+    the model download until dismissed, and users reopened without quitting,
+    which started a second copy. The system prompt only appears once per
+    app, so the window explains it every time.
+    """
+    global needs_accessibility
+    if needs_accessibility or Quartz.CGPreflightPostEventAccess():
         return
+    needs_accessibility = True
     Quartz.CGRequestPostEventAccess()
-    log("missing permission: Accessibility")
-    choice = run_alert(
-        "Kaho needs the Accessibility permission",
-        "Accessibility lets Kaho see the hotkey and paste the transcribed "
-        "text.\n\nEnable Kaho in System Settings > Privacy & Security > "
-        "Accessibility (it may be listed as \"Python\"), then quit Kaho from "
-        "the 🎙 menu and open it again — grants only apply on a fresh launch.",
-        ["Open System Settings", "Later"],
-    )
-    if choice == 0:
-        AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(SETTINGS_URL))
+    log("missing permission: Accessibility — waiting for it, checking every second")
+    permission_win.show()
+    permission_win.startWatching()
+
+
+def show_yourself():
+    """What another launch, or a click on the Dock icon, brings up."""
+    if needs_accessibility:
+        permission_win.show()
+    else:
+        history_win.show()
+
+
+PERMISSION_TEXT = {
+    "waiting": (
+        "Allow Kaho to type for you",
+        (
+            "Kaho pastes your words into other apps, which macOS only allows "
+            "with the Accessibility permission.\n\nClick Open Privacy Settings "
+            "and switch Kaho on. Kaho notices straight away and restarts "
+            "itself; there's nothing else to do."
+        ),
+    ),
+    "stale": (
+        "Kaho still can't paste",
+        (
+            "macOS hasn't given Kaho access yet. If Kaho already shows as "
+            "switched on, that entry belongs to an older or moved copy of "
+            "Kaho.\n\nSelect Kaho in the list and click −, then click + and "
+            "choose Kaho in your Applications folder."
+        ),
+    ),
+}
+
+
+class PermissionWindow(AppKit.NSObject):
+    """Explains the Accessibility permission, and watches for it.
+
+    A window rather than an alert: runModal() starves every NSTimer in the
+    process, including the one that notices the grant.
+    """
+
+    def show(self):
+        if not getattr(self, "window", None):
+            self.buildWindow()
+        self.applyMode()
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+        self.window.makeKeyAndOrderFront_(None)
+
+    def buildWindow(self):
+        mask = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable
+        window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            ((0, 0), (460, 230)), mask, AppKit.NSBackingStoreBuffered, False
+        )
+        window.setTitle_("Kaho")
+        window.setReleasedWhenClosed_(False)
+        window.setLevel_(AppKit.NSFloatingWindowLevel)
+        window.center()
+        content = window.contentView()
+        self.heading = make_label("", 24, 186, 15, bold=True)
+        self.body = AppKit.NSTextField.wrappingLabelWithString_("")
+        self.body.setFrame_(((24, 62), (412, 116)))
+        self.body.setFont_(AppKit.NSFont.systemFontOfSize_(13))
+        self.primary = AppKit.NSButton.buttonWithTitle_target_action_(
+            "Open Privacy Settings", self, "openSettings:"
+        )
+        self.primary.setFrame_(((266, 16), (176, 32)))
+        self.primary.setKeyEquivalent_("\r")
+        self.secondary = AppKit.NSButton.buttonWithTitle_target_action_(
+            "Show Kaho in Finder", self, "revealApp:"
+        )
+        self.secondary.setFrame_(((106, 16), (160, 32)))
+        self.restartButton = AppKit.NSButton.buttonWithTitle_target_action_(
+            "Restart Kaho", self, "restartKaho:"
+        )
+        self.restartButton.setFrame_(((14, 16), (96, 32)))
+        for view in (self.heading, self.body, self.primary, self.secondary, self.restartButton):
+            content.addSubview_(view)
+        self.window = window
+
+    def applyMode(self):
+        mode = getattr(self, "mode", "waiting")
+        heading, body = PERMISSION_TEXT[mode]
+        self.heading.setStringValue_(heading)
+        self.body.setStringValue_(body)
+        # Recovery buttons only once the simple path has had its chance
+        self.secondary.setHidden_(mode != "stale")
+        self.restartButton.setHidden_(mode != "stale")
+
+    def startWatching(self):
+        if getattr(self, "timer", None):
+            return
+        self.opened_at = None
+        self.mode = "waiting"
+        self.timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0, self, "tick:", None, True
+        )
+
+    def tick_(self, _timer):
+        st = accessibility_state(
+            Quartz.CGPreflightPostEventAccess(), getattr(self, "opened_at", None), time.monotonic()
+        )
+        if st == "granted":
+            self.timer.invalidate()
+            self.timer = None
+            log("Accessibility granted")
+            # The hotkey monitor was installed while untrusted and does not
+            # start firing on its own; a fresh process picks the grant up
+            relaunch(reason="so the new Accessibility permission takes effect")
+        elif st == "stale" and getattr(self, "mode", "waiting") != "stale":
+            self.mode = "stale"
+            log(f"Accessibility still missing {STALE_GRANT_SECONDS}s after opening "
+                "Privacy Settings — showing the remove-and-re-add steps")
+            self.show()
+            if status_item:
+                status_item.rebuildMenu()
+
+    def openSettings_(self, _sender):
+        open_privacy_settings()
+
+    def revealApp_(self, _sender):
+        AppKit.NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_(
+            [AppKit.NSURL.fileURLWithPath_(bundle_path())]
+        )
+
+    def restartKaho_(self, _sender):
+        relaunch(reason="to pick up the Accessibility permission")
+
+
+def open_privacy_settings():
+    if permission_win and getattr(permission_win, "opened_at", None) is None:
+        permission_win.opened_at = time.monotonic()
+    AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(SETTINGS_URL))
+
+
+def accessibility_lost():
+    """A paste was refused for want of Accessibility: say so and fix it,
+    whether it was never granted or revoked while Kaho was running."""
+    watch_accessibility()
+    if needs_accessibility:
+        permission_win.show()
 
 
 def status_item_onscreen():
@@ -1925,6 +2349,7 @@ PHASE_LABELS = {
     "blocked": "Not pasted — ⌘V",
     "wedged": "Mic stuck — Restart Kaho",
     "instructing": "Instruction…",
+    "ready": "Ready to dictate",
 }
 
 # Secure input (password fields, Terminal's "Secure Keyboard Entry", sudo
@@ -1995,9 +2420,10 @@ def draw_phase(phase, ticks, bounds, message=None):
     # Three dots cycling left-to-right: cheap to draw, reads as "working"
     # without a spinner's implication of a known duration
     r, g, b = ((1.0, 0.72, 0.30) if phase in ("blocked", "wedged", "instructing")
+               else (0.40, 0.85, 0.52) if phase == "ready"
                else (0.48, 0.64, 0.97))
     for i in range(3):
-        alpha = 0.9 if phase in ("done", "blocked", "wedged") else 0.25 + 0.65 * (
+        alpha = 0.9 if phase in ("done", "blocked", "wedged", "ready") else 0.25 + 0.65 * (
             0.5 + 0.5 * np.sin(ticks * 0.28 - i * 0.9)
         )
         AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, alpha).setFill()
@@ -2063,10 +2489,7 @@ class Overlay(AppKit.NSObject):
         if self.done_timer:
             self.done_timer.invalidate()
             self.done_timer = None
-        screen = AppKit.NSScreen.mainScreen().frame()
-        w, h = OVERLAY_SIZE
-        x = screen.origin.x + (screen.size.width - w) / 2
-        self.panel.setFrame_display_(((x, screen.origin.y + 110), (w, h)), True)
+        self.place()
         self.view.levels = []
         self.view.phase = "recording"
         self.view.started = time.monotonic()
@@ -2074,6 +2497,14 @@ class Overlay(AppKit.NSObject):
         self.displayed = 0.0
         self.panel.orderFrontRegardless()
         self.startTimer()
+
+    def place(self):
+        """Bottom-centre of the main screen. Also before an announcement: on
+        a first launch nothing has positioned the pill yet."""
+        screen = AppKit.NSScreen.mainScreen().frame()
+        w, h = OVERLAY_SIZE
+        x = screen.origin.x + (screen.size.width - w) / 2
+        self.panel.setFrame_display_(((x, screen.origin.y + 110), (w, h)), True)
 
     def startTimer(self):
         if self.timer:
@@ -2089,7 +2520,7 @@ class Overlay(AppKit.NSObject):
         tolerate arriving after hide() — a fast dictation can finish before
         the phase change is delivered.
         """
-        if phase != "blocked":
+        if phase not in ("blocked", "ready"):
             # Cleared here rather than in hide(): a message that outlived its
             # phase would caption the next recording
             self.view.message = None
@@ -2154,10 +2585,15 @@ class Overlay(AppKit.NSObject):
             3.5, self, "hideTimer:", None, False
         )
 
-    def blocked(self):
-        """Warn that the transcript did not paste. Lingers longer than the
-        "Pasted" flash — this one the user genuinely needs to read."""
-        self.setPhase_("blocked")
+    def announce_(self, message):
+        """Show a one-off status, such as "Ready to dictate" after the first
+        download. Same lifetime as showProblem_, in green rather than amber."""
+        if state == "recording":
+            return
+        self.place()
+        self.view.message = message
+        self.setPhase_("ready")
+        self.panel.orderFrontRegardless()
         if self.done_timer:
             self.done_timer.invalidate()
         self.done_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
@@ -2763,13 +3199,42 @@ def build_submenu(target, title, entries, selected, action):
     return parent
 
 
+def status_title():
+    """Menu bar glyph. A missing permission outranks everything but a live
+    recording, and a first-run download shows its progress instead of "…"."""
+    if needs_accessibility and state != "recording":
+        return "⚠️"
+    if state == "loading" and download_progress:
+        return f"↓{download_percent(*download_progress)}%"
+    return TITLES[state]
+
+
+def status_line():
+    """The menu's first line while Kaho can't dictate yet; None once it can."""
+    if state == "loading":
+        if download_progress:
+            return format_download(*download_progress)
+        return "Loading the speech model…"
+    if state == "error":
+        return "Kaho couldn't start — see Open Log"
+    return None
+
+
+def permission_menu_title():
+    if permission_win and getattr(permission_win, "mode", "waiting") == "stale":
+        return "Kaho still can't paste — see how to fix it…"
+    return "Allow Accessibility to start dictating…"
+
+
 class StatusItem(AppKit.NSObject):
     def refresh_(self, _timer):
         button = self.item.button()
-        if button.title() != TITLES[state]:
-            button.setTitle_(TITLES[state])
-        if self.menu_version != history_version:
-            self.menu_version = history_version
+        title = status_title()
+        if button.title() != title:
+            button.setTitle_(title)
+        key = (history_version, status_line(), needs_accessibility)
+        if self.menu_key != key:
+            self.menu_key = key
             self.rebuildMenu()
         self.ticks += 1
         # `is not True` rather than `is False`: status_item_onscreen() returns
@@ -2791,6 +3256,20 @@ class StatusItem(AppKit.NSObject):
 
     def rebuildMenu(self):
         menu = AppKit.NSMenu.alloc().init()
+        # What's in the way of dictating comes first, where it can't be missed
+        if needs_accessibility:
+            fix = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                permission_menu_title(), "allowAccessibility:", ""
+            )
+            fix.setTarget_(self)
+            menu.addItem_(fix)
+            menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        line = status_line()
+        if line:
+            note = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(line, None, "")
+            note.setEnabled_(False)
+            menu.addItem_(note)
+            menu.addItem_(AppKit.NSMenuItem.separatorItem())
         if history:
             for stamp, text in history:
                 label = text if len(text) <= 60 else text[:57] + "…"
@@ -2928,8 +3407,12 @@ class StatusItem(AppKit.NSObject):
             )
             AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(url))
 
+    def allowAccessibility_(self, _sender):
+        open_privacy_settings()
+        permission_win.show()
+
     def restart_(self, _sender):
-        relaunch()
+        relaunch(reason="from the menu")
 
     def quit_(self, _sender):
         AppKit.NSApp.terminate_(None)
@@ -2940,8 +3423,13 @@ class AppDelegate(AppKit.NSObject):
     # here — show the history window, since the menu bar icon can be hidden
     # behind the notch on a crowded menu bar
     def applicationShouldHandleReopen_hasVisibleWindows_(self, _app, _has_windows):
-        history_win.show()
+        show_yourself()
         return False
+
+    # Another launch found this copy holding the instance lock and quit
+    def otherLaunch_(self, _note):
+        log("another launch asked this copy to show itself")
+        show_yourself()
 
 
 def install_status_item():
@@ -2951,7 +3439,7 @@ def install_status_item():
     )
     item.button().setTitle_(TITLES[state])
     delegate.item = item
-    delegate.menu_version = -1  # forces the first rebuildMenu from refresh_
+    delegate.menu_key = None  # forces the first rebuildMenu from refresh_
     delegate.ticks = 0
     timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.3, delegate, "refresh:", None, True
@@ -2983,9 +3471,22 @@ def migrate_sotto_support_dir():
 
 
 def main():
-    global overlay, history_win, settings_win, status_item
+    global overlay, history_win, settings_win, status_item, permission_win, instance_lock
     migrate_sotto_support_dir()
     os.makedirs(SUPPORT_DIR, exist_ok=True)
+    instance_lock = acquire_instance_lock(
+        INSTANCE_LOCK_PATH, wait=LOCK_HANDOVER_SECONDS if relaunch_pending() else 0
+    )
+    if instance_lock is None:
+        AppKit.NSDistributedNotificationCenter.defaultCenter().postNotificationName_object_userInfo_deliverImmediately_(
+            SHOW_NOTIFICATION, None, None, True
+        )
+        log("Kaho is already running — asked it to show itself, and quitting this copy")
+        return
+    try:
+        os.remove(RELAUNCH_MARKER_PATH)
+    except OSError:
+        pass
     ensure_dictionary_file()
     # Migrate transcript files created by older versions to private mode;
     # _private_opener only covers newly created files
@@ -3003,6 +3504,13 @@ def main():
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
     delegate = AppDelegate.alloc().init()
     app.setDelegate_(delegate)
+    AppKit.NSDistributedNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+        delegate, "otherLaunch:", SHOW_NOTIFICATION, None
+    )
+    # Before any permission is asked for: a grant made for a copy running
+    # from the download doesn't follow it into Applications
+    if check_install_location():
+        return
     load_settings()
     load_history()
     refs = install_status_item()  # tuple keeps the AppKit objects alive
@@ -3011,10 +3519,13 @@ def main():
     overlay.build()
     history_win = HistoryWindow.alloc().init()
     settings_win = SettingsWindow.alloc().init()
+    permission_win = PermissionWindow.alloc().init()
     threading.Thread(target=audio_control, daemon=True).start()
     install_hotkey_monitors()
-    prompt_missing_permissions()
+    # The download starts before the permission prompt, not after it: the
+    # old modal alert held the 2.3 GB download until it was dismissed
     threading.Thread(target=backend, daemon=True).start()
+    watch_accessibility()
     AppHelper.runEventLoop()
 
 

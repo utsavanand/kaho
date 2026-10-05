@@ -1,5 +1,8 @@
 # Generated from a clean venv resolve of requirements.txt on 2026-09-29.
 # Regenerate: pip download -r <(pip freeze) then hash each artifact.
+# mlx and mlx-metal also carry the hash of their macosx_14_0 wheel: the
+# release build pins that platform (see packaging/release.sh) so the DMG
+# runs on macOS 14, while a source install keeps the host's own wheel.
 annotated-doc==0.0.5 \
     --hash=sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101
 anyio==4.14.2 \
@@ -37,13 +40,15 @@ mdurl==0.1.2 \
 miniaudio==1.71 \
     --hash=sha256:d9dc15eff711bcfc62a9d05e0c78e4bc34821a455595e049629f2fea7491a523
 mlx==0.32.2 \
-    --hash=sha256:daebf84dfb857d70e87b1b98189a057e691e99a4a2b9f6f64cadebad917f8964
+    --hash=sha256:daebf84dfb857d70e87b1b98189a057e691e99a4a2b9f6f64cadebad917f8964 \
+    --hash=sha256:65d3d29b66045ed8dd2d8e437c8770de325843c364f7b7c38cd8ae90a7eec854
 mlx-audio==0.5.7 \
     --hash=sha256:2f2b3c666241ff4a45df7e92057d176b3c1079541a5e9062a0d1e8088db5c123
 mlx-lm==0.31.3 \
     --hash=sha256:758cfddf1180053b7613db76fad3d246a331a2a905808e1164a275621fc983b8
 mlx-metal==0.32.2 \
-    --hash=sha256:55a369250d220b2cf10213a87a2ac1b1a420608c5b35b1df4e7147ac8e32f121
+    --hash=sha256:55a369250d220b2cf10213a87a2ac1b1a420608c5b35b1df4e7147ac8e32f121 \
+    --hash=sha256:3825fff379dbc107dd3413e564a06caeaa24819910ec49c0439e454c06a1b9b8
 numpy==2.5.2 \
     --hash=sha256:29d81e97f668489cba8ebfd796b9bdd453525d35dd9e162e2daec94bf3fc7740
 packaging==26.3 \

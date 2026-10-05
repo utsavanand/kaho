@@ -9,67 +9,105 @@
 #   1. developer.apple.com -> Certificates -> "+" -> Developer ID Application
 #      Install the downloaded .cer by double-clicking it.
 #   2. appleid.apple.com -> Sign-In and Security -> App-Specific Passwords
-#   3. xcrun notarytool store-credentials kaho-notary \
+#   3. xcrun notarytool store-credentials kaho-fresh \
 #        --apple-id "you@example.com" --team-id "TEAMID" --password "app-specific-password"
 #
 # Then:  ./packaging/release.sh 2.0.0
+#        ./packaging/release.sh 2.0.0 --build-only   # stop after the bundle checks, unsigned
 
 set -euo pipefail
 
 VERSION="${1:-}"
-[[ -n "$VERSION" ]] || { echo "usage: $0 <version>   e.g. $0 2.0.0"; exit 1; }
+[[ -n "$VERSION" ]] || { echo "usage: $0 <version> [--build-only]   e.g. $0 2.0.0"; exit 1; }
+BUILD_ONLY="${2:-}"
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$SRC/build-release"
+VENV="$SRC/build-venv"
+# The interpreter is bundled, so it sets the oldest macOS the app runs on.
+# Homebrew builds Python for the Mac it is installed on: 2.2.0 was built on
+# macOS 15 and shipped a Python (and an mlx wheel) that needs 15, so on a
+# macOS 14 MacBook Air it died at launch, before showing a single prompt —
+# while Info.plist still claimed 14. python.org's installer targets macOS 11.
+PYTHON_ORG="/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
+MIN_MACOS="$(sed -nE 's/.*"LSMinimumSystemVersion": "([0-9.]+)".*/\1/p' "$SRC/packaging/Kaho.spec")"
+[[ -n "$MIN_MACOS" ]] || { echo "could not read LSMinimumSystemVersion from packaging/Kaho.spec"; exit 1; }
 # Named for this app, not shared. The profile was called "sotto-notary" through
 # 2.1.0, which another project on this machine also used — each store-credentials
 # overwrote the other, and notarization then failed with "No Keychain password
 # item found" on a profile that had existed minutes earlier.
-NOTARY_PROFILE="${KAHO_NOTARY_PROFILE:-kaho-notary}"
+NOTARY_PROFILE="${KAHO_NOTARY_PROFILE:-kaho-fresh}"
 
 # Resolve the Developer ID automatically: hardcoding it means every machine
-# needs an edit, and the hash changes when the certificate is renewed
+# needs an edit, and the hash changes when the certificate is renewed.
+# grep finding nothing must not trip pipefail: --build-only runs without a
+# certificate, and without one the message below has to be reached.
 IDENTITY="$(security find-identity -v -p codesigning \
-    | grep "Developer ID Application" \
+    | { grep "Developer ID Application" || true; } \
     | head -1 \
     | sed -E 's/.*"(.*)"/\1/')"
-if [[ -z "$IDENTITY" ]]; then
+if [[ -z "$IDENTITY" && "$BUILD_ONLY" != "--build-only" ]]; then
     echo "No 'Developer ID Application' certificate found in the keychain."
     echo "Create one at developer.apple.com > Certificates, then double-click the .cer."
     exit 1
 fi
-echo "signing as: $IDENTITY"
+echo "signing as: ${IDENTITY:-(none, --build-only)}"
 
-# PyInstaller bundles whatever is importable in the venv, not what the lock
-# says. A package the lock dropped stays installed until something removes
-# it — 2.2.0 replaced Whisper with mlx-audio, and a stale torch left behind
-# from before silently went on shipping, making the app 575 MB larger than
-# the release notes claimed.
-echo "==> checking the build venv matches the lock"
-EXTRA="$("$SRC/.venv/bin/pip" list --format=freeze 2>/dev/null \
-    | cut -d= -f1 | tr 'A-Z_' 'a-z-' | sort -u \
-    | comm -23 - <(grep -oE '^[A-Za-z0-9._-]+' "$SRC/requirements.lock" \
-        | tr 'A-Z_' 'a-z-' | sort -u) \
-    | grep -vxE 'pip|setuptools|wheel|pyinstaller|pyinstaller-hooks-contrib|ruff|altgraph|macholib|packaging|pefile' || true)"
-if [[ -n "$EXTRA" ]]; then
-    echo "The build venv has packages the lock does not list:"
-    echo "$EXTRA" | sed 's/^/  /'
-    echo ""
-    echo "PyInstaller will bundle them. Recreate the venv:"
-    echo "  rm -rf .venv && python3.13 -m venv .venv"
-    echo "  .venv/bin/pip install --require-hashes --no-deps -r requirements.lock"
-    echo "  .venv/bin/pip install pyinstaller ruff"
+if [[ ! -x "$PYTHON_ORG" ]]; then
+    echo "Release builds need python.org's Python 3.13, not Homebrew's."
+    echo "Homebrew's targets the macOS it was installed on, and the bundled"
+    echo "interpreter then refuses to load on anything older."
+    echo "Install the macOS universal2 installer from https://www.python.org/downloads/macos/"
     exit 1
 fi
 
-echo "==> building the bundle"
-rm -rf "$BUILD"
+# A fresh venv every release. PyInstaller bundles whatever is importable, not
+# what the lock says — a stale torch left in the old shared .venv once shipped
+# 575 MB nobody asked for — and the wheels must be the macOS $MIN_MACOS builds,
+# which the host's own pip would never pick on a newer Mac.
+echo "==> creating the release venv (python.org Python, macOS $MIN_MACOS wheels)"
+rm -rf "$BUILD" "$VENV"
 mkdir -p "$BUILD"
-KAHO_VERSION="$VERSION" "$SRC/.venv/bin/pyinstaller" "$SRC/packaging/Kaho.spec" \
+"$PYTHON_ORG" -m venv "$VENV"
+"$VENV/bin/pip" download --quiet --require-hashes --no-deps -r "$SRC/requirements.lock" \
+    --dest "$BUILD/wheels" --platform "macosx_${MIN_MACOS//./_}_arm64" \
+    --python-version 3.13 --implementation cp --abi cp313 --abi abi3 --abi none \
+    --only-binary=:all:
+"$VENV/bin/pip" install --quiet --require-hashes --no-deps --no-index \
+    --find-links "$BUILD/wheels" -r "$SRC/requirements.lock"
+"$VENV/bin/pip" install --quiet pyinstaller
+
+echo "==> building the bundle"
+KAHO_VERSION="$VERSION" "$VENV/bin/pyinstaller" "$SRC/packaging/Kaho.spec" \
     --noconfirm --distpath "$BUILD/dist" --workpath "$BUILD/work" >/dev/null
 
 APP="$BUILD/dist/Kaho.app"
 [[ -d "$APP" ]] || { echo "build produced no app bundle"; exit 1; }
+
+# Info.plist's minimum is a promise the binaries have to keep. LaunchServices
+# checks only the plist, so a dylib built for a newer macOS passes every
+# install step and then kills the app in dyld, with nothing on screen.
+echo "==> checking every binary loads on macOS $MIN_MACOS"
+newer_than() {  # is $1 a later macOS version than $2?
+    awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, ".");
+        exit !(x[1] > y[1] || (x[1] == y[1] && x[2] + 0 > y[2] + 0)) }'
+}
+TOO_NEW=""
+while IFS= read -r -d '' f; do
+    file -b "$f" | grep -q Mach-O || continue
+    minos="$(vtool -arch arm64 -show-build "$f" 2>/dev/null | awk '/minos|version/ {print $2; exit}')"
+    [[ -n "$minos" ]] && newer_than "$minos" "$MIN_MACOS" && TOO_NEW+="  $minos  ${f#$APP/}"$'\n'
+done < <(find "$APP" -type f -print0)
+if [[ -n "$TOO_NEW" ]]; then
+    echo "These need a newer macOS than the $MIN_MACOS Info.plist promises:"
+    printf '%s' "$TOO_NEW"
+    exit 1
+fi
+
+if [[ "$BUILD_ONLY" == "--build-only" ]]; then
+    echo "built and checked, unsigned: $APP"
+    exit 0
+fi
 
 echo "==> signing"
 # The hardened runtime is required for notarization. Python loads compiled
