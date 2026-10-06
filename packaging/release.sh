@@ -159,13 +159,14 @@ STAGE="$BUILD/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"   # drag-to-install target
-# The volume name is deliberately not the bare app name: hdiutil mounts the
-# image at /Volumes/<volname> while building, and under the old name something
-# on this machine held a claim on /Volumes/Sotto that survived a detach — every
-# attempt failed with a bare "Operation not permitted" naming no cause.
-# "Kaho Installer" also reads better in the Finder title bar.
-hdiutil detach "/Volumes/Kaho Installer" -force >/dev/null 2>&1 || true
-hdiutil create -volname "Kaho Installer" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+# The volume name carries the version: hdiutil mounts the image at
+# /Volumes/<volname> while building, and a fixed name stops working once
+# something on this machine holds a claim on it that survives a detach —
+# every attempt then fails with a bare "Operation not permitted" naming no
+# cause. It happened to /Volumes/Sotto, then to /Volumes/Kaho Installer.
+VOLNAME="Kaho $VERSION"
+hdiutil detach "/Volumes/$VOLNAME" -force >/dev/null 2>&1 || true
+hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
 # Poll with short-lived `info` calls rather than one long `notarytool wait`.
@@ -250,9 +251,9 @@ xcrun stapler validate "$APP"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-hdiutil detach "/Volumes/Kaho Installer" -force >/dev/null 2>&1 || true
+hdiutil detach "/Volumes/$VOLNAME" -force >/dev/null 2>&1 || true
 rm -f "$DMG"
-hdiutil create -volname "Kaho Installer" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
 # The rebuilt image is a new file, so it needs its own trip through the
