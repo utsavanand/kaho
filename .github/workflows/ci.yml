@@ -61,7 +61,7 @@ jobs:
       # happened three times in this codebase.
       - name: import under real PyObjC
         run: |
-          pip install --quiet pyobjc-framework-Cocoa pyobjc-framework-Quartz
+          pip install --quiet pyobjc-framework-Cocoa pyobjc-framework-Quartz pyobjc-framework-ApplicationServices
           python - <<'EOF'
           import sys, types, unittest.mock as mock
           for name in ("mlx_audio", "mlx_audio.stt", "mlx_audio.stt.utils",
