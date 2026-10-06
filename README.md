@@ -34,10 +34,14 @@ telemetry.
   know what it's doing
 - **Dictionary** — list your names, products, and jargon; the model stops
   guessing "cow" for "Kaho"
+- **Words on screen** — names already in the window you're dictating into
+  (the Slack thread, the email, the PR) are spelled the way that window
+  spells them, with nothing added to the dictionary. Read in memory when you
+  press the hotkey, used for that one dictation, then discarded
 - **On-device** — audio never leaves the machine; works offline. (Optional:
   point the *rewrite* step at a cloud model with your own key — transcript
   only, never audio.)
-- **Small** — one Python file, seven dependencies
+- **Small** — one Python file, eight dependencies
 
 ## The menu
 
@@ -48,6 +52,10 @@ log, and one-click bug reports:
 
 - **Settings…** — a real window (⌘,) for hotkey, trigger, language and rewrite
 - **Edit Dictionary…** — names and jargon the model should spell your way
+- **Use Words on Screen** — on by default; untick it (here or in Settings) to
+  stop Kaho reading the focused window at all. Some apps don't expose their
+  text: Electron apps such as Slack, Notion and VS Code only do once asked,
+  so the first dictation into one gets no words and later ones do
 - **Hotkey** — right Option (default), right Command, right Control, or right
   Shift. Right-side only: the left keys are needed for typing.
 - **Say how you want it written** — while still holding the hotkey (or
@@ -135,7 +143,7 @@ Kaho asks for two permissions:
 | Permission | Why |
 |---|---|
 | Microphone | recording while the hotkey is held |
-| Accessibility | observing the global hotkey, sending the paste |
+| Accessibility | observing the global hotkey, sending the paste, and (if Words on Screen is on) reading the focused window's text |
 
 Until Accessibility is granted the menu bar shows ⚠️ and the first menu
 item opens the right Settings pane. Kaho notices the grant and restarts
@@ -225,6 +233,8 @@ flowchart LR
     K["hotkey (hold or double-tap)"] --> M["NSEvent global monitor (main run loop)"]
     M --> R["Recorder — sounddevice, 16 kHz"]
     M -.-> O["Overlay pill — live mic level"]
+    M -.-> S["Words on screen — focused window via Accessibility (own thread)"]
+    S -.-> T
     R --> Q[["audio queue"]]
     Q --> W["Worker thread"]
     W --> T["mlx-audio — Qwen3-ASR 1.7B on the Apple GPU"]
@@ -246,6 +256,13 @@ written to disk or sent anywhere. Transcripts go to the clipboard, the local
 log, and the local history file (`~/Library/Application Support/Kaho/`) —
 delete them any time. Rewriting runs entirely on-device too. The models are
 fetched once from Hugging Face; nothing else touches the network.
+
+Words on Screen reads only the window you're dictating into, only when you
+press the hotkey, and only its visible text. The names and jargon it picks
+out stay in memory for that one dictation and are then discarded — they are
+never written to the log, the history, or disk, and never sent anywhere.
+Kaho's own windows are never read. Untick **Use Words on Screen** in the menu
+or Settings to turn it off.
 
 ## Development
 

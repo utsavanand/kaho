@@ -21,6 +21,7 @@ import urllib.parse
 import urllib.request
 
 import AppKit
+import ApplicationServices
 import huggingface_hub
 import numpy as np
 import Quartz
@@ -351,6 +352,18 @@ DICTIONARY_MAX_TERMS = 120
 RESPELL_MIN_SIMILARITY = 0.85
 # Ships with macOS: 236k words, the guard that keeps respell() off real words
 ENGLISH_WORDS_PATH = "/usr/share/dict/words"
+# Words read off the focused window at record start, passed as extra hotwords.
+# The read runs while the user is still talking, so the budget only has to
+# beat the shortest dictation; it bounds a slow app (Word and Notes answer
+# accessibility queries slowly enough to need it) rather than a typical one,
+# which reads in 10-40 ms. A name written in the thread being replied to went
+# from 3/15 to 10/15 spelled right in an offline test with these as hotwords.
+SCREEN_READ_SECONDS = 0.15
+SCREEN_MAX_NODES = 4000
+# Fewer than the dictionary's cap: these are guesses about what the user will
+# say, and every one dilutes the bias on the words they actually do say
+SCREEN_MAX_TERMS = 40
+SCREEN_TEXT_ATTRIBUTES = ("AXValue", "AXTitle", "AXDescription")
 DICTIONARY_TEMPLATE = """\
 # Kaho dictionary — one term per line.
 #
@@ -454,12 +467,17 @@ class Recording:
     moment the user is mid-sentence.
     """
 
-    __slots__ = ("buf", "cancelled", "released_at", "spans")
+    __slots__ = ("buf", "cancelled", "released_at", "screen_done", "screen_terms", "spans")
 
     def __init__(self):
         self.buf = []
         self.spans = []
         self.cancelled = False
+        # Words read off the focused window by a background thread; on the
+        # recording rather than a global so a slow read can only ever land
+        # in the dictation it was taken for
+        self.screen_terms = None
+        self.screen_done = False
         # When the user let go of the key. The number that matters to them
         # starts here, not when the worker picks the job up: the old timer
         # began after jobs.get(), so microphone shutdown and queue waiting
@@ -478,6 +496,21 @@ class Recording:
             return "closed"
         return None
 
+    def offer_screen_terms(self, terms):
+        """Store the window's words unless the job has already started without them."""
+        if not self.screen_done:
+            self.screen_terms = terms
+
+    def take_screen_terms(self):
+        """The window's words if the read finished in time, then forget them.
+
+        Transcription never waits on the read: a window that answers late is
+        simply not used, and nothing it returns afterwards is kept.
+        """
+        self.screen_done = True
+        terms, self.screen_terms = self.screen_terms, None
+        return terms or ()
+
     def frozen_spans(self):
         """Ranges with any still-open one closed at the end of the audio.
 
@@ -495,7 +528,7 @@ last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
 settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto",
             "trigger": "hold", "rewrite_backend": "local",
-            "api_url": "", "api_model": ""}
+            "api_url": "", "api_model": "", "screen_words": True}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
@@ -506,6 +539,7 @@ warmup_queued = False
 rewriter_lock = threading.Lock()  # see ensure_rewriter
 asr = None  # the speech model, loaded by backend
 _english_words = None  # see english_words
+_common_words = None  # see common_words
 
 
 # Transcripts are sensitive: create log/history files 0600 instead of the
@@ -575,6 +609,8 @@ def load_settings():
     for key in ("api_url", "api_model"):
         if isinstance(saved.get(key), str):
             settings[key] = saved[key]
+    if isinstance(saved.get("screen_words"), bool):
+        settings["screen_words"] = saved["screen_words"]
 
 
 def save_settings():
@@ -607,30 +643,87 @@ def read_dictionary():
     return terms
 
 
+def _load_word_lists():
+    """Read the macOS word list once into both forms. Empty if the file is
+    missing — respell() then relies on its similarity and length rules alone,
+    and the screen filter keeps any name-like word."""
+    global _english_words, _common_words
+    try:
+        with open(ENGLISH_WORDS_PATH) as f:
+            lines = [line.strip() for line in f]
+    except OSError:
+        lines = []
+    _english_words = {line.lower() for line in lines}
+    _common_words = {line for line in lines if line.islower()}
+
+
 def english_words():
-    """Lowercased macOS word list, loaded once. Empty if the file is missing —
-    respell() then relies on its similarity and length rules alone."""
-    global _english_words
+    """Every listed word, lowercased — proper names included."""
     if _english_words is None:
-        try:
-            with open(ENGLISH_WORDS_PATH) as f:
-                _english_words = {line.strip().lower() for line in f}
-        except OSError:
-            _english_words = set()
+        _load_word_lists()
     return _english_words
 
 
-def is_english(word):
-    """True for a listed word or a regular inflection of one. The macOS list
-    is mostly base forms: it has "motion" but not "motions" or "reviewed"."""
-    low = word.lower()
-    words = english_words()
+def common_words():
+    """Only the entries the list itself spells in lowercase.
+
+    The list also carries proper names ("Nguyen", "Kafka"), and
+    lowercasing them all — right for respell(), which must never rewrite a
+    name the user said — would throw away exactly the names the screen read
+    is meant to find.
+    """
+    if _common_words is None:
+        _load_word_lists()
+    return _common_words
+
+
+def _listed(low, words):
+    """A listed word or a regular inflection of one. The macOS list is mostly
+    base forms: it has "motion" but not "motions" or "reviewed"."""
     if low in words:
         return True
     return any(
         low.endswith(end) and low[: -len(end)] in words
         for end in ("s", "es", "ed", "d", "ing", "er", "ers", "ly")
     )
+
+
+def is_english(word):
+    return _listed(word.lower(), english_words())
+
+
+def _worth_hinting(token):
+    """Whether a word from the screen is the kind the model misspells."""
+    # Numbers and dates are not vocabulary
+    if not re.search(r"[^\W\d_]", token):
+        return False
+    low = token.lower()
+    # An everyday word, however it is capitalized ("The", "Carpenter")
+    if _listed(low, common_words()):
+        return False
+    name_like = (
+        token[0].isupper()
+        or re.search(r"[a-z][A-Z]", token)  # camelCase
+        or any(c.isdigit() for c in token)
+        or not token.isascii()  # Joaquín, Dálaigh
+    )
+    # Lowercase jargon ("ledgerd", "kubectl") only when no list knows it at all
+    return bool(name_like) or not _listed(low, english_words())
+
+
+def screen_terms(texts, dictionary):
+    """Names and jargon from a window's text, most frequent first.
+
+    Terms already in the dictionary are left out — they are passed anyway.
+    """
+    counts = collections.Counter()
+    for token in re.findall(r"[^\W_][\w'’.+-]*", " ".join(texts)):
+        token = token.strip(".'’+-")
+        if 3 <= len(token) <= 30 and _worth_hinting(token):
+            counts[token] += 1
+    known = {term.lower() for term in dictionary}
+    # most_common keeps first-seen order among ties
+    return [t for t, _ in counts.most_common() if t.lower() not in known][:SCREEN_MAX_TERMS]
 
 
 def _compact(s):
@@ -1011,6 +1104,68 @@ def check_install_location():
     return False
 
 
+def start_screen_read(session):
+    """Collect the focused window's names and jargon for this recording.
+
+    The frontmost app is looked up here, on the main thread, at key-down — the
+    window the user is about to dictate into. The read itself runs on its own
+    thread: accessibility queries are synchronous IPC into the other app, and
+    a busy app answers slowly.
+    """
+    app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+    pid = app.processIdentifier() if app is not None else None
+    threading.Thread(target=_read_screen, args=(session, pid), daemon=True).start()
+
+
+def _read_screen(session, pid):
+    # Never logs the words or any window text: only how many, and how long
+    t0 = time.monotonic()
+    if pid is None:
+        log("[screen skipped: no focused app]")
+        return
+    if pid == os.getpid():
+        log("[screen skipped: Kaho's own window]")
+        return
+    try:
+        texts = window_texts(pid)
+    except Exception as e:  # noqa: BLE001
+        # Type only: an exception's message could quote the window
+        log(f"[screen skipped: {type(e).__name__}]")
+        return
+    terms = screen_terms(texts, read_dictionary())
+    session.offer_screen_terms(terms)
+    log(f"[screen {len(terms)} words, {(time.monotonic() - t0) * 1000:.0f} ms]")
+
+
+def _ax(element, attribute):
+    err, value = ApplicationServices.AXUIElementCopyAttributeValue(element, attribute, None)
+    return value if err == 0 else None
+
+
+def window_texts(pid):
+    """The visible text of an app's focused window, within the time and node budget."""
+    app = ApplicationServices.AXUIElementCreateApplication(pid)
+    # Electron apps (Slack, VS Code, Notion) only build an accessibility tree
+    # once asked, and the tree arrives after this read — so the first
+    # dictation into one gets nothing, and later ones get the text.
+    ApplicationServices.AXUIElementSetAttributeValue(app, "AXManualAccessibility", True)
+    window = _ax(app, "AXFocusedWindow")
+    if window is None:
+        return []
+    texts, stack, visited = [], [window], 0
+    deadline = time.monotonic() + SCREEN_READ_SECONDS
+    while stack and visited < SCREEN_MAX_NODES and time.monotonic() < deadline:
+        element = stack.pop()
+        visited += 1
+        for attribute in SCREEN_TEXT_ATTRIBUTES:
+            value = _ax(element, attribute)
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+        # Reversed, so the walk reads top to bottom as the window does
+        stack.extend(reversed(list(_ax(element, "AXChildren") or ())))
+    return texts
+
+
 def start_recording():
     global state, record_buf, recording
     if state != "ready":
@@ -1035,6 +1190,8 @@ def start_recording():
         recording = Recording()
         buf = recording.buf
         record_buf = buf
+    if settings["screen_words"]:
+        start_screen_read(recording)
     overlay.show()
     # Fire a warmup while the user is still speaking: the page-in of idle
     # model weights overlaps the recording instead of delaying the paste.
@@ -1191,7 +1348,7 @@ def _finish_recording(s, buf, session=None):
             released = session.released_at if session is not None else None
             global job_outstanding
             job_outstanding = True
-            jobs.put((audio, job_generation, spans, released))
+            jobs.put((audio, job_generation, spans, released, session))
 
     if s is not None:
         t0 = time.monotonic()
@@ -1387,14 +1544,17 @@ def looks_hallucinated(text):
     return unique_ratio < 0.12
 
 
-def transcribe(audio, use_dictionary=True):
+def transcribe(audio, use_dictionary=True, screen=()):
+    """`screen` words bias the model but never feed respell(): a word that
+    happens to be on screen must not rewrite a word the user said."""
     terms = read_dictionary() if use_dictionary else []
+    hotwords = terms + list(screen)
     # Whisper needed condition_on_previous_text=False to stop one 30 s
     # window's bad guess seeding the next. This model decodes the whole
     # dictation in one pass, so there is no window-to-window context to cut.
     text = asr.generate(
         audio,
-        hotwords=terms or None,
+        hotwords=hotwords or None,
         # None lets the model detect; it takes the language's name, not its code
         language=None if settings["language"] == "auto" else LANGUAGES[settings["language"]],
     ).text.strip()
@@ -1757,13 +1917,15 @@ def split_audio(audio, spans):
     )
 
 
-def run_job(audio, generation, spans, released, t0):
+def run_job(audio, generation, spans, released, t0, session=None):
     """Transcribe, optionally rewrite, and paste one recording.
 
     Split out of worker() so the cancel path can be tested against the real
     code rather than a copy of it. `continue` in the loop becomes `return`.
     """
     global last_inference
+    # Taken now, not awaited: a window that has not answered yet is skipped
+    screen = session.take_screen_terms() if session is not None else ()
     instruction = None
     message_audio, instruction_audio = split_audio(audio, spans)
     if instruction_audio is not None:
@@ -1783,7 +1945,7 @@ def run_job(audio, generation, spans, released, t0):
             instruction = transcribe(instruction_audio).strip()
             if not instruction:
                 log("instruction was empty — pasting the dictation as-is")
-    text = transcribe(audio)
+    text = transcribe(audio, screen=screen)
     if generation != job_generation:
         # The models did run, so this still counts against idle warmup
         last_inference = time.monotonic()
@@ -1873,7 +2035,8 @@ def worker():
         # The sole worker must outlive any single bad job, or dictation dies
         # silently while the UI still shows ready
         try:
-            run_job(*job, t0)
+            audio, generation, spans, released, session = job
+            run_job(audio, generation, spans, released, t0, session)
         except Exception as e:  # noqa: BLE001
             AppHelper.callAfter(overlay.hide)
             log(f"transcription failed: {e!r} — dictation continues")
@@ -2580,16 +2743,16 @@ class SettingsWindow(AppKit.NSObject):
             | AppKit.NSWindowStyleMaskMiniaturizable
         )
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (460, 492)), mask, AppKit.NSBackingStoreBuffered, False
+            ((0, 0), (460, 522)), mask, AppKit.NSBackingStoreBuffered, False
         )
         window.setTitle_("Kaho Settings")
         window.setReleasedWhenClosed_(False)
         window.center()
         content = window.contentView()
 
-        content.addSubview_(make_label("Hotkey", 24, 444, 13, bold=True))
+        content.addSubview_(make_label("Hotkey", 24, 474, 13, bold=True))
         self.hotkey_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 412), (412, 26)), False
+            ((24, 442), (412, 26)), False
         )
         for name, (_, _, label) in HOTKEYS.items():
             self.hotkey_popup.addItemWithTitle_(label)
@@ -2599,12 +2762,12 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(self.hotkey_popup)
         content.addSubview_(
             make_label("Right-side keys only: the left ones are for typing.",
-                       24, 390, 11, dim=True)
+                       24, 420, 11, dim=True)
         )
 
-        content.addSubview_(make_label("Trigger", 24, 356, 13, bold=True))
+        content.addSubview_(make_label("Trigger", 24, 386, 13, bold=True))
         self.trigger_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 324), (412, 26)), False
+            ((24, 354), (412, 26)), False
         )
         for mode, label in TRIGGERS.items():
             self.trigger_popup.addItemWithTitle_(label)
@@ -2613,9 +2776,9 @@ class SettingsWindow(AppKit.NSObject):
         self.trigger_popup.setAction_("triggerChanged:")
         content.addSubview_(self.trigger_popup)
 
-        content.addSubview_(make_label("Language", 24, 302, 13, bold=True))
+        content.addSubview_(make_label("Language", 24, 332, 13, bold=True))
         self.language_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 270), (412, 26)), False
+            ((24, 300), (412, 26)), False
         )
         for code, label in LANGUAGES.items():
             self.language_popup.addItemWithTitle_(label)
@@ -2626,13 +2789,13 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(
             make_label(
                 "Pick yours if detection gets it wrong on short dictations.",
-                24, 252, 11, dim=True,
+                24, 282, 11, dim=True,
             )
         )
 
-        content.addSubview_(make_label("Rewrite", 24, 224, 13, bold=True))
+        content.addSubview_(make_label("Rewrite", 24, 254, 13, bold=True))
         self.rewrite_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 192), (412, 26)), False
+            ((24, 222), (412, 26)), False
         )
         for mode, label in REWRITE_MODES.items():
             self.rewrite_popup.addItemWithTitle_(label)
@@ -2641,18 +2804,18 @@ class SettingsWindow(AppKit.NSObject):
         self.rewrite_popup.setAction_("rewriteChanged:")
         content.addSubview_(self.rewrite_popup)
 
-        self.hint = make_label("", 24, 148, 11, dim=True)
-        self.hint.setFrame_(((24, 140), (412, 44)))
+        self.hint = make_label("", 24, 178, 11, dim=True)
+        self.hint.setFrame_(((24, 170), (412, 44)))
         # Hints run two lines for the longer modes
         self.hint.cell().setWraps_(True)
         content.addSubview_(self.hint)
 
-        self.status = make_label("", 24, 96, 11, dim=True)
-        self.status.setFrame_(((24, 88), (412, 34)))
+        self.status = make_label("", 24, 126, 11, dim=True)
+        self.status.setFrame_(((24, 118), (412, 34)))
         self.status.cell().setWraps_(True)
         content.addSubview_(self.status)
 
-        self.dict_button = AppKit.NSButton.alloc().initWithFrame_(((24, 48), (200, 26)))
+        self.dict_button = AppKit.NSButton.alloc().initWithFrame_(((24, 78), (200, 26)))
         self.dict_button.setTitle_("Edit Dictionary…")
         self.dict_button.setBezelStyle_(AppKit.NSBezelStyleRounded)
         self.dict_button.setTarget_(self)
@@ -2660,9 +2823,16 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(self.dict_button)
         content.addSubview_(
             make_label(
-                "Names and jargon to spell your way.", 232, 52, 11, dim=True
+                "Names and jargon to spell your way.", 232, 82, 11, dim=True
             )
         )
+
+        self.screen_box = AppKit.NSButton.alloc().initWithFrame_(((24, 46), (412, 22)))
+        self.screen_box.setButtonType_(AppKit.NSButtonTypeSwitch)
+        self.screen_box.setTitle_("Also spell names from the window you're dictating into")
+        self.screen_box.setTarget_(self)
+        self.screen_box.setAction_("screenWordsChanged:")
+        content.addSubview_(self.screen_box)
 
         self.notice = make_label("", 24, 16, 11, dim=True)
         self.notice.setFrame_(((24, 8), (412, 30)))
@@ -2683,6 +2853,9 @@ class SettingsWindow(AppKit.NSObject):
         for i in range(self.rewrite_popup.numberOfItems()):
             if self.rewrite_popup.itemAtIndex_(i).representedObject() == settings["rewrite"]:
                 self.rewrite_popup.selectItemAtIndex_(i)
+        self.screen_box.setState_(
+            AppKit.NSControlStateValueOn if settings["screen_words"] else AppKit.NSControlStateValueOff
+        )
         self.refreshHint()
 
     def refreshHint(self):
@@ -2722,6 +2895,9 @@ class SettingsWindow(AppKit.NSObject):
 
     def rewriteChanged_(self, sender):
         apply_rewrite(sender.selectedItem().representedObject())
+
+    def screenWordsChanged_(self, sender):
+        apply_screen_words(sender.state() == AppKit.NSControlStateValueOn)
 
 
 def make_label(text, x, y, size, bold=False, dim=False):
@@ -2946,6 +3122,13 @@ def apply_trigger(mode):
     refresh_settings_ui()
 
 
+def apply_screen_words(on):
+    settings["screen_words"] = bool(on)
+    save_settings()
+    log(f"words on screen: {'on' if on else 'off'}")
+    refresh_settings_ui()
+
+
 def apply_rewrite_backend(name):
     """Switch the rewrite model, prompting for a key the first time."""
     settings["rewrite_backend"] = name
@@ -3157,6 +3340,15 @@ class StatusItem(AppKit.NSObject):
                 settings["rewrite"], "setRewrite:",
             )
         )
+        screen = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Use Words on Screen", "toggleScreenWords:", ""
+        )
+        screen.setTarget_(self)
+        screen.setState_(
+            AppKit.NSControlStateValueOn if settings["screen_words"] else AppKit.NSControlStateValueOff
+        )
+        screen.setToolTip_("Spell names in the window you're dictating into. Read in memory, never kept.")
+        menu.addItem_(screen)
         for title, action, key in MENU_ACTIONS:
             entry = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
             entry.setTarget_(self)
@@ -3177,6 +3369,9 @@ class StatusItem(AppKit.NSObject):
 
     def setRewrite_(self, sender):
         apply_rewrite(sender.representedObject())
+
+    def toggleScreenWords_(self, _sender):
+        apply_screen_words(not settings["screen_words"])
 
     def copyTranscript_(self, sender):
         set_clipboard(sender.representedObject())

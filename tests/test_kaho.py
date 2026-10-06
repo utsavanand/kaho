@@ -78,6 +78,7 @@ def _install_stubs():
     for name, module in (
         ("AppKit", appkit),
         ("Quartz", _Stub("Quartz")),
+        ("ApplicationServices", _Stub("ApplicationServices")),
         ("sounddevice", sounddevice),
         ("mlx_audio", _Stub("mlx_audio")),
         ("mlx_audio.stt", _Stub("mlx_audio.stt")),
@@ -158,9 +159,12 @@ class KahoTestCase(unittest.TestCase):
         self.enterContext(mock.patch.object(
             kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": ""}
+             "api_url": "", "api_model": "", "screen_words": True}
         ))
         self.enterContext(mock.patch.object(kaho, "overlay", mock.MagicMock()))
+        # A real read starts a thread against the stubbed accessibility API;
+        # TestScreenWords drives the reading code directly instead
+        self.screen_reads = self.enterContext(mock.patch.object(kaho, "start_screen_read"))
 
         # Keep the log out of stdout, and let tests read what was logged
         self.logged = []
@@ -413,7 +417,7 @@ class TestSettings(KahoTestCase):
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": ""},
+             "api_url": "", "api_model": "", "screen_words": True},
         )
 
     def test_a_non_finite_timestamp_is_skipped_not_fatal(self):
@@ -469,7 +473,7 @@ class TestSettings(KahoTestCase):
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": ""},
+             "api_url": "", "api_model": "", "screen_words": True},
         )
 
     def test_saved_settings_round_trip_and_stay_private(self):
@@ -1289,7 +1293,7 @@ class TestSpokenInstruction(KahoTestCase):
         self.up()
         self.run_audio_ops()
 
-        _, _, spans, _ = kaho.jobs.get()
+        _, _, spans, _, _ = kaho.jobs.get()
         self.assertEqual(spans, [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE]])
 
     def test_the_halves_are_gathered_from_every_piece(self):
@@ -1591,7 +1595,7 @@ class TestCancel(KahoTestCase):
         MLX inference cannot be interrupted, so this is what cancelling
         actually buys: the text is computed and then thrown away.
         """
-        kaho.jobs.put((mock.MagicMock(), 0, [], None))
+        kaho.jobs.put((mock.MagicMock(), 0, [], None, None))
         kaho.job_generation = 1
         self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
         kaho.asr.generate.return_value.text = "unwanted text"
@@ -1605,7 +1609,7 @@ class TestCancel(KahoTestCase):
         self.assertTrue(any("cancelled" in m for m in self.logged))
 
     def test_an_uncancelled_job_still_pastes(self):
-        kaho.jobs.put((mock.MagicMock(), 0, [], None))
+        kaho.jobs.put((mock.MagicMock(), 0, [], None, None))
         self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
         kaho.asr.generate.return_value.text = "wanted text"
 
@@ -1672,8 +1676,8 @@ class TestCancel(KahoTestCase):
 
     def run_one_job(self):
         """The real worker body, minus its `while True`."""
-        audio, generation, spans, released = kaho.jobs.get()
-        kaho.run_job(audio, generation, spans, released, self.clock.now)
+        audio, generation, spans, released, session = kaho.jobs.get()
+        kaho.run_job(audio, generation, spans, released, self.clock.now, session)
 
 
 class TestRelaunch(KahoTestCase):
@@ -1993,6 +1997,133 @@ class TestDownloadProgress(KahoTestCase):
         kaho.download_progress = None
         self.assertIsNone(kaho.status_line())
         self.assertEqual(kaho.status_title(), kaho.TITLES["ready"])
+
+
+class FakeAX:
+    """A tiny accessibility tree standing in for another app's window.
+
+    Each node is (text attributes, children). Implements the three calls
+    window_texts() makes, with the same (error, value) return shape.
+    """
+
+    def __init__(self, window):
+        self.window = window
+
+    def AXUIElementCreateApplication(self, pid):
+        return "app"
+
+    def AXUIElementSetAttributeValue(self, element, attribute, value):
+        return 0
+
+    def AXUIElementCopyAttributeValue(self, element, attribute, _out):
+        if element == "app":
+            return (0, self.window) if attribute == "AXFocusedWindow" else (-25212, None)
+        attrs, children = element
+        if attribute == "AXChildren":
+            return 0, children
+        return (0, attrs[attribute]) if attribute in attrs else (-25212, None)
+
+
+def node(children=(), **attrs):
+    return (attrs, list(children))
+
+
+@unittest.skipUnless(HAVE_NUMPY, "the job tests need real audio buffers")
+class TestScreenWords(KahoTestCase):
+    """Names in the window being dictated into, used as hotwords for one dictation."""
+
+    THREAD = (
+        "#infra-oncall · Siobhan, Abhimanyu, Nguyen Thi Hoa",
+        "Siobhan: the Debezium connector restarted again",
+        "The Carpenter rollout moved ledgerd to the new nodes in 2024",
+        "Siobhan: thanks",
+    )
+
+    def setUp(self):
+        super().setUp()
+        # Shaped like the macOS list: lowercase entries for everyday words,
+        # and proper names spelled with their capital, as the real one does
+        words = pathlib.Path(self.tmp.name) / "words"
+        words.write_text("the\ncarpenter\nconnector\nrestart\nagain\nthanks\nnew\nnode\nrollout\nmove\n"
+                         "Nguyen\nKafka\n")
+        self.enterContext(mock.patch.object(kaho, "ENGLISH_WORDS_PATH", str(words)))
+        self.enterContext(mock.patch.object(kaho, "_english_words", None))
+        self.enterContext(mock.patch.object(kaho, "_common_words", None))
+        self.asr = self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
+        self.asr.generate.return_value.text = "thanks siobhan"
+
+    def test_names_and_jargon_are_kept_and_everyday_words_dropped(self):
+        terms = kaho.screen_terms(self.THREAD, [])
+        for kept in ("Siobhan", "Debezium", "ledgerd", "Nguyen", "Abhimanyu"):
+            self.assertIn(kept, terms)
+        for dropped in ("Carpenter", "The", "connector", "2024"):
+            self.assertNotIn(dropped, terms)
+
+    def test_the_most_repeated_name_comes_first(self):
+        self.assertEqual(kaho.screen_terms(self.THREAD, [])[0], "Siobhan")
+
+    def test_dictionary_terms_are_not_repeated(self):
+        self.assertNotIn("Debezium", kaho.screen_terms(self.THREAD, ["debezium"]))
+
+    def test_the_list_is_capped(self):
+        names = [f"Zorblax{i}" for i in range(kaho.SCREEN_MAX_TERMS + 10)]
+        self.assertEqual(len(kaho.screen_terms(names, [])), kaho.SCREEN_MAX_TERMS)
+
+    def test_the_window_is_read_top_to_bottom_skipping_non_text(self):
+        window = node([node(AXTitle="Siobhan"), node([node(AXValue="Debezium")]), node(AXValue=3)],
+                      AXTitle="#infra")
+        with mock.patch.object(kaho, "ApplicationServices", FakeAX(window)):
+            self.assertEqual(kaho.window_texts(123), ["#infra", "Siobhan", "Debezium"])
+
+    def test_a_huge_window_stops_at_the_node_budget(self):
+        window = node([node(AXValue=f"Name{i}") for i in range(50)])
+        with mock.patch.object(kaho, "ApplicationServices", FakeAX(window)), \
+             mock.patch.object(kaho, "SCREEN_MAX_NODES", 5):
+            self.assertEqual(len(kaho.window_texts(123)), 4)  # the window plus four rows
+
+    def test_kahos_own_window_is_never_read(self):
+        session = kaho.Recording()
+        with mock.patch.object(kaho, "ApplicationServices", FakeAX(node(AXValue="Siobhan"))):
+            kaho._read_screen(session, os.getpid())
+        self.assertIsNone(session.screen_terms)
+        self.assertTrue(any("Kaho's own window" in m for m in self.logged))
+
+    def test_screen_words_are_hotwords_after_the_dictionary_but_never_respelled(self):
+        pathlib.Path(kaho.DICTIONARY_PATH).write_text("Kaho\n")
+        session = kaho.Recording()
+        session.offer_screen_terms(["Siobhan", "Debezium"])
+        with mock.patch.object(kaho, "respell", side_effect=lambda text, terms: text) as respell, \
+             mock.patch.object(kaho, "paste"), mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            kaho.run_job(REAL_NUMPY.zeros(16000, dtype="float32"), kaho.job_generation, [], None,
+                         self.clock.now, session)
+        self.assertEqual(self.asr.generate.call_args.kwargs["hotwords"], ["Kaho", "Siobhan", "Debezium"])
+        self.assertEqual(respell.call_args.args[1], ["Kaho"])
+
+    def test_a_read_that_lands_after_its_job_started_is_dropped(self):
+        session = kaho.Recording()
+        with mock.patch.object(kaho, "paste"), mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            kaho.run_job(REAL_NUMPY.zeros(16000, dtype="float32"), kaho.job_generation, [], None,
+                         self.clock.now, session)
+        session.offer_screen_terms(["Siobhan"])
+        self.assertIsNone(self.asr.generate.call_args.kwargs["hotwords"])
+        self.assertIsNone(session.screen_terms)
+
+    def test_turning_it_off_means_no_read(self):
+        kaho.settings["screen_words"] = False
+        self.down()
+        self.screen_reads.assert_not_called()
+
+    def test_each_recording_gets_its_own_read(self):
+        self.down()
+        self.screen_reads.assert_called_once_with(kaho.recording)
+
+    def test_the_setting_survives_a_restart(self):
+        kaho.apply_screen_words(False)
+        kaho.settings["screen_words"] = True
+        kaho.load_settings()
+        self.assertFalse(kaho.settings["screen_words"])
 
 
 if __name__ == "__main__":
