@@ -50,14 +50,16 @@ log, and one-click bug reports:
 - **Edit Dictionary…** — names and jargon the model should spell your way
 - **Hotkey** — right Option (default), right Command, right Control, or right
   Shift. Right-side only: the left keys are needed for typing.
-- **Say how you want it written** — while still holding the hotkey, press
-  right Shift and keep talking. It is *held*, not latched — release it and you
+- **Say how you want it written** — while still holding the hotkey (or
+  during hands-free), press either Shift and keep talking. It is *held*, not latched — release it and you
   are dictating again, so a thought can be interrupted with an aside and then
   carry on. Everything said while it is down is an instruction, not message: *"tell Mark I can't make the offsite, suggest
   November"* → ⇧ → *"formal, two sentences"* becomes "Mark, I am unable to
   attend the offsite; I recommend scheduling it in November." The same words
   with *"casual, like texting a friend"* come out as "Hey Mark, I'm sorry but
-  I can't make the offsite…". Nothing to configure and nothing stored — the
+  I can't make the offsite…". It can change what the message says as well as
+  how it reads: *"drop the part about shipping"*, *"it's 4 pm, not 3"*, *"the
+  PR is number six"*. Nothing to configure and nothing stored — the
   instruction is spoken once and forgotten.
 - **Rewrite model** — on this Mac by default. You can point the rewrite step
   at OpenAI, Anthropic, or any OpenAI-compatible endpoint (Groq, OpenRouter,
