@@ -1215,12 +1215,12 @@ class TestSpokenInstruction(KahoTestCase):
         super().setUp()
         kaho.overlay.is_working.return_value = False
 
-    def hold_instruction(self):
-        code, mask = kaho.instruction_key()
-        kaho.handle_flags_changed(FakeEvent(code, mask))
+    def hold_instruction(self, code=None):
+        code = code or kaho.HOTKEYS[kaho.INSTRUCTION_FALLBACK][0]
+        kaho.handle_flags_changed(FakeEvent(code, kaho.instruction_keys()[code]))
 
-    def release_instruction(self):
-        code, _ = kaho.instruction_key()
+    def release_instruction(self, code=None):
+        code = code or kaho.HOTKEYS[kaho.INSTRUCTION_FALLBACK][0]
         kaho.handle_flags_changed(FakeEvent(code, 0))
 
     def speak(self, seconds=1.0):
@@ -1430,10 +1430,57 @@ class TestSpokenInstruction(KahoTestCase):
                          "starting B erased A's instruction ranges")
         self.assertEqual(kaho.recording.spans, [], "B inherited A's ranges")
 
-    def test_the_instruction_key_is_never_the_hotkey(self):
+    def test_no_instruction_key_is_ever_the_hotkey(self):
         for name in kaho.HOTKEYS:
             kaho.settings["hotkey"] = name
-            self.assertNotEqual(kaho.instruction_key()[0], kaho.HOTKEYS[name][0], name)
+            self.assertNotIn(kaho.HOTKEYS[name][0], kaho.instruction_keys(), name)
+
+    def test_left_shift_marks_an_instruction_too(self):
+        # Pressed with the left Shift, the instruction used to be dictated
+        # into the message: only the right one was listened to
+        left = kaho.LEFT_SHIFT[0]
+        self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        self.hold_instruction(left)
+        self.speak(1.0)
+        self.release_instruction(left)
+        self.assertEqual(kaho.recording.spans,
+                         [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE]])
+
+    def test_releasing_one_shift_while_the_other_is_held_keeps_the_instruction(self):
+        right = kaho.HOTKEYS[kaho.INSTRUCTION_FALLBACK][0]
+        left = kaho.LEFT_SHIFT[0]
+        both = sum(kaho.instruction_keys().values())
+        self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        kaho.handle_flags_changed(FakeEvent(right, both))
+        self.speak(1.0)
+        # Right comes up, left is still down
+        kaho.handle_flags_changed(FakeEvent(right, kaho.LEFT_SHIFT[1]))
+        self.speak(1.0)
+        kaho.handle_flags_changed(FakeEvent(left, 0))
+        self.assertEqual(kaho.recording.spans,
+                         [[kaho.SAMPLE_RATE, 3 * kaho.SAMPLE_RATE]])
+
+    def test_shift_marks_an_instruction_in_hands_free_with_the_hotkey_up(self):
+        # Double-tap, let go, then Shift: the hotkey is not held at all
+        self.down()
+        self.run_audio_ops()
+        kaho.locked = True
+        self.up()
+        self.assertEqual(kaho.state, "recording")
+        self.speak(1.0)
+        self.hold_instruction(kaho.LEFT_SHIFT[0])
+        self.speak(1.0)
+        self.release_instruction(kaho.LEFT_SHIFT[0])
+        self.assertEqual(kaho.recording.spans,
+                         [[kaho.SAMPLE_RATE, 2 * kaho.SAMPLE_RATE]])
+
+    def test_left_shift_does_nothing_when_not_recording(self):
+        kaho.handle_flags_changed(FakeEvent(kaho.LEFT_SHIFT[0], kaho.LEFT_SHIFT[1]))
+        self.assertIsNone(kaho.recording)
 
 
 class TestBringYourOwnKey(KahoTestCase):

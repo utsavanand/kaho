@@ -78,13 +78,22 @@ KEYCHAIN_SERVICE = "com.utsavanand.kaho.apikey"
 API_TIMEOUT_SECONDS = 30
 
 
-def instruction_key():
-    """(keycode, device mask) of the modifier that starts an instruction."""
+LEFT_SHIFT = (56, 0x0002)
+
+
+def instruction_keys():
+    """{keycode: device mask} of the modifiers that mark speech as instruction.
+
+    Left Shift as well as the right one: it is the Shift most people reach
+    for, and when only the right one counted, an instruction spoken with the
+    left was transcribed into the message as if it had been dictated. Nobody
+    types during a dictation, so the left key is free while recording.
+    """
     name = INSTRUCTION_FALLBACK
     if settings["hotkey"] == name:
         name = "right_command"
     keycode, mask, _ = HOTKEYS[name]
-    return keycode, mask
+    return {keycode: mask, LEFT_SHIFT[0]: LEFT_SHIFT[1]}
 
 
 def instruction_label():
@@ -159,25 +168,32 @@ REWRITE_HINTS = {
     "caveman": "Compress hard for prompting an LLM — every instruction kept, words minimised.",
 }
 # The instruction is spoken, so it arrives as loose speech ("uh, make this
-# formal, short") rather than a tidy directive. The prompt says to follow its
-# intent, and spells out the two failure modes seen in testing: answering the
-# instruction as if it were a question, and treating it as new content to
-# include in the output.
+# formal, short") rather than a tidy directive. It edits what the message
+# says as often as how it reads: "drop the part about shipping", "the PR is
+# number six". The first version only allowed changes to how it reads, and
+# the on-device model then kept parts it was told to drop and left out
+# details the instruction supplied. The two failure modes from the first
+# round of testing still hold: answering the instruction as if it were a
+# question, and quoting it into the output.
 INSTRUCTION_PROMPT = (
-    "You rewrite dictated speech according to a spoken instruction.\n\n"
-    "INSTRUCTION (how the user wants it written):\n{instruction}\n\n"
+    "You apply a spoken instruction to dictated speech.\n\n"
+    "INSTRUCTION (what the user wants changed):\n{instruction}\n\n"
     "MESSAGE (what the user dictated):\n{text}\n\n"
-    "Rewrite MESSAGE following INSTRUCTION. Rules:\n"
-    "- Output only the rewritten message. No preamble, no explanation, no "
+    "Apply INSTRUCTION to the whole MESSAGE and output the result. Rules:\n"
+    "- Output only the resulting message. No preamble, no explanation, no "
     "quotes around it.\n"
-    "- Never answer or comment on the instruction. It describes how to "
-    "write, it is not a question and not part of the message.\n"
-    "- Keep every fact, name, number and request from MESSAGE. You are "
-    "changing how it reads, not what it says.\n"
+    "- The instruction can change how the message reads (tone, length, "
+    "format) and what it says (add, correct, remove or reorder parts). Make "
+    "every change it asks for.\n"
+    "- Names, numbers, dates, spellings and other details in the "
+    "instruction belong in the message: put each where it fits, replacing "
+    "anything it corrects.\n"
+    "- Never answer or comment on the instruction, and never copy its "
+    "wording in as a request. It is addressed to you, not part of the "
+    "message.\n"
+    "- Keep everything in MESSAGE that the instruction does not change.\n"
     "- The instruction was spoken, so ignore its filler words and follow "
-    "what it means.\n"
-    "- If the instruction asks for something the message cannot support, "
-    "write the message as well as you can and change nothing else."
+    "what it means."
 )
 
 REWRITE_PROMPTS = {
@@ -1368,9 +1384,12 @@ def schedule_deferred_stop(tap_time):
 def handle_flags_changed(event):
     global locked, press_time, last_tap, lock_time
     keycode, device_mask, _ = HOTKEYS[settings["hotkey"]]
-    instr_code, instr_mask = instruction_key()
-    if event.keyCode() == instr_code and state == "recording" and recording:
-        changed = recording.mark_instruction(bool(event.modifierFlags() & instr_mask))
+    instr_keys = instruction_keys()
+    if event.keyCode() in instr_keys and state == "recording" and recording:
+        # Held while any of them is down, so letting go of one Shift while
+        # the other is still pressed doesn't end the instruction
+        held = event.modifierFlags() & sum(instr_keys.values())
+        changed = recording.mark_instruction(bool(held))
         if changed == "opened":
             overlay.setPhase_("instructing")
         elif changed == "closed":
