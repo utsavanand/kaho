@@ -101,6 +101,11 @@ worker thread     ──▶ loops on Queue.get(): transcribe (dictionary + any
                       screen words that arrived as hotwords) ▸ optional
                       rewrite ▸ pbcopy ▸ Cmd+V ▸ history
                       logs one line per event (text, timing, or why dropped)
+agent hook        ──▶ `Kaho --agent-done <agent>` exits before the heavy
+                      imports, hands the reply to agent.sock and returns;
+                      the app queues it on the same worker Queue (MLX must
+                      never see two threads) ▸ on-device summary ▸ /usr/bin/say.
+                      Any hotkey press kills the speech first
 ```
 
 - The monitor callbacks only flip state and enqueue — they return in

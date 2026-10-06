@@ -13,12 +13,17 @@ Run with:  python -m unittest discover -s tests -t .
 """
 
 import ctypes
+import io
 import json
 import os
 import pathlib
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -159,7 +164,8 @@ class KahoTestCase(unittest.TestCase):
         self.enterContext(mock.patch.object(
             kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True}
+             "api_url": "", "api_model": "", "screen_words": True,
+             "agent_voice": False}
         ))
         self.enterContext(mock.patch.object(kaho, "overlay", mock.MagicMock()))
         # A real read starts a thread against the stubbed accessibility API;
@@ -417,7 +423,7 @@ class TestSettings(KahoTestCase):
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True},
+             "api_url": "", "api_model": "", "screen_words": True, "agent_voice": False},
         )
 
     def test_a_non_finite_timestamp_is_skipped_not_fatal(self):
@@ -473,7 +479,7 @@ class TestSettings(KahoTestCase):
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True},
+             "api_url": "", "api_model": "", "screen_words": True, "agent_voice": False},
         )
 
     def test_saved_settings_round_trip_and_stay_private(self):
@@ -2077,6 +2083,317 @@ class TestScreenWords(KahoTestCase):
         kaho.settings["screen_words"] = True
         kaho.load_settings()
         self.assertFalse(kaho.settings["screen_words"])
+
+
+def _jsonl(*entries):
+    return "".join(json.dumps(e) + "\n" for e in entries)
+
+
+# Shaped like a real Claude Code transcript: the last turn ends with text that
+# follows a tool call, and a subagent's reply lands after the main one
+CLAUDE_TRANSCRIPT = _jsonl(
+    {"type": "user", "message": {"role": "user", "content": "fix the flaky test"}},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "Let me look at the test first."},
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pytest"}},
+    ]}},
+    {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "1 failed"},
+    ]}},
+    {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "Fixed it: the test joined its thread too late.\n\nAll 154 tests pass now."},
+    ]}},
+    {"type": "assistant", "isSidechain": True, "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "subagent chatter that must not be read out"},
+    ]}},
+)
+
+
+# A user who already has hooks of their own, which connecting must not disturb
+EXISTING_CLAUDE = {
+    "model": "opus",
+    "hooks": {
+        "Stop": [{"matcher": "*", "hooks": [{"type": "command", "command": "uv-suite checkpoint"}]}],
+        "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "audit"}]}],
+    },
+}
+
+
+class TestAgentVoice(KahoTestCase):
+    """Coding agents finishing a reply: hook payloads in, a short spoken summary out."""
+
+    def setUp(self):
+        super().setUp()
+        while not kaho.jobs.empty():
+            kaho.jobs.get()
+        self.addCleanup(kaho.stop_speaking)
+
+    def path(self, name):
+        return str(pathlib.Path(self.tmp.name) / name)
+
+    def write(self, name, text):
+        pathlib.Path(self.path(name)).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(self.path(name)).write_text(text)
+        return self.path(name)
+
+    def short_home(self):
+        # A Unix socket path must fit in 104 bytes; tmpdirs on macOS do not
+        home = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(shutil.rmtree, home, True)
+        return home
+
+    # -- hook payloads ---------------------------------------------------
+    def test_claude_code_names_its_transcript_on_stdin(self):
+        stdin = io.StringIO(json.dumps({"transcript_path": "/t.jsonl", "stop_hook_active": False}))
+        self.assertEqual(kaho.agent_message("claude-code", [], stdin),
+                         {"agent": "claude-code", "transcript_path": "/t.jsonl"})
+
+    def test_codex_passes_the_reply_as_the_last_argument(self):
+        payload = {"type": "agent-turn-complete", "turn-id": "1", "last-assistant-message": "Done."}
+        msg = kaho.agent_message("codex", [json.dumps(payload)], io.StringIO(""))
+        self.assertEqual(msg, {"agent": "codex", "text": "Done."})
+
+    def test_other_codex_events_are_ignored(self):
+        payload = {"type": "approval-requested", "last-assistant-message": "Done."}
+        self.assertIsNone(kaho.agent_message("codex", [json.dumps(payload)], io.StringIO("")))
+
+    def test_a_long_codex_reply_keeps_its_end(self):
+        text = "x" * (kaho.AGENT_TEXT_MAX_CHARS + 50) + "the wrap-up."
+        payload = {"type": "agent-turn-complete", "last-assistant-message": text}
+        msg = kaho.agent_message("codex", [json.dumps(payload)], io.StringIO(""))
+        self.assertEqual(len(msg["text"]), kaho.AGENT_TEXT_MAX_CHARS)
+        self.assertTrue(msg["text"].endswith("the wrap-up."))
+
+    def test_the_final_reply_is_read_from_the_transcript_tail(self):
+        path = self.write("t.jsonl", CLAUDE_TRANSCRIPT)
+        self.assertEqual(
+            kaho.last_assistant_text(path),
+            "Fixed it: the test joined its thread too late.\n\nAll 154 tests pass now.",
+        )
+
+    def test_a_cut_first_line_in_the_tail_is_skipped(self):
+        path = self.write("t.jsonl", '{"type": "assist' + "\n" + CLAUDE_TRANSCRIPT)
+        with mock.patch.object(kaho, "TRANSCRIPT_TAIL_BYTES", len(CLAUDE_TRANSCRIPT) + 3):
+            self.assertIn("Fixed it", kaho.last_assistant_text(path))
+
+    def test_a_message_becomes_a_reply_or_a_reason(self):
+        path = self.write("t.jsonl", CLAUDE_TRANSCRIPT)
+        reply, why = kaho.agent_reply_from_message(
+            json.dumps({"agent": "claude-code", "transcript_path": path}).encode()
+        )
+        self.assertEqual((reply.agent, why), ("claude-code", None))
+        self.assertEqual(kaho.agent_reply_from_message(b"{nope")[1], "unreadable message")
+        self.assertEqual(kaho.agent_reply_from_message(b'{"agent": "cursor"}')[1], "unknown agent")
+        missing = json.dumps({"agent": "claude-code", "transcript_path": self.path("gone.jsonl")})
+        self.assertEqual(kaho.agent_reply_from_message(missing.encode())[1],
+                         "transcript unreadable (FileNotFoundError)")
+
+    def test_nothing_is_queued_while_the_setting_is_off(self):
+        message = json.dumps({"agent": "codex", "text": "Done."}).encode()
+        kaho.handle_agent_message(message)
+        self.assertTrue(kaho.jobs.empty())
+        kaho.settings["agent_voice"] = True
+        kaho.handle_agent_message(message)
+        self.assertEqual(kaho.jobs.get_nowait(), kaho.AgentReply("codex", "Done."))
+
+    # -- summary --------------------------------------------------------
+    def test_without_the_model_the_first_sentence_is_read(self):
+        text = "Fixed the `parse_config` bug in [config.py](src/config.py). Tests pass.\n\n```py\nx = 1\n```"
+        # Underscores read as spaces: "parse underscore config" is noise
+        self.assertEqual(kaho.summarize_agent_reply(text),
+                         ("Fixed the parse config bug in config.py.", "first sentence"))
+
+    def test_a_runaway_first_sentence_is_capped(self):
+        summary, _ = kaho.summarize_agent_reply("word " * 80)
+        self.assertEqual(len(summary.split()), kaho.AGENT_FALLBACK_WORDS)
+        self.assertTrue(summary.endswith("…"))
+
+    def test_markdown_is_not_read_out(self):
+        self.assertEqual(
+            kaho.speakable("## Done\n- **Fixed** the `test`\n- see https://x.io/a\n```\ncode\n```"),
+            "Done Fixed the test see",
+        )
+
+    # -- speaking ------------------------------------------------------
+    def test_speech_goes_to_the_system_voice_through_stdin(self):
+        out = self.path("spoken.txt")
+        with mock.patch.object(kaho, "SAY_COMMAND", ("/bin/sh", "-c", f"cat > '{out}'", "say")):
+            kaho.speak("-starts with a dash and stays text")
+            kaho.speech.wait(5)
+        self.assertEqual(pathlib.Path(out).read_text(), "-starts with a dash and stays text")
+
+    def test_pressing_the_hotkey_stops_a_reply_being_read(self):
+        with mock.patch.object(kaho, "SAY_COMMAND", ("/bin/sh", "-c", "sleep 30", "say")):
+            kaho.speak("a long reply")
+        proc = kaho.speech
+        self.down()
+        self.assertIsNotNone(proc.wait(5))
+        self.assertIsNone(kaho.speech)
+
+    def test_nothing_is_spoken_mid_dictation(self):
+        kaho.state = "recording"
+        with mock.patch.object(kaho, "speak") as speak:
+            kaho.speak_agent_reply(kaho.AgentReply("codex", "Done."))
+        speak.assert_not_called()
+        self.assertIn("[agent codex: skipped, dictation in progress]", self.logged)
+
+    def test_a_kaho_still_loading_its_models_reads_replies(self):
+        # Found live: the speech model loads for seconds at startup, and the
+        # first version skipped every reply until it was ready
+        kaho.state = "loading"
+        with mock.patch.object(kaho, "speak") as speak:
+            kaho.speak_agent_reply(kaho.AgentReply("codex", "Done."))
+        speak.assert_called_once_with("Done.")
+
+    def test_only_a_word_count_is_logged(self):
+        with mock.patch.object(kaho, "speak"):
+            kaho.speak_agent_reply(kaho.AgentReply("codex", "Shipped the secret-project migration."))
+        self.assertEqual(self.logged, ["[agent codex: spoke 4 words (first sentence)]"])
+
+    # -- the hook entry point ------------------------------------------
+    def run_entry(self, home, *args, stdin=""):
+        script = pathlib.Path(__file__).resolve().parent.parent / "kaho.py"
+        t0 = time.monotonic()
+        done = subprocess.run(
+            [sys.executable, str(script), "--agent-done", *args],
+            input=stdin, text=True, capture_output=True, timeout=10, check=False,
+            env={**os.environ, "HOME": home},
+        )
+        return done, time.monotonic() - t0
+
+    def test_the_hook_exits_at_once_when_kaho_is_not_running(self):
+        payload = json.dumps({"type": "agent-turn-complete", "last-assistant-message": "Done."})
+        done, elapsed = self.run_entry(self.short_home(), "codex", payload)
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "", ""))
+        # The early exit skips AppKit and MLX entirely, so this is quick even
+        # on a slow CI runner
+        self.assertLess(elapsed, 2.0)
+
+    def test_the_hook_hands_the_reply_to_the_running_app(self):
+        home = self.short_home()
+        support = pathlib.Path(home, "Library", "Application Support", "Kaho")
+        support.mkdir(parents=True)
+        server = kaho.open_agent_socket(str(support / "agent.sock"))
+        self.addCleanup(server.close)
+        self.assertEqual(stat.S_IMODE(os.stat(support / "agent.sock").st_mode), 0o600)
+        transcript = self.write("t.jsonl", CLAUDE_TRANSCRIPT)
+        received = []
+
+        def accept_one():
+            conn, _ = server.accept()
+            with conn:
+                received.append(conn.recv(65536))
+
+        t = threading.Thread(target=accept_one)
+        t.start()
+        done, _ = self.run_entry(home, "claude-code", stdin=json.dumps({"transcript_path": transcript}))
+        t.join(5)
+        self.assertEqual(done.returncode, 0)
+        kaho.settings["agent_voice"] = True
+        kaho.handle_agent_message(received[0])
+        self.assertIn("All 154 tests pass", kaho.jobs.get_nowait().text)
+
+    def test_a_stale_socket_file_is_replaced(self):
+        home = self.short_home()
+        path = os.path.join(home, "agent.sock")
+        pathlib.Path(path).write_text("left behind by a crash")
+        server = kaho.open_agent_socket(path)
+        self.addCleanup(server.close)
+        self.assertTrue(stat.S_ISSOCK(os.stat(path).st_mode))
+
+    # -- Claude Code settings ------------------------------------------
+    def test_connecting_keeps_existing_hooks_and_makes_a_backup(self):
+        path = self.write(".claude/settings.json", json.dumps(EXISTING_CLAUDE, indent=2))
+        backup = kaho.connect_claude_code(path, "/Applications/Kaho.app/Contents/MacOS/Kaho --agent-done claude-code")
+        data = json.loads(pathlib.Path(path).read_text())
+        self.assertEqual(data["model"], "opus")
+        self.assertEqual(data["hooks"]["PostToolUse"], EXISTING_CLAUDE["hooks"]["PostToolUse"])
+        self.assertEqual(data["hooks"]["Stop"][0], EXISTING_CLAUDE["hooks"]["Stop"][0])
+        self.assertEqual(len(data["hooks"]["Stop"]), 2)
+        self.assertEqual(json.loads(pathlib.Path(backup).read_text()), EXISTING_CLAUDE)
+        self.assertTrue(kaho.claude_code_connected(path))
+
+    def test_connecting_twice_adds_one_hook(self):
+        path = self.write(".claude/settings.json", json.dumps(EXISTING_CLAUDE))
+        kaho.connect_claude_code(path, "kaho --agent-done claude-code")
+        self.assertIsNone(kaho.connect_claude_code(path, "kaho --agent-done claude-code"))
+        self.assertEqual(len(json.loads(pathlib.Path(path).read_text())["hooks"]["Stop"]), 2)
+
+    def test_disconnecting_removes_only_kahos_hook(self):
+        path = self.write(".claude/settings.json", json.dumps(EXISTING_CLAUDE))
+        kaho.connect_claude_code(path, "kaho --agent-done claude-code")
+        kaho.disconnect_claude_code(path)
+        self.assertEqual(json.loads(pathlib.Path(path).read_text()), EXISTING_CLAUDE)
+
+    def test_a_missing_settings_file_is_created_and_removed_cleanly(self):
+        path = self.path(".claude/settings.json")
+        self.assertIsNone(kaho.connect_claude_code(path, "kaho --agent-done claude-code"))
+        kaho.disconnect_claude_code(path)
+        self.assertEqual(json.loads(pathlib.Path(path).read_text()), {})
+
+    def test_an_unexpected_settings_shape_is_refused_untouched(self):
+        path = self.write(".claude/settings.json", '{"hooks": {"Stop": "nope"}}')
+        with self.assertRaises(TypeError):
+            kaho.connect_claude_code(path, "kaho --agent-done claude-code")
+        self.assertEqual(pathlib.Path(path).read_text(), '{"hooks": {"Stop": "nope"}}')
+        self.assertEqual(len(list(pathlib.Path(path).parent.iterdir())), 1)  # no backup either
+
+    # -- Codex config --------------------------------------------------
+    CODEX_CONFIG = (
+        'model = "gpt-5.1-codex"\n'
+        "# chained by Computer Use\n"
+        'notify = [\n  "/Apps/Codex Computer Use.app/client",  # the client\n  "turn-ended",\n]\n'
+        "\n[profiles.fast]\n"
+        'notify = ["only-in-a-table"]\n'
+    )
+
+    def test_codex_notify_is_chained_and_restored_byte_for_byte(self):
+        path = self.write(".codex/config.toml", self.CODEX_CONFIG)
+        kaho.connect_codex(path, "/Applications/Kaho.app/Contents/MacOS/Kaho")
+        wrapper, _ = kaho.codex_paths()
+        text = pathlib.Path(path).read_text()
+        self.assertIn(f'notify = ["{wrapper}"]\n', text)
+        self.assertIn('notify = ["only-in-a-table"]', text)  # a table's notify is not the top-level one
+        script = pathlib.Path(wrapper).read_text()
+        self.assertIn("exec '/Apps/Codex Computer Use.app/client' turn-ended \"$@\"", script)
+        self.assertEqual(stat.S_IMODE(os.stat(wrapper).st_mode), 0o700)
+        self.assertTrue(kaho.codex_connected(path))
+        kaho.disconnect_codex(path)
+        self.assertEqual(pathlib.Path(path).read_text(), self.CODEX_CONFIG)
+        self.assertFalse(os.path.exists(wrapper))
+
+    def test_a_config_without_notify_gets_one_and_loses_it_again(self):
+        original = 'model = "o4"\n\n[profiles.x]\nnotify = ["inner"]\n'
+        path = self.write(".codex/config.toml", original)
+        kaho.connect_codex(path, "kaho")
+        self.assertTrue(pathlib.Path(path).read_text().startswith("notify = ["))
+        kaho.disconnect_codex(path)
+        self.assertEqual(pathlib.Path(path).read_text(), original)
+
+    def test_the_codex_wrapper_runs_the_old_command_and_kaho(self):
+        log_dir = pathlib.Path(self.tmp.name)
+        fake_previous = self.write("previous.sh", f"#!/bin/sh\necho \"$@\" > '{log_dir}/previous.args'\n")
+        fake_kaho = self.write("kaho.sh", f"#!/bin/sh\necho \"$@\" > '{log_dir}/kaho.args'\n")
+        os.chmod(fake_previous, 0o755)
+        os.chmod(fake_kaho, 0o755)
+        path = self.write(".codex/config.toml", f'notify = ["{fake_previous}", "turn-ended"]\n')
+        kaho.connect_codex(path, fake_kaho)
+        wrapper, _ = kaho.codex_paths()
+        payload = '{"type": "agent-turn-complete"}'
+        done = subprocess.run([wrapper, payload], timeout=10, check=False)
+        self.assertEqual(done.returncode, 0)
+        for _ in range(50):  # Kaho is started in the background
+            if (log_dir / "kaho.args").exists():
+                break
+            time.sleep(0.1)
+        self.assertEqual((log_dir / "previous.args").read_text().strip(), f"turn-ended {payload}")
+        self.assertEqual((log_dir / "kaho.args").read_text().strip(), f"--agent-done codex {payload}")
+
+    def test_the_agent_setting_survives_a_restart(self):
+        kaho.apply_agent_voice(True)
+        kaho.settings["agent_voice"] = False
+        kaho.load_settings()
+        self.assertTrue(kaho.settings["agent_voice"])
 
 
 if __name__ == "__main__":

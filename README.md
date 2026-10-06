@@ -38,6 +38,9 @@ telemetry.
   (the Slack thread, the email, the PR) are spelled the way that window
   spells them, with nothing added to the dictionary. Read in memory when you
   press the hotkey, used for that one dictation, then discarded
+- **Hear your coding agent finish** — when Claude Code or Codex ends a
+  reply, Kaho reads a one- or two-sentence summary aloud, made on this Mac.
+  Press the hotkey to stop it and dictate your answer
 - **On-device** — audio never leaves the machine; works offline. (Optional:
   point the *rewrite* step at a cloud model with your own key — transcript
   only, never audio.)
@@ -56,6 +59,8 @@ log, and one-click bug reports:
   stop Kaho reading the focused window at all. Some apps don't expose their
   text: Electron apps such as Slack, Notion and VS Code only do once asked,
   so the first dictation into one gets no words and later ones do
+- **Read Agent Replies Aloud** and **Connect Coding Agents…** — see
+  [Coding agents](#coding-agents) below
 - **Hotkey** — right Option (default), right Command, right Control, or right
   Shift. Right-side only: the left keys are needed for typing.
 - **Say how you want it written** — while still holding the hotkey, press
@@ -109,6 +114,35 @@ as-is when the model is at least 90% sure, skipping the rewrite entirely.
 
 Off by default. If the model isn't loaded yet or a rewrite fails, the raw
 transcript is pasted — you never lose words.
+
+## Coding agents
+
+Dictate a prompt to Claude Code or Codex, look away, and hear when it's
+done: when the agent finishes a reply, Kaho reads a one- or two-sentence
+summary aloud in your system voice. Press the hotkey to stop it mid-sentence
+and dictate your answer.
+
+**🎙 → Connect Coding Agents…** shows exactly what it will change and asks
+first:
+
+- **Claude Code** — adds a Stop hook to `~/.claude/settings.json` that runs
+  `Kaho --agent-done claude-code`. Your other hooks are kept, and a backup is
+  saved next to the file.
+- **Codex** — Codex allows a single `notify` command, so Kaho doesn't take
+  it over: `notify` in `~/.codex/config.toml` points at a small script in
+  Kaho's support folder that runs your existing notify command first, then
+  Kaho. A backup is saved next to the file.
+
+Connecting turns on **Read Agent Replies Aloud**; untick it in the menu or
+Settings to stay connected but quiet. Run Connect Coding Agents… again to
+**Disconnect**, which puts both files back the way they were (Codex's line
+byte for byte).
+
+The summary comes from the on-device rewrite model when it's loaded (about
+half a second), and otherwise the reply's first sentence is read. It never
+goes to a cloud model, even when the rewrite step is set to one: agent
+replies are your code and project detail. Nothing is read aloud while you're
+dictating, and the hook does nothing at all when Kaho isn't running.
 
 ## Install
 
@@ -241,6 +275,9 @@ flowchart LR
     P --> A["Focused app"]
     T --> H[("history.jsonl")]
     H --> V["History window"]
+    G["Claude Code / Codex hook — Kaho --agent-done"] -.-> U[["agent.sock (owner-only)"]]
+    U -.-> W
+    W -.-> SAY["one- or two-sentence summary — /usr/bin/say"]
 ```
 
 The hotkey handler and UI live on the main run loop; recording and inference
@@ -261,6 +298,13 @@ out stay in memory for that one dictation and are then discarded — they are
 never written to the log, the history, or disk, and never sent anywhere.
 Kaho's own windows are never read. Untick **Use Words on Screen** in the menu
 or Settings to turn it off.
+
+Coding-agent replies (only once you Connect Coding Agents and only while
+**Read Agent Replies Aloud** is on) are read from the agent's own transcript
+on this Mac, summarized by the on-device model, and spoken. They are never
+sent anywhere, even with a cloud rewrite key set, and never logged: the log
+records only how many words were spoken. The hook talks to Kaho over a
+socket in Kaho's support folder that only your user account can open.
 
 ## Development
 
