@@ -1,0 +1,7 @@
+# Kaho Windows spike. One native speech package (sherpa-onnx bundles
+# onnxruntime), no PyTorch. Pinned so the benchmark is reproducible.
+sherpa-onnx==1.13.8
+numpy==2.5.3
+soundfile==0.14.0
+sounddevice==0.5.6
+PySide6-Essentials==6.11.2
