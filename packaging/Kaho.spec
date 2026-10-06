@@ -109,6 +109,12 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
+    # Keep the PKG (all pure-Python code, compressed) out of the executable.
+    # Appended, it made a 45 MB launcher that Apple's notary service held
+    # and then dropped without a verdict — even 2.2.0's previously accepted
+    # copy. PyInstaller places the separate Kaho.pkg in Contents/Resources,
+    # symlinked into Contents/MacOS where the bootloader looks for it.
+    append_pkg=False,
     name="Kaho",
     debug=False,
     bootloader_ignore_signals=False,
