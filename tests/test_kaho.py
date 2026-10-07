@@ -180,8 +180,8 @@ class KahoTestCase(unittest.TestCase):
         self.enterContext(mock.patch("kaho.time.monotonic", self.clock))
 
         # A fresh stream object per open, so the tests can tell them apart
-        kaho.sd.InputStream.reset_mock()
-        kaho.sd.InputStream.side_effect = lambda **_: mock.MagicMock(name="stream")
+        self.enterContext(mock.patch.object(kaho.audio_capture, "InputStream"))
+        kaho.audio_capture.InputStream.side_effect = lambda **_: mock.MagicMock(name="stream")
         kaho.AppKit.NSTimer.reset_mock()
         kaho.AppKit.NSPasteboard.reset_mock()
         kaho.AppHelper.callAfter.reset_mock()
@@ -268,7 +268,7 @@ class TestTapStateMachine(KahoTestCase):
         to lock without a stop in between.
         """
         opened = []
-        kaho.sd.InputStream.side_effect = lambda **_: opened.append(mock.MagicMock()) or opened[-1]
+        kaho.audio_capture.InputStream.side_effect = lambda **_: opened.append(mock.MagicMock()) or opened[-1]
         self._lock_hands_free()
         self.run_audio_ops()
         self.assertEqual(len(opened), 1, "the double-tap reopened the stream")
@@ -346,7 +346,7 @@ class TestRecordingHandoff(KahoTestCase):
 
     def test_a_release_before_the_open_lands_leaves_no_stream_behind(self):
         opened = []
-        kaho.sd.InputStream.side_effect = lambda **_: opened.append(mock.MagicMock()) or opened[-1]
+        kaho.audio_capture.InputStream.side_effect = lambda **_: opened.append(mock.MagicMock()) or opened[-1]
         kaho.start_recording()
         kaho.stop_recording()  # key released while the open is still queued
         self.run_audio_ops()
@@ -363,18 +363,44 @@ class TestRecordingHandoff(KahoTestCase):
         dead, because start_recording will not start when one is supposedly
         already running.
         """
-        kaho.sd.InputStream.side_effect = RuntimeError("something unforeseen")
+        kaho.audio_capture.InputStream.side_effect = RuntimeError("something unforeseen")
         kaho.start_recording()
         self.run_audio_ops()
         self.assertEqual(kaho.state, "ready", "the app was left unable to record")
         self.assertFalse(kaho.locked)
+
+    def test_escape_cancels_audio_waiting_for_the_child_to_freeze(self):
+        kaho.start_recording()
+        self.run_audio_ops()
+        session = kaho.recording
+        kaho.stop_recording()
+        kaho.overlay.is_working.return_value = False
+        self.assertTrue(session.pending)
+        self.assertTrue(kaho.cancel_pending_job())
+        self.assertTrue(session.cancelled)
+        self.run_audio_ops()
+        self.assertFalse(session.pending)
+
+    def test_late_error_from_old_capture_cannot_stop_the_new_recording(self):
+        kaho.start_recording()
+        self.run_audio_ops()
+        interrupted = kaho.audio_capture.InputStream.call_args.kwargs["on_error"]
+        kaho.stop_recording()
+        self.run_audio_ops()
+        kaho.start_recording()
+        current = kaho.recording
+        interrupted("old device went away")
+        finish = kaho.AppHelper.callAfter.call_args.args[0]
+        finish()
+        self.assertIs(kaho.recording, current)
+        self.assertEqual(kaho.state, "recording")
 
     def test_a_stream_that_fails_to_start_is_closed(self):
         """QA finding: an unclosed stream keeps the device claimed, so one
         bad open makes every later open fail too."""
         opened = mock.MagicMock()
         opened.start.side_effect = kaho.sd.PortAudioError("device busy")
-        kaho.sd.InputStream.side_effect = lambda **_: opened
+        kaho.audio_capture.InputStream.side_effect = lambda **_: opened
 
         kaho.start_recording()
         self.run_audio_ops()
@@ -383,7 +409,7 @@ class TestRecordingHandoff(KahoTestCase):
         self.assertEqual(kaho.state, "ready")
 
     def test_a_failed_open_returns_to_ready(self):
-        kaho.sd.InputStream.side_effect = kaho.sd.PortAudioError("no device")
+        kaho.audio_capture.InputStream.side_effect = kaho.sd.PortAudioError("no device")
         kaho.start_recording()
         self.assertEqual(kaho.state, "recording")
         self.run_audio_ops()

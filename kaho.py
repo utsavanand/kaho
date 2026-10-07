@@ -1,6 +1,17 @@
 """Kaho: hold the hotkey (right Option by default) anywhere, speak, release —
 locally transcribed text is pasted into the focused app. See DESIGN.md."""
 
+# The packaged audio child must dispatch before importing GUI/model packages.
+import sys
+
+# A source-installed bundle is signed too; do not add __pycache__ files inside it.
+sys.dont_write_bytecode = True
+
+import audio_capture
+
+if __name__ == "__main__" and "--kaho-audio-helper" in sys.argv:
+    audio_capture.child_main()
+
 import collections
 import ctypes
 import difflib
@@ -13,7 +24,6 @@ import platform
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -451,7 +461,8 @@ class Recording:
     moment the user is mid-sentence.
     """
 
-    __slots__ = ("buf", "cancelled", "released_at", "screen_done", "screen_terms", "spans")
+    __slots__ = ("buf", "cancelled", "pending", "released_at", "screen_done",
+                 "screen_terms", "spans")
 
     def __init__(self):
         self.buf = []
@@ -462,6 +473,7 @@ class Recording:
         # in the dictation it was taken for
         self.screen_terms = None
         self.screen_done = False
+        self.pending = False  # released, but final audio has not reached the worker
         # When the user let go of the key. The number that matters to them
         # starts here, not when the worker picks the job up: the old timer
         # began after jobs.get(), so microphone shutdown and queue waiting
@@ -535,7 +547,7 @@ def _private_opener(path, flags):
 def log(msg):
     # Best-effort by design: log() runs inside the exception handlers that
     # keep the workers alive, so it must never raise (full disk, broken pipe)
-    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
     try:
         print(line, flush=True)
     except OSError:
@@ -840,12 +852,9 @@ def pick_input_device():
     return None, sd.query_devices(kind="input")["name"] + " (system default)"
 
 
-# CoreAudio open/stop can block indefinitely on a HAL mutex held by another
-# audio client (observed as a full main-thread deadlock with Wispr Flow
-# running), so every PortAudio call runs on one dedicated audio thread — the
-# hotkey and UI stay alive no matter what the audio stack does, and
-# serializing the ops means a wedged device pins at most that one thread
-# instead of leaking a new one per recording.
+# Serialize capture ownership on one executor. Native microphone calls now run
+# in replaceable child processes: a CoreAudio hang cannot pin this executor and
+# permanently disable later recordings. Models stay in the parent process.
 def audio_control():
     global audio_op_started
     while True:
@@ -1195,12 +1204,23 @@ def _open_stream(buf):
     global stream, state, locked
     s = None
     try:
-        s = sd.InputStream(
-            device=input_device,
+        def interrupted(message):
+            def finish_interrupted():
+                if record_buf is buf and state == "recording":
+                    log(f"microphone interrupted — preserving captured speech: {message}")
+                    stop_recording()
+            AppHelper.callAfter(finish_interrupted)
+
+        s = audio_capture.InputStream(
+            # PortAudio indices can differ between independently initialized
+            # processes after hotplug. Resolve the selected name in the child.
+            device=input_name if input_device is not None else None,
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
-            callback=lambda data, *_: buf.append(data.copy()),
+            callback=lambda data, *_: buf.append(data),  # reader supplies an owned array
+            on_error=interrupted,
+            log=log,
         )
         s.start()
     except Exception as e:  # noqa: BLE001
@@ -1245,13 +1265,13 @@ def _shutdown_stream(s):
     # keep the microphone device busy and wedge every later open
     try:
         s.stop()
-    except sd.PortAudioError as e:
+    except (sd.PortAudioError, audio_capture.CaptureError) as e:
         log(f"mic stop failed: {e}")
     finally:
         try:
             s.close()
-        except sd.PortAudioError:
-            pass
+        except (sd.PortAudioError, audio_capture.CaptureError) as e:
+            log(f"mic close failed: {e}")
 
 
 def stop_recording():
@@ -1265,6 +1285,7 @@ def stop_recording():
         s, buf, session = stream, record_buf, recording
         if session is not None:
             session.released_at = time.monotonic()
+            session.pending = True
         stream = None
         record_buf = None
     # The pill stays up: the worker switches it to "Transcribing…" and hides
@@ -1307,16 +1328,24 @@ def _audio_or_drop_reason(buf):
 def _finish_recording(s, buf, session=None):
     """Hand the recording to the worker, then release the device.
 
-    Enqueue first, shut down second. The buffer is already complete by the
-    time this runs — the callback stopped appending when stop_recording took
-    the stream — so nothing about the transcript depends on the device
-    closing. CoreAudio's stop can block forever on a HAL mutex (seen in
-    process samples, and both stop() and abort() route through
-    FinishStoppingStream), and doing it first meant a hung device threw away
-    speech the user had already finished saying.
+    Freeze and drain the capture pipe first, then enqueue the immutable audio
+    before native shutdown. The old callback kept appending to buf after release;
+    moving its stream reference did not stop it. Child cleanup has a hard deadline
+    and cannot leave the audio executor permanently unable to open the next mic.
     """
+    if s is not None:
+        try:
+            s.freeze()
+        except audio_capture.CaptureError as e:
+            if session is not None:
+                session.pending = False
+            log(f"could not finalize microphone capture: {e}")
+            _shutdown_stream(s)
+            AppHelper.callAfter(overlay.showProblem_, "Mic interrupted — try again")
+            return
     # This recording's own cancel flag, not a global one: cancelling a later
     # dictation used to discard whichever recording finalized next.
+    generation = job_generation
     if session is not None and session.cancelled:
         AppHelper.callAfter(overlay.hide)
     else:
@@ -1332,7 +1361,10 @@ def _finish_recording(s, buf, session=None):
             released = session.released_at if session is not None else None
             global job_outstanding
             job_outstanding = True
-            jobs.put((audio, job_generation, spans, released, session))
+            jobs.put((audio, generation, spans, released, session))
+
+    if session is not None:
+        session.pending = False
 
     if s is not None:
         t0 = time.monotonic()
@@ -1459,9 +1491,12 @@ def cancel_pending_job():
     really is stopped.
     """
     global job_generation, locked
-    if state != "recording" and not overlay.is_working():
+    pending = recording is not None and recording.pending
+    if state != "recording" and not overlay.is_working() and not pending:
         return False
     job_generation += 1
+    if pending:
+        recording.cancelled = True
     if state == "recording":
         # Marked on this recording, not on a global: the generation counter
         # cannot cover it either, because _finish_recording runs later on the
@@ -3487,6 +3522,7 @@ def main():
         os.remove(RELAUNCH_MARKER_PATH)
     except OSError:
         pass
+    log(f"Kaho {APP_VERSION} pid={os.getpid()} — isolated microphone capture enabled")
     ensure_dictionary_file()
     # Migrate transcript files created by older versions to private mode;
     # _private_opener only covers newly created files
