@@ -10,6 +10,11 @@ import queue
 import threading
 
 VK_RCONTROL = 0xA3
+# Selectable for testing over Remote Desktop from a Mac, whose keyboard has
+# no Right Ctrl: right ⌥ arrives as Right Alt and right ⌘ as the Windows key.
+# Right Alt is AltGr on most non-US layouts, so it stays out of the default.
+HOTKEYS = {"rctrl": VK_RCONTROL, "ralt": 0xA5, "rwin": 0x5C, "f8": 0x77, "f9": 0x78}
+KEY_NAMES = {"rctrl": "Right Ctrl", "ralt": "Right Alt (right ⌥ from a Mac)", "rwin": "Right Windows key", "f8": "F8", "f9": "F9"}
 
 IDLE, HOLDING = "idle", "holding"
 START, STOP, CANCEL = "start", "stop", "cancel"

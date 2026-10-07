@@ -22,6 +22,8 @@ def parse(argv):
     p.add_argument("command", nargs="?", default="run", choices=["run", "bench"])
     p.add_argument("--engine", default="qwen3", choices=["qwen3", "parakeet", "moonshine"])
     p.add_argument("--hotwords", default="", help="comma-separated names/terms to bias qwen3 toward")
+    p.add_argument("--hotkey", default="rctrl", choices=["rctrl", "ralt", "rwin", "f8", "f9"],
+                   help="key to hold; use ralt or f8 over Remote Desktop from a Mac")
     p.add_argument("--threads", type=int, default=min(4, os.cpu_count() or 4))
     p.add_argument("--models-dir", default=str(DATA / "models"))
     p.add_argument("--out", help="bench: also write the Markdown table here")
@@ -38,7 +40,7 @@ def run(args):
 
     from . import engines
     from .clipboard import WinClipboard, paste
-    from .hotkey import CANCEL, START, STOP, HotkeyHook
+    from .hotkey import CANCEL, HOTKEYS, KEY_NAMES, START, STOP, HotkeyHook
     from .overlay import Pill
 
     DATA.mkdir(parents=True, exist_ok=True)
@@ -50,7 +52,7 @@ def run(args):
     t = time.monotonic()
     rec = engines.load(args.engine, args.models_dir, hotwords=hotwords, threads=args.threads)
     engines.transcribe(rec, np.zeros(engines.SAMPLE_RATE // 2, dtype=np.float32))  # warm-up
-    log(f"ready in {time.monotonic() - t:.1f}s — hold Right Ctrl, talk, release. Ctrl+C here to quit.")
+    log(f"ready in {time.monotonic() - t:.1f}s — hold {KEY_NAMES[args.hotkey]}, talk, release. Ctrl+C here to quit.")
 
     app = QtWidgets.QApplication([])
     pill = Pill()
@@ -99,7 +101,7 @@ def run(args):
             pill.show_state.emit("Transcribing…")
             threading.Thread(target=finish, args=(audio,), daemon=True).start()
 
-    hook = HotkeyHook(on_action)
+    hook = HotkeyHook(on_action, HOTKEYS[args.hotkey])
     hook.start()
     hook.ready.wait(5)
     if hook.error or not hook.ready.is_set():

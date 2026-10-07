@@ -14,6 +14,8 @@ speech engines are on your hardware.
    A black console window opens. The FIRST run downloads the speech model
    (about 840 MB) and shows progress; after that it starts in a few seconds.
    Wait for: "ready … hold Right Ctrl, talk, release".
+   Over Remote Desktop from a Mac (no Right Ctrl key): run kaho-spike.exe --hotkey ralt
+   and hold the right Option key instead (or --hotkey f8).
 
 3. Open Notepad and click into it.
    Hold the RIGHT Ctrl key, say a sentence, let go.
