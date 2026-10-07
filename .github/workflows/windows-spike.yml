@@ -60,6 +60,15 @@ jobs:
           "`n### Same benchmark from the packaged exe`n" | Add-Content $env:GITHUB_STEP_SUMMARY
           Get-Content ../../bench-packaged.md | Add-Content $env:GITHUB_STEP_SUMMARY
 
+      - name: First-run model download from the packaged exe (empty models dir)
+        shell: pwsh
+        working-directory: dist/kaho-spike
+        run: |
+          # The earlier steps reuse cached models, so this is the only check that a
+          # fresh install can download them (it once failed on certificate checks)
+          ./kaho-spike.exe bench --models-dir "$env:RUNNER_TEMP/fresh-models" --out "$env:RUNNER_TEMP/bench-fresh.md"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Stage artifact
         run: |
           Copy-Item README.txt ../dist/kaho-spike/README.txt
