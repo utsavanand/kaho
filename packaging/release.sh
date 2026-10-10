@@ -14,11 +14,12 @@
 #
 # Then:  ./packaging/release.sh 2.0.0
 #        ./packaging/release.sh 2.0.0 --build-only   # stop after the bundle checks, unsigned
+#        ./packaging/release.sh 2.0.0 --zip          # notarize and ship a zip, no DMG
 
 set -euo pipefail
 
 VERSION="${1:-}"
-[[ -n "$VERSION" ]] || { echo "usage: $0 <version> [--build-only]   e.g. $0 2.0.0"; exit 1; }
+[[ -n "$VERSION" ]] || { echo "usage: $0 <version> [--build-only|--zip]   e.g. $0 2.0.0"; exit 1; }
 BUILD_ONLY="${2:-}"
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
@@ -153,22 +154,6 @@ codesign --force --deep --timestamp --options runtime \
     --entitlements "$BUILD/entitlements.plist" --sign "$IDENTITY" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
-echo "==> packaging the dmg"
-DMG="$BUILD/Kaho-$VERSION.dmg"
-STAGE="$BUILD/stage"
-rm -rf "$STAGE"; mkdir -p "$STAGE"
-cp -R "$APP" "$STAGE/"
-ln -s /Applications "$STAGE/Applications"   # drag-to-install target
-# The volume name carries the version: hdiutil mounts the image at
-# /Volumes/<volname> while building, and a fixed name stops working once
-# something on this machine holds a claim on it that survives a detach —
-# every attempt then fails with a bare "Operation not permitted" naming no
-# cause. It happened to /Volumes/Sotto, then to /Volumes/Kaho Installer.
-VOLNAME="Kaho $VERSION"
-hdiutil detach "/Volumes/$VOLNAME" -force >/dev/null 2>&1 || true
-hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
-codesign --force --timestamp --sign "$IDENTITY" "$DMG"
-
 # Poll with short-lived `info` calls rather than one long `notarytool wait`.
 # The keychain credential vanished three times in one day, each time while a
 # long-running wait was alive, and the keychain's own mtime matched. The
@@ -194,7 +179,7 @@ await_notarization() {
                 echo "could not read submission $id. notarytool said:"
                 echo "$info" | tail -3
                 echo "a 401 means the keychain profile needs store-credentials;"
-                echo "\"does not exist\" means Apple dropped it: submit the DMG again"
+                echo "\"does not exist\" means Apple dropped it: submit it again"
                 return 1 ;;
         esac
         sleep 30
@@ -204,6 +189,50 @@ await_notarization() {
     echo "resume with:  xcrun notarytool info $id --keychain-profile $NOTARY_PROFILE"
     return 1
 }
+
+if [[ "${2:-}" == "--zip" ]]; then
+    # Apple held and then dropped every Kaho DMG submitted in October 2026,
+    # including one wrapping an app it had already notarized, while the same
+    # app as a zip cleared in minutes. The zip is the release when DMGs stall.
+    ZIP="$BUILD/Kaho-$VERSION.zip"
+    echo "==> notarizing the app as a zip"
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    SUBMIT_OUT="$BUILD/notarytool-submit.txt"
+    xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" \
+        2>&1 | tee "$SUBMIT_OUT"
+    SUBMIT_ID="$(awk '/^  id:/ {print $2; exit}' "$SUBMIT_OUT")"
+    [[ -n "$SUBMIT_ID" ]] || { echo "no submission id; notarytool output is in $SUBMIT_OUT"; exit 1; }
+    echo "submission id: $SUBMIT_ID"
+    await_notarization "$SUBMIT_ID" || exit 1
+    echo "==> stapling"
+    xcrun stapler staple "$APP"
+    xcrun stapler validate "$APP"
+    # Re-zipped around the stapled app, so a first launch offline still
+    # passes Gatekeeper without an online check
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    spctl -a -t exec -vv "$APP"
+    echo ""
+    echo "done: $ZIP"
+    exit 0
+fi
+
+echo "==> packaging the dmg"
+DMG="$BUILD/Kaho-$VERSION.dmg"
+STAGE="$BUILD/stage"
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+cp -R "$APP" "$STAGE/"
+ln -s /Applications "$STAGE/Applications"   # drag-to-install target
+# The volume name carries the version: hdiutil mounts the image at
+# /Volumes/<volname> while building, and a fixed name stops working once
+# something on this machine holds a claim on it that survives a detach —
+# every attempt then fails with a bare "Operation not permitted" naming no
+# cause. It happened to /Volumes/Sotto, then to /Volumes/Kaho Installer.
+VOLNAME="Kaho $VERSION"
+hdiutil detach "/Volumes/$VOLNAME" -force >/dev/null 2>&1 || true
+hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
 echo "==> notarizing (usually minutes; large uploads can take an hour)"
 # Submit and wait separately. `submit --wait` died mid-wait when the script
