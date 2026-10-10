@@ -3,6 +3,10 @@
 # defaults move between ruff releases, and an unpinned bump would arrive as an
 # unrelated PR failing to lint.
 
+# The app is pinned to Python 3.13 (requirements.lock), so stdlib modules
+# such as tomllib are sorted as stdlib, not third-party.
+target-version = "py313"
+
 [lint.per-file-ignores]
 # PyInstaller injects Analysis, PYZ, EXE, COLLECT, BUNDLE and SPECPATH into a
 # spec file's namespace at exec time, so every one of them reads as undefined.

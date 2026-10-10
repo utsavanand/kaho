@@ -12,13 +12,66 @@ import os
 import platform
 import queue
 import re
+import shlex
+import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+import tomllib
 import traceback
 import urllib.parse
 import urllib.request
+
+AGENT_SOCKET_PATH = os.path.expanduser("~/Library/Application Support/Kaho/agent.sock")
+AGENTS = {"claude-code": "Claude Code", "codex": "Codex"}
+# A Codex reply rides in argv and over the socket; the summary only needs the
+# end of it, where agents put their wrap-up
+AGENT_TEXT_MAX_CHARS = 16_000
+
+
+def agent_message(agent, args, stdin):
+    """What a coding agent's hook hands over, as the message Kaho reads.
+
+    Claude Code pipes JSON on stdin naming the session transcript; Codex
+    passes JSON as the last argument with the reply text inside. None means
+    there is nothing to read aloud.
+    """
+    if agent == "claude-code":
+        path = json.loads(stdin.read() or "{}").get("transcript_path")
+        return {"agent": agent, "transcript_path": path} if isinstance(path, str) else None
+    if agent == "codex" and args:
+        payload = json.loads(args[-1])
+        text = payload.get("last-assistant-message")
+        if payload.get("type") == "agent-turn-complete" and isinstance(text, str) and text.strip():
+            return {"agent": agent, "text": text[-AGENT_TEXT_MAX_CHARS:]}
+    return None
+
+
+def forward_agent_reply(argv, stdin, socket_path=AGENT_SOCKET_PATH):
+    """`Kaho --agent-done <agent> [payload]`: hand the reply to the running app.
+
+    Always exits 0, and quickly: agents run this after every turn, and a hook
+    that fails or hangs gets in the way of the user's actual work. When Kaho
+    isn't running there is nobody to tell, which is fine.
+    """
+    try:
+        msg = agent_message(argv[0], argv[1:], stdin)
+        if msg is not None:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.2)
+                s.connect(socket_path)
+                s.sendall(json.dumps(msg).encode())
+    except (OSError, ValueError, AttributeError, IndexError):
+        pass
+    return 0
+
+
+# Before the imports below, which take seconds (AppKit, MLX): an agent hook
+# only forwards a message and must not pay for starting the app
+if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "--agent-done":
+    sys.exit(forward_agent_reply(sys.argv[2:], sys.stdin))
 
 import AppKit
 import ApplicationServices
@@ -512,7 +565,8 @@ last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
 settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto",
             "trigger": "hold", "rewrite_backend": "local",
-            "api_url": "", "api_model": "", "screen_words": True}
+            "api_url": "", "api_model": "", "screen_words": True,
+            "agent_voice": False}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
@@ -593,8 +647,9 @@ def load_settings():
     for key in ("api_url", "api_model"):
         if isinstance(saved.get(key), str):
             settings[key] = saved[key]
-    if isinstance(saved.get("screen_words"), bool):
-        settings["screen_words"] = saved["screen_words"]
+    for key in ("screen_words", "agent_voice"):
+        if isinstance(saved.get(key), bool):
+            settings[key] = saved[key]
 
 
 def save_settings():
@@ -1152,6 +1207,9 @@ def window_texts(pid):
 
 def start_recording():
     global state, record_buf, recording
+    # First, so the user can answer straight away: and the microphone must
+    # not record the reply being read
+    stop_speaking()
     if state != "ready":
         return
     if audio_wedged():
@@ -1996,11 +2054,525 @@ def job_timing(released, t0):
     return f"{waited:.2f}s"
 
 
+# ---- Coding agents: read the reply aloud when Claude Code or Codex finishes
+#
+# The hooks run `Kaho --agent-done <agent>` (see forward_agent_reply at the
+# top of this file), which hands the reply over a Unix socket. The summary
+# runs on the worker thread like any other model job — MLX must never see two
+# threads at once — and only ever on the on-device model: agent output is
+# code and project detail the user has not chosen to send anywhere.
+
+AgentReply = collections.namedtuple("AgentReply", "agent text")
+# Transcripts grow to megabytes over a long session; the reply that just
+# finished is always near the end
+TRANSCRIPT_TAIL_BYTES = 512 * 1024
+AGENT_SUMMARY_INPUT_CHARS = 6000
+AGENT_FALLBACK_WORDS = 30
+# "Only what the reply says": the first version turned "gives up on 4xx
+# errors" into "handles them gracefully" and added offers the agent never
+# made. A spoken summary the developer can't glance back at must not invent.
+AGENT_SUMMARY_PROMPT = (
+    "Summarize this reply from an AI coding assistant in one or two short "
+    "sentences that will be read aloud to the developer. Say what it did or "
+    "found, and any question it is asking them. Use only what the reply "
+    "says: keep its facts exact, and never add offers, opinions or anything "
+    "it did not say. No code, no file paths, no lists, no markdown. Reply "
+    "with the summary only.\n\nReply:\n{text}"
+)
+SAY_COMMAND = ("/usr/bin/say",)
+CLAUDE_SETTINGS_PATH = "~/.claude/settings.json"
+CODEX_CONFIG_PATH = "~/.codex/config.toml"
+AGENT_HOOK_MARKER = "--agent-done"
+speech = None  # the `say` process reading a reply, if any
+speech_lock = threading.Lock()
+
+
+def last_assistant_text(transcript_path):
+    """The final text Claude Code wrote, from the tail of its JSONL transcript.
+
+    Tool calls, tool results and subagent (sidechain) entries are skipped:
+    what the developer wants to hear is the answer, not the steps.
+    """
+    with open(transcript_path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - TRANSCRIPT_TAIL_BYTES))
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # the first line is usually cut by the seek
+        if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        content = (entry.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        text = "\n".join(
+            b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        ).strip()
+        if text:
+            return text
+    return None
+
+
+def agent_reply_from_message(data):
+    """(AgentReply, None) from a forwarded message, or (None, why not)."""
+    try:
+        msg = json.loads(data)
+    except ValueError:
+        return None, "unreadable message"
+    if not isinstance(msg, dict) or msg.get("agent") not in AGENTS:
+        return None, "unknown agent"
+    text = msg.get("text")
+    if msg["agent"] == "claude-code":
+        path = msg.get("transcript_path")
+        if not isinstance(path, str):
+            return None, "no transcript path"
+        try:
+            text = last_assistant_text(path)
+        except OSError as e:
+            return None, f"transcript unreadable ({type(e).__name__})"
+    if not isinstance(text, str) or not text.strip():
+        return None, "no reply text"
+    return AgentReply(msg["agent"], text), None
+
+
+def speakable(text):
+    """Agent replies are markdown; drop what would be read out as noise."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)  # a link keeps its label
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", text, flags=re.MULTILINE)  # list markers
+    text = re.sub(r"[*_#>|]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def first_sentence(text):
+    """The summary when the model isn't loaded: the opening sentence, capped."""
+    text = speakable(text)
+    m = re.match(r"(.+?[.!?])(?:\s|$)", text)
+    words = (m.group(1) if m else text).split()
+    if len(words) > AGENT_FALLBACK_WORDS:
+        return " ".join(words[:AGENT_FALLBACK_WORDS]) + "…"
+    return " ".join(words)
+
+
+def summarize_agent_reply(text):
+    """(summary, how) — the on-device model's summary, or the first sentence."""
+    if rewriter is None:
+        return first_sentence(text), "first sentence"
+    model, tokenizer = rewriter
+    try:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": AGENT_SUMMARY_PROMPT.format(
+                text=speakable(text)[-AGENT_SUMMARY_INPUT_CHARS:])}],
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        out = speakable(mlx_lm.generate(model, tokenizer, prompt=prompt, max_tokens=80))
+    except Exception as e:  # noqa: BLE001
+        log(f"agent summary failed: {e!r} — reading the first sentence instead")
+        out = ""
+    return (out, "summary") if out else (first_sentence(text), "first sentence")
+
+
+def stop_speaking():
+    global speech
+    with speech_lock:
+        if speech is not None and speech.poll() is None:
+            speech.terminate()
+        speech = None
+
+
+def speak(text):
+    """Read text aloud with the system voice, replacing anything still going."""
+    global speech
+    stop_speaking()
+    with speech_lock:
+        # Through stdin, not argv: a reply starting with "-" would read as a flag
+        speech = subprocess.Popen(
+            [*SAY_COMMAND, "-f", "-"], stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        speech.stdin.write(text.encode())
+        speech.stdin.close()
+
+
+def speak_agent_reply(reply):
+    # Mid-dictation the microphone would record the speech, and it would talk
+    # over the user. The reply isn't lost: it is still in the agent's window.
+    # Only recording blocks it: speaking needs neither model, so a Kaho still
+    # loading at startup reads replies too.
+    if state == "recording":
+        log(f"[agent {reply.agent}: skipped, dictation in progress]")
+        return
+    summary, how = summarize_agent_reply(reply.text)
+    if not summary:
+        log(f"[agent {reply.agent}: skipped, nothing speakable]")
+        return
+    speak(summary)
+    # Word count only: the reply is the user's code and project detail
+    log(f"[agent {reply.agent}: spoke {len(summary.split())} words ({how})]")
+
+
+def handle_agent_message(data):
+    if not settings["agent_voice"]:
+        log("[agent reply skipped: Read Agent Replies Aloud is off]")
+        return
+    reply, why = agent_reply_from_message(data)
+    if reply is None:
+        log(f"[agent reply skipped: {why}]")
+        return
+    jobs.put(reply)
+
+
+def open_agent_socket(path):
+    """The listening socket hooks connect to, readable by this user only."""
+    # A crashed instance leaves the socket file behind; the instance lock
+    # already says this is the only Kaho, so the file is safe to replace
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old = os.umask(0o177)  # created owner-only: any process of this user, no one else
+    try:
+        server.bind(path)
+    finally:
+        os.umask(old)
+    server.listen(4)
+    return server
+
+
+def agent_listener(path=AGENT_SOCKET_PATH):
+    """Accept replies from `--agent-done` hooks for as long as Kaho runs."""
+    try:
+        server = open_agent_socket(path)
+    except OSError as e:
+        log(f"agent replies unavailable: could not open {path}: {e!r}")
+        return
+    while True:
+        conn, _ = server.accept()
+        with conn:
+            conn.settimeout(1)
+            chunks = []
+            try:
+                while chunk := conn.recv(65536):
+                    chunks.append(chunk)
+            except OSError:
+                continue
+        try:
+            handle_agent_message(b"".join(chunks))
+        except Exception as e:  # noqa: BLE001
+            log(f"agent reply failed: {e!r}")
+
+
+def agent_executable():
+    """What an agent's hook runs to reach Kaho, for this install."""
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    # Source install: install.sh's launcher script forwards its arguments
+    return os.path.join(bundle_path(), "Contents", "MacOS", "kaho")
+
+
+def agent_command(agent):
+    return f"{shlex.quote(agent_executable())} {AGENT_HOOK_MARKER} {agent}"
+
+
+def _backup(path):
+    backup = path + time.strftime(".kaho-backup-%Y%m%d-%H%M%S")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def _write_atomically(path, text):
+    tmp = path + ".kaho-tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    if os.path.exists(path):
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+
+
+def _is_kaho_hook(hook):
+    return isinstance(hook, dict) and AGENT_HOOK_MARKER in str(hook.get("command", ""))
+
+
+def claude_code_connected(path):
+    try:
+        with open(path) as f:
+            stop = json.load(f).get("hooks", {}).get("Stop", [])
+    except (OSError, ValueError, AttributeError):
+        return False
+    return any(
+        _is_kaho_hook(h) for e in stop if isinstance(e, dict) for h in e.get("hooks", [])
+    )
+
+
+def connect_claude_code(path, command):
+    """Add Kaho's Stop hook, keeping every existing hook. Returns the backup.
+
+    Raises TypeError for a settings file not shaped the way Claude Code
+    writes it, rather than guess at a file it could not read either. The
+    check comes before the backup, so a refusal leaves no trace.
+    """
+    if claude_code_connected(path):
+        return None
+    backup = None
+    data = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        hooks = data.get("hooks", {}) if isinstance(data, dict) else None
+        if not isinstance(hooks, dict) or not isinstance(hooks.get("Stop", []), list):
+            raise TypeError("~/.claude/settings.json is not in the shape Claude Code writes")
+        backup = _backup(path)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    stop = data.setdefault("hooks", {}).setdefault("Stop", [])
+    stop.append({"hooks": [{"type": "command", "command": command}]})
+    _write_atomically(path, json.dumps(data, indent=2) + "\n")
+    return backup
+
+
+def disconnect_claude_code(path):
+    """Remove only Kaho's Stop hook; everything else stays as it was."""
+    if not claude_code_connected(path):
+        return
+    with open(path) as f:
+        data = json.load(f)
+    hooks = data["hooks"]
+    kept = []
+    for entry in hooks["Stop"]:
+        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+            entry["hooks"] = [h for h in entry["hooks"] if not _is_kaho_hook(h)]
+            if not entry["hooks"]:
+                continue
+        kept.append(entry)
+    if kept:
+        hooks["Stop"] = kept
+    else:
+        del hooks["Stop"]
+    if not hooks:
+        del data["hooks"]
+    _write_atomically(path, json.dumps(data, indent=2) + "\n")
+
+
+def _top_level_notify(text):
+    """(start, end) of Codex's top-level `notify = [...]` line(s), or None.
+
+    Found by hand rather than by rewriting the parsed TOML: the rest of the
+    user's config, comments and layout included, must come back byte for byte.
+    """
+    table = re.search(r"^\s*\[", text, re.MULTILINE)
+    top = text[: table.start()] if table else text
+    m = re.search(r"^notify\s*=\s*\[", top, re.MULTILINE)
+    if not m:
+        return None
+    i, depth, quote = m.end(), 1, None
+    while i < len(text) and depth:
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+        i += 1
+    end = text.find("\n", i)
+    return m.start(), len(text) if end == -1 else end + 1
+
+
+def codex_paths():
+    return (
+        os.path.join(SUPPORT_DIR, "codex-notify.sh"),
+        os.path.join(SUPPORT_DIR, "codex-notify-original.json"),
+    )
+
+
+def codex_connected(path):
+    wrapper, _ = codex_paths()
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return False
+    span = _top_level_notify(text)
+    return bool(span) and wrapper in text[span[0]:span[1]]
+
+
+def codex_previous_notify(path):
+    """The notify command Codex runs today, as argv (empty if none)."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return []
+    span = _top_level_notify(text)
+    return tomllib.loads(text[span[0]:span[1]])["notify"] if span else []
+
+
+def connect_codex(path, executable):
+    """Point Codex's notify at a wrapper that runs the old command, then Kaho.
+
+    Codex allows a single notify command, and this one may already belong to
+    something else (Codex Computer Use does this), so it is chained, not
+    replaced. The exact original line is saved so disconnecting restores it.
+    """
+    if codex_connected(path):
+        return None
+    wrapper, original_path = codex_paths()
+    text = ""
+    backup = None
+    if os.path.exists(path):
+        with open(path) as f:
+            text = f.read()
+        backup = _backup(path)
+    span = _top_level_notify(text)
+    previous = tomllib.loads(text[span[0]:span[1]])["notify"] if span else []
+    script = (
+        "#!/bin/sh\n"
+        "# Written by Kaho's Connect Coding Agents. Tells Kaho a Codex turn\n"
+        "# ended, then runs the notify command Codex had before, unchanged.\n"
+        f"{shlex.quote(executable)} {AGENT_HOOK_MARKER} codex \"$@\" >/dev/null 2>&1 &\n"
+    )
+    if previous:
+        script += f"exec {shlex.join(previous)} \"$@\"\n"
+    with open(wrapper, "w", opener=lambda p, fl: os.open(p, fl, 0o700)) as f:
+        f.write(script)
+    with open(original_path, "w", opener=_private_opener) as f:
+        json.dump({"line": text[span[0]:span[1]] if span else ""}, f)
+    line = f"notify = [{json.dumps(wrapper)}]\n"
+    text = text[: span[0]] + line + text[span[1]:] if span else line + text
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write_atomically(path, text)
+    return backup
+
+
+def disconnect_codex(path):
+    """Put back the exact notify line Codex had before connecting."""
+    if not codex_connected(path):
+        return
+    wrapper, original_path = codex_paths()
+    with open(original_path) as f:
+        original = json.load(f)["line"]
+    with open(path) as f:
+        text = f.read()
+    span = _top_level_notify(text)
+    _write_atomically(path, text[: span[0]] + original + text[span[1]:])
+    for leftover in (wrapper, original_path):
+        try:
+            os.remove(leftover)
+        except OSError:
+            pass
+
+
+def agent_paths():
+    return {
+        "claude-code": os.path.expanduser(CLAUDE_SETTINGS_PATH),
+        "codex": os.path.expanduser(CODEX_CONFIG_PATH),
+    }
+
+
+def installed_agents():
+    """Agents with a config directory, i.e. ones this user has run."""
+    return [a for a, p in agent_paths().items() if os.path.isdir(os.path.dirname(p))]
+
+
+def connect_agents_dialog():
+    """Show exactly what changes, then connect or disconnect on confirmation."""
+    paths = agent_paths()
+    found = installed_agents()
+    if not found:
+        run_alert(
+            "No coding agents found",
+            "Kaho looks for Claude Code (~/.claude) and Codex (~/.codex). Run "
+            "one of them once, then try again.",
+            ["OK"],
+        )
+        return
+    connected = {
+        "claude-code": claude_code_connected(paths["claude-code"]),
+        "codex": codex_connected(paths["codex"]),
+    }
+    todo = [a for a in found if not connected[a]]
+    if not todo:
+        names = " and ".join(AGENTS[a] for a in found)
+        choice = run_alert(
+            "Coding agents are connected",
+            f"{names} tell Kaho when they finish, and Kaho reads a short "
+            "summary aloud when Read Agent Replies Aloud is on.\n\n"
+            "Disconnect puts their settings back the way they were.",
+            ["Keep", "Disconnect"],
+        )
+        if choice == 1:
+            disconnect_claude_code(paths["claude-code"])
+            disconnect_codex(paths["codex"])
+            log("disconnected coding agents")
+        return
+    lines = []
+    if "claude-code" in todo:
+        lines.append(
+            "Claude Code: adds a Stop hook to ~/.claude/settings.json that runs\n"
+            f"  {agent_command('claude-code')}\n"
+            "Your other hooks are kept, and a backup is saved next to the file."
+        )
+    if "codex" in todo:
+        try:
+            previous = shlex.join(codex_previous_notify(paths["codex"])) or "none"
+        except (tomllib.TOMLDecodeError, KeyError):
+            previous = "unreadable"
+        lines.append(
+            "Codex: points notify in ~/.codex/config.toml at a small Kaho script "
+            f"that still runs your current notify command ({previous}) first. "
+            "A backup is saved next to the file."
+        )
+    choice = run_alert(
+        "Connect coding agents?",
+        "When an agent finishes a reply, Kaho reads a one- or two-sentence "
+        "summary aloud, made by the model on this Mac. Nothing is sent "
+        "anywhere.\n\n" + "\n\n".join(lines),
+        ["Connect", "Cancel"],
+    )
+    if choice != 0:
+        return
+    try:
+        if "claude-code" in todo:
+            connect_claude_code(paths["claude-code"], agent_command("claude-code"))
+        if "codex" in todo:
+            connect_codex(paths["codex"], agent_executable())
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        log(f"connecting coding agents failed: {e!r}")
+        run_alert(
+            "Couldn't connect",
+            f"{e}\n\nNothing was changed in a file Kaho couldn't read.",
+            ["OK"],
+        )
+        return
+    log(f"connected coding agents: {', '.join(todo)}")
+    apply_agent_voice(True)
+
+
 def worker():
     global last_inference, job_outstanding, warmup_queued
     while True:
         job = jobs.get()
         t0 = time.monotonic()
+        if isinstance(job, AgentReply):
+            # Before the dictation try block: a failed summary must not touch
+            # job_outstanding, which arms Escape for a real dictation
+            try:
+                speak_agent_reply(job)
+            except Exception as e:  # noqa: BLE001
+                log(f"agent reply failed: {e!r}")
+            continue
         if job is WARMUP:
             warmup_queued = False
             try:
@@ -2724,16 +3296,16 @@ class SettingsWindow(AppKit.NSObject):
             | AppKit.NSWindowStyleMaskMiniaturizable
         )
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (460, 522)), mask, AppKit.NSBackingStoreBuffered, False
+            ((0, 0), (460, 552)), mask, AppKit.NSBackingStoreBuffered, False
         )
         window.setTitle_("Kaho Settings")
         window.setReleasedWhenClosed_(False)
         window.center()
         content = window.contentView()
 
-        content.addSubview_(make_label("Hotkey", 24, 474, 13, bold=True))
+        content.addSubview_(make_label("Hotkey", 24, 504, 13, bold=True))
         self.hotkey_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 442), (412, 26)), False
+            ((24, 472), (412, 26)), False
         )
         for name, (_, _, label) in HOTKEYS.items():
             self.hotkey_popup.addItemWithTitle_(label)
@@ -2743,12 +3315,12 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(self.hotkey_popup)
         content.addSubview_(
             make_label("Right-side keys only: the left ones are for typing.",
-                       24, 420, 11, dim=True)
+                       24, 450, 11, dim=True)
         )
 
-        content.addSubview_(make_label("Trigger", 24, 386, 13, bold=True))
+        content.addSubview_(make_label("Trigger", 24, 416, 13, bold=True))
         self.trigger_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 354), (412, 26)), False
+            ((24, 384), (412, 26)), False
         )
         for mode, label in TRIGGERS.items():
             self.trigger_popup.addItemWithTitle_(label)
@@ -2757,9 +3329,9 @@ class SettingsWindow(AppKit.NSObject):
         self.trigger_popup.setAction_("triggerChanged:")
         content.addSubview_(self.trigger_popup)
 
-        content.addSubview_(make_label("Language", 24, 332, 13, bold=True))
+        content.addSubview_(make_label("Language", 24, 362, 13, bold=True))
         self.language_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 300), (412, 26)), False
+            ((24, 330), (412, 26)), False
         )
         for code, label in LANGUAGES.items():
             self.language_popup.addItemWithTitle_(label)
@@ -2770,13 +3342,13 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(
             make_label(
                 "Pick yours if detection gets it wrong on short dictations.",
-                24, 282, 11, dim=True,
+                24, 312, 11, dim=True,
             )
         )
 
-        content.addSubview_(make_label("Rewrite", 24, 254, 13, bold=True))
+        content.addSubview_(make_label("Rewrite", 24, 284, 13, bold=True))
         self.rewrite_popup = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            ((24, 222), (412, 26)), False
+            ((24, 252), (412, 26)), False
         )
         for mode, label in REWRITE_MODES.items():
             self.rewrite_popup.addItemWithTitle_(label)
@@ -2785,18 +3357,18 @@ class SettingsWindow(AppKit.NSObject):
         self.rewrite_popup.setAction_("rewriteChanged:")
         content.addSubview_(self.rewrite_popup)
 
-        self.hint = make_label("", 24, 178, 11, dim=True)
-        self.hint.setFrame_(((24, 170), (412, 44)))
+        self.hint = make_label("", 24, 208, 11, dim=True)
+        self.hint.setFrame_(((24, 200), (412, 44)))
         # Hints run two lines for the longer modes
         self.hint.cell().setWraps_(True)
         content.addSubview_(self.hint)
 
-        self.status = make_label("", 24, 126, 11, dim=True)
-        self.status.setFrame_(((24, 118), (412, 34)))
+        self.status = make_label("", 24, 156, 11, dim=True)
+        self.status.setFrame_(((24, 148), (412, 34)))
         self.status.cell().setWraps_(True)
         content.addSubview_(self.status)
 
-        self.dict_button = AppKit.NSButton.alloc().initWithFrame_(((24, 78), (200, 26)))
+        self.dict_button = AppKit.NSButton.alloc().initWithFrame_(((24, 108), (200, 26)))
         self.dict_button.setTitle_("Edit Dictionary…")
         self.dict_button.setBezelStyle_(AppKit.NSBezelStyleRounded)
         self.dict_button.setTarget_(self)
@@ -2804,16 +3376,23 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(self.dict_button)
         content.addSubview_(
             make_label(
-                "Names and jargon to spell your way.", 232, 82, 11, dim=True
+                "Names and jargon to spell your way.", 232, 112, 11, dim=True
             )
         )
 
-        self.screen_box = AppKit.NSButton.alloc().initWithFrame_(((24, 46), (412, 22)))
+        self.screen_box = AppKit.NSButton.alloc().initWithFrame_(((24, 76), (412, 22)))
         self.screen_box.setButtonType_(AppKit.NSButtonTypeSwitch)
         self.screen_box.setTitle_("Also spell names from the window you're dictating into")
         self.screen_box.setTarget_(self)
         self.screen_box.setAction_("screenWordsChanged:")
         content.addSubview_(self.screen_box)
+
+        self.agent_box = AppKit.NSButton.alloc().initWithFrame_(((24, 46), (412, 22)))
+        self.agent_box.setButtonType_(AppKit.NSButtonTypeSwitch)
+        self.agent_box.setTitle_("Read Claude Code and Codex replies aloud (Connect in the menu)")
+        self.agent_box.setTarget_(self)
+        self.agent_box.setAction_("agentVoiceChanged:")
+        content.addSubview_(self.agent_box)
 
         self.notice = make_label("", 24, 16, 11, dim=True)
         self.notice.setFrame_(((24, 8), (412, 30)))
@@ -2836,6 +3415,9 @@ class SettingsWindow(AppKit.NSObject):
                 self.rewrite_popup.selectItemAtIndex_(i)
         self.screen_box.setState_(
             AppKit.NSControlStateValueOn if settings["screen_words"] else AppKit.NSControlStateValueOff
+        )
+        self.agent_box.setState_(
+            AppKit.NSControlStateValueOn if settings["agent_voice"] else AppKit.NSControlStateValueOff
         )
         self.refreshHint()
 
@@ -2879,6 +3461,9 @@ class SettingsWindow(AppKit.NSObject):
 
     def screenWordsChanged_(self, sender):
         apply_screen_words(sender.state() == AppKit.NSControlStateValueOn)
+
+    def agentVoiceChanged_(self, sender):
+        apply_agent_voice(sender.state() == AppKit.NSControlStateValueOn)
 
 
 def make_label(text, x, y, size, bold=False, dim=False):
@@ -3110,6 +3695,15 @@ def apply_screen_words(on):
     refresh_settings_ui()
 
 
+def apply_agent_voice(on):
+    settings["agent_voice"] = bool(on)
+    save_settings()
+    if not on:
+        stop_speaking()
+    log(f"read agent replies aloud: {'on' if on else 'off'}")
+    refresh_settings_ui()
+
+
 def apply_rewrite_backend(name):
     """Switch the rewrite model, prompting for a key the first time."""
     settings["rewrite_backend"] = name
@@ -3330,6 +3924,23 @@ class StatusItem(AppKit.NSObject):
         )
         screen.setToolTip_("Spell names in the window you're dictating into. Read in memory, never kept.")
         menu.addItem_(screen)
+        voice = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Read Agent Replies Aloud", "toggleAgentVoice:", ""
+        )
+        voice.setTarget_(self)
+        voice.setState_(
+            AppKit.NSControlStateValueOn if settings["agent_voice"] else AppKit.NSControlStateValueOff
+        )
+        voice.setToolTip_(
+            "When Claude Code or Codex finishes, hear a short summary made on this Mac. "
+            "Press the hotkey to stop it."
+        )
+        menu.addItem_(voice)
+        agents = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Connect Coding Agents…", "connectAgents:", ""
+        )
+        agents.setTarget_(self)
+        menu.addItem_(agents)
         for title, action, key in MENU_ACTIONS:
             entry = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key)
             entry.setTarget_(self)
@@ -3353,6 +3964,12 @@ class StatusItem(AppKit.NSObject):
 
     def toggleScreenWords_(self, _sender):
         apply_screen_words(not settings["screen_words"])
+
+    def toggleAgentVoice_(self, _sender):
+        apply_agent_voice(not settings["agent_voice"])
+
+    def connectAgents_(self, _sender):
+        connect_agents_dialog()
 
     def copyTranscript_(self, sender):
         set_clipboard(sender.representedObject())
@@ -3513,6 +4130,7 @@ def main():
         return
     load_settings()
     load_history()
+    threading.Thread(target=agent_listener, daemon=True).start()
     refs = install_status_item()  # tuple keeps the AppKit objects alive
     status_item = refs[0]
     overlay = Overlay.alloc().init()

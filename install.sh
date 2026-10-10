@@ -78,7 +78,7 @@ PLIST
 
 cat > "$STAGE/Contents/MacOS/kaho" <<LAUNCH
 #!/bin/zsh
-exec "$SUPPORT/venv/bin/python" "\$(cd "\$(dirname "\$0")/../Resources" && pwd)/kaho.py"
+exec "$SUPPORT/venv/bin/python" "\$(cd "\$(dirname "\$0")/../Resources" && pwd)/kaho.py" "\$@"
 LAUNCH
 chmod +x "$STAGE/Contents/MacOS/kaho"
 
