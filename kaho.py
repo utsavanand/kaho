@@ -1603,6 +1603,12 @@ def handle_key_down(event):
     return False
 
 
+def handle_global_key_down(event):
+    # Global monitors require a void return. Passing the boolean-returning
+    # handler directly makes PyObjC raise on every keypress, even when idle.
+    handle_key_down(event)
+
+
 # NSEvent monitors instead of a CGEventTap: same job for a single modifier
 # key, but gated on Accessibility only — a tap would additionally require
 # the Input Monitoring permission (this is how Wispr Flow gets away with
@@ -1620,7 +1626,7 @@ def install_hotkey_monitors():
         # Escape cancels. Global so it works while dictating into another app,
         # which is the only place a dictation is ever in flight.
         AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            AppKit.NSEventMaskKeyDown, handle_key_down
+            AppKit.NSEventMaskKeyDown, handle_global_key_down
         ),
         # Locally, swallow the Escape that cancels so it does not also reach
         # the focused window; pass every other key through untouched.

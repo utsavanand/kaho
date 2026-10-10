@@ -1645,6 +1645,47 @@ class TestBringYourOwnKey(KahoTestCase):
         urlopen.assert_not_called()
 
 
+class TestHotkeyMonitors(KahoTestCase):
+    """Exercise registered callbacks, including AppKit's different returns."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(kaho, "job_generation", 0))
+        self.enterContext(mock.patch.object(kaho, "monitors", []))
+        self.global_monitor = self.enterContext(mock.patch.object(
+            kaho.AppKit.NSEvent, "addGlobalMonitorForEventsMatchingMask_handler_"
+        ))
+        self.local_monitor = self.enterContext(mock.patch.object(
+            kaho.AppKit.NSEvent, "addLocalMonitorForEventsMatchingMask_handler_"
+        ))
+        kaho.install_hotkey_monitors()
+
+    def callback(self, monitor, mask):
+        return next(callback for (registered, callback), _ in monitor.call_args_list
+                    if registered == mask)
+
+    def test_global_key_monitor_returns_void_and_still_cancels(self):
+        callback = self.callback(self.global_monitor, kaho.AppKit.NSEventMaskKeyDown)
+        for working, keycode in ((False, 0), (False, kaho.ESCAPE_KEYCODE),
+                                 (True, 0), (True, kaho.ESCAPE_KEYCODE)):
+            with self.subTest(working=working, keycode=keycode):
+                kaho.overlay.is_working.return_value = working
+                self.assertIsNone(callback(FakeEvent(keycode, 0)))
+        self.assertEqual(kaho.job_generation, 1)
+        kaho.overlay.hide.assert_called_once()
+
+    def test_local_key_monitor_only_swallows_escape_that_cancels(self):
+        callback = self.callback(self.local_monitor, kaho.AppKit.NSEventMaskKeyDown)
+        for working, keycode in ((False, 0), (False, kaho.ESCAPE_KEYCODE),
+                                 (True, 0), (True, kaho.ESCAPE_KEYCODE)):
+            with self.subTest(working=working, keycode=keycode):
+                kaho.overlay.is_working.return_value = working
+                event = FakeEvent(keycode, 0)
+                expected = None if working and keycode == kaho.ESCAPE_KEYCODE else event
+                self.assertIs(callback(event), expected)
+        self.assertEqual(kaho.job_generation, 1)
+
+
 class TestCancel(KahoTestCase):
     """Escape has to stop an unwanted dictation from landing in the document."""
 
