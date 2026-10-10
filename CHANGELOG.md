@@ -1,4 +1,47 @@
 # Changelog
+## 2.4.1 — 2026-10-10
+
+Dictation that keeps working, a first run that needs no help, and two
+ways to change text by saying how.
+
+- A frozen microphone no longer stops dictation until Kaho is restarted.
+  macOS's audio system sometimes never returns from opening or closing
+  the microphone, and Kaho's only audio thread then stayed stuck: every
+  later dictation was refused. The microphone now runs in a separate
+  process. One that freezes is stopped after 350 ms, and the next
+  dictation gets a fresh one without reloading the models. Speech already
+  captured is kept. The next recording's process is started ahead of
+  time, with the microphone closed, so the key press still reaches an open
+  microphone in about 100 ms, as before.
+- Edit text you've already written. Select it in any app, hold the
+  hotkey and Shift, and say what to change: "make this more formal",
+  "the date is Friday, not Thursday". Kaho rewrites the selection and
+  pastes over it.
+- Spoken instructions work with either Shift key. Only the right one
+  counted, so an instruction spoken while holding the left one was typed
+  into the message. Instructions can now change what the message says as
+  well as how it reads: "drop the part about shipping", "the PR is number
+  six".
+- Names on screen are spelled right. At the start of a dictation, Kaho
+  reads the window you're dictating into and passes unusual names and
+  terms to the speech model as hints. In testing, "Siobhan" and
+  "Debezium" stopped coming out as "Shavon" and "debesium". The words are
+  never logged, and
+  "Use Words on Screen" turns it off.
+- A first run that works without help:
+  - Opening Kaho a second time brings up the running copy instead of
+    starting another that processes every dictation twice.
+  - Opened from the download, Kaho offers to move itself to Applications
+    before asking for any permission, so the permission isn't granted to
+    a temporary copy.
+  - After Accessibility is granted, Kaho restarts by itself. While it's
+    missing, the menu bar shows ⚠️ and the first menu item opens the right
+    settings page.
+  - The speech model download shows its progress in the menu.
+  - A paste that can't happen says why and how to fix it.
+- Releases are notarized again. Apple held, then dropped, Kaho's 45 MB
+  launcher. It is now 124 KB, with the rest of the code beside it.
+
 ## 2.4.0 — 2026-10-04
 
 A reliability release. An independent audit of the whole application
