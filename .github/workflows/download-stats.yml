@@ -1,0 +1,45 @@
+name: Download stats
+
+# GitHub keeps only running totals per release asset, so a trend needs a daily
+# snapshot. Rows go to the orphan `stats` branch to keep main's history clean.
+on:
+  schedule:
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Append today's per-asset download counts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          day=$(date -u +%Y-%m-%d)
+          git init -q stats && cd stats
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          if git fetch -q --depth 1 origin stats; then
+            git checkout -q -B stats FETCH_HEAD
+          else
+            git checkout -q --orphan stats
+          fi
+          mkdir -p stats
+          f=stats/downloads.csv
+          [ -f "$f" ] || echo "day,tag,asset,downloads" > "$f"
+          if grep -q "^${day}," "$f"; then
+            echo "rows for $day already recorded"; exit 0
+          fi
+          gh api --paginate "repos/${REPO}/releases" \
+            --jq '.[] | .tag_name as $t | .assets[] | [$t, .name, .download_count] | @csv' \
+            | sed "s/^/${day},/" >> "$f"
+          git add "$f"
+          git commit -q -m "Download counts for ${day}"
+          git push -q origin stats
+          grep "^${day}," "$f"
