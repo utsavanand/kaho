@@ -1,8 +1,10 @@
 """Process isolation: freeze real IPC, kill stuck children, record again."""
 
+import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -119,3 +121,62 @@ class TestAudioCapture(unittest.TestCase):
                                 capture_output=True, text=True, timeout=3, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--audio-fd", result.stdout)
+
+
+class TestStandby(unittest.TestCase):
+    """A child started between recordings, so the key press only opens the mic."""
+
+    def make_stream(self, mode):
+        data, errors = [], []
+        stream = audio_capture.InputStream(
+            device=0, samplerate=16_000, channels=1, dtype="float32",
+            callback=lambda chunk, *_: data.append(chunk), on_error=errors.append,
+            command=[sys.executable, str(pathlib.Path(__file__).with_name("audio_child_fixture.py")), mode],
+        )
+        self.addCleanup(stream.close)
+        return stream, data, errors
+
+    def test_a_prepared_child_opens_the_microphone_only_when_started(self):
+        # An idle standby must not hold the mic, or macOS shows its indicator
+        marker = pathlib.Path(tempfile.mkdtemp()) / "opened"
+        with mock.patch.dict(os.environ, {"KAHO_TEST_OPENED": str(marker)}):
+            stream, chunks, _ = self.make_stream("native_standby")
+            stream.prepare()
+            self.assertTrue(stream.ready.wait(5), "child never reported ready")
+            time.sleep(0.2)
+            self.assertFalse(marker.exists(), "the microphone was opened before start()")
+            self.assertTrue(stream.usable())
+            stream.start()
+        self.assertTrue(marker.exists())
+        stream.freeze()
+        self.assertEqual(sum(len(c) for c in chunks), 1600)
+        self.assertFalse(stream.usable(), "a started stream cannot be reused as a standby")
+
+    def test_a_discarded_standby_exits_without_opening_the_microphone(self):
+        marker = pathlib.Path(tempfile.mkdtemp()) / "opened"
+        with mock.patch.dict(os.environ, {"KAHO_TEST_OPENED": str(marker)}):
+            stream, _, errors = self.make_stream("native_standby")
+            stream.prepare()
+            self.assertTrue(stream.ready.wait(5))
+            stream.close()
+        self.assertIsNotNone(stream.process.returncode)
+        self.assertFalse(marker.exists())
+        self.assertEqual(errors, [], "discarding a standby is not a microphone failure")
+
+    def test_a_standby_that_died_is_not_usable(self):
+        stream, _, _ = self.make_stream("start_error")
+        stream.prepare()
+        stream.reader.join(5)
+        self.assertFalse(stream.usable())
+        with self.assertRaises(audio_capture.CaptureError):
+            stream.start()
+
+    def test_open_and_stop_arriving_together_are_both_obeyed(self):
+        # A press shorter than one pipe read: "open\nstop\n" lands as one chunk
+        stream, chunks, _ = self.make_stream("native_standby")
+        stream.prepare()
+        self.assertTrue(stream.ready.wait(5))
+        stream.process.stdin.write(b"open\nstop\n")
+        stream.reader.join(5)
+        self.assertTrue(stream.frozen.is_set())
+        self.assertEqual(sum(len(c) for c in chunks), 1600)

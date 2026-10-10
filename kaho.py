@@ -400,6 +400,7 @@ STALE_GRANT_SECONDS = 45
 
 jobs = queue.Queue()
 audio_ops = queue.Queue()  # serialized PortAudio operations, see audio_control()
+standby = None  # a capture process started ahead of the next recording; audio thread only
 audio_op_started = None  # monotonic start of the op in flight, None when idle
 # Guards the recording handoff — state, record_buf, stream, locked — between the
 # main run loop (hotkey, UI) and the audio thread. Without it _open_stream's
@@ -1200,6 +1201,65 @@ def start_recording():
     audio_ops.put(lambda: _open_stream(buf))
 
 
+def _capture_device():
+    # PortAudio indices can differ between independently initialized
+    # processes after hotplug. Resolve the selected name in the child.
+    return input_name if input_device is not None else None
+
+
+def _new_capture(callback=None, on_error=None):
+    return audio_capture.InputStream(
+        device=_capture_device(), samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+        callback=callback, on_error=on_error, log=log,
+    )
+
+
+def prepare_standby():
+    """Start the next recording's capture process now, on the audio thread.
+
+    The key press then only opens the microphone. Starting the process takes
+    about 200 ms, over a second on a cold launch, and words spoken before the
+    microphone opens are lost. The standby imports sounddevice and waits, with
+    the microphone closed.
+    """
+    global standby
+    if standby is not None and standby.usable() and standby.device == _capture_device():
+        return
+    _discard_standby()
+    try:
+        s = _new_capture()
+        s.prepare()
+    except Exception as e:  # noqa: BLE001
+        # Not fatal: the next recording starts its own process, as before
+        log(f"could not prepare the next microphone capture: {e!r}")
+        return
+    standby = s
+
+
+def _take_standby():
+    global standby
+    s, standby = standby, None
+    if s is not None and s.usable() and s.device == _capture_device():
+        return s
+    if s is not None:
+        _close_quietly(s)
+    return None
+
+
+def _discard_standby():
+    global standby
+    s, standby = standby, None
+    if s is not None:
+        _close_quietly(s)
+
+
+def _close_quietly(s):
+    try:
+        s.close()
+    except audio_capture.CaptureError as e:
+        log(f"could not discard the standby microphone process: {e}")
+
+
 def _open_stream(buf):
     global stream, state, locked
     s = None
@@ -1211,17 +1271,14 @@ def _open_stream(buf):
                     stop_recording()
             AppHelper.callAfter(finish_interrupted)
 
-        s = audio_capture.InputStream(
-            # PortAudio indices can differ between independently initialized
-            # processes after hotplug. Resolve the selected name in the child.
-            device=input_name if input_device is not None else None,
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            callback=lambda data, *_: buf.append(data),  # reader supplies an owned array
-            on_error=interrupted,
-            log=log,
-        )
+        def capture(data, *_):
+            buf.append(data)  # the reader supplies an owned array
+
+        s = _take_standby()
+        if s is None:
+            s = _new_capture(callback=capture, on_error=interrupted)
+        else:
+            s.callback, s.on_error = capture, interrupted
         s.start()
     except Exception as e:  # noqa: BLE001
         # Not just PortAudioError: anything else escaped to audio_control,
@@ -1238,6 +1295,7 @@ def _open_stream(buf):
             except Exception as close_error:  # noqa: BLE001
                 log(f"could not close the failed stream: {close_error!r}")
         log(f"mic open failed: {e!r}\n(System Settings > Privacy & Security > Microphone)")
+        prepare_standby()
         with recording_lock:
             current = buf is record_buf and state == "recording"
             if current:
@@ -1342,6 +1400,7 @@ def _finish_recording(s, buf, session=None):
             log(f"could not finalize microphone capture: {e}")
             _shutdown_stream(s)
             AppHelper.callAfter(overlay.showProblem_, "Mic interrupted — try again")
+            prepare_standby()
             return
     # This recording's own cancel flag, not a global one: cancelling a later
     # dictation used to discard whichever recording finalized next.
@@ -1371,6 +1430,7 @@ def _finish_recording(s, buf, session=None):
         _shutdown_stream(s)
         if time.monotonic() - t0 > 3:
             log("audio device was slow to release — another audio app may be fighting for the mic")
+    prepare_standby()
 
 
 def schedule_deferred_stop(tap_time):
@@ -2124,6 +2184,9 @@ def backend():
     try:
         input_device, input_name = pick_input_device()
         log(f"mic: {input_name}")
+        # Started while the models load, so not even the first dictation
+        # waits for the capture process
+        audio_ops.put(prepare_standby)
         log(f"loading {MODEL_REPO}@{MODEL_REVISION[:8]} (first run downloads {MODEL_SIZE_LABEL})...")
         t0 = time.monotonic()
         path, downloaded = download_model()

@@ -48,6 +48,7 @@ class InputStream:
         self.reader = None
         self.storage = None
         self.mapping = None
+        self.ready = threading.Event()
         self.started = threading.Event()
         self.frozen = threading.Event()
         self.stopping = threading.Event()
@@ -55,7 +56,14 @@ class InputStream:
         self.frames = 0
         self._closed = False
 
-    def start(self):
+    def prepare(self):
+        """Start the child without opening the microphone.
+
+        The child imports sounddevice and then waits for "open". Done between
+        recordings, this takes process startup (about 200 ms, over a second on
+        a cold launch) out of the time between the key press and the first
+        captured audio. No microphone is opened, so macOS shows no indicator.
+        """
         if self.process is not None or self._closed:
             raise CaptureError("capture already started or closed")
         command = self.command
@@ -73,6 +81,25 @@ class InputStream:
             )
             self.reader = threading.Thread(target=self._read, name="Kaho audio reader", daemon=True)
             self.reader.start()
+        except BaseException:
+            self.close()
+            raise
+
+    def usable(self):
+        """Whether a prepared child can still be opened."""
+        return (self.process is not None and not self._closed and self.process.poll() is None
+                and not self.error and not self.started.is_set())
+
+    def start(self):
+        if self._closed or self.started.is_set():
+            raise CaptureError("capture already started or closed")
+        if self.process is None:
+            self.prepare()
+        try:
+            try:
+                self.process.stdin.write(b"open\n")
+            except OSError as error:
+                raise CaptureError("microphone process exited before opening") from error
             if not self.started.wait(START_TIMEOUT):
                 raise CaptureError("microphone startup timed out")
             if self.error:
@@ -93,7 +120,9 @@ class InputStream:
                     raise CaptureError("invalid microphone message size")
                 event = json.loads(line)
                 kind = event["event"]
-                if kind == "started":
+                if kind == "ready":
+                    self.ready.set()
+                elif kind == "started":
                     self.started.set()
                 elif kind == "frames":
                     total = event["frames"]
@@ -236,18 +265,35 @@ def child_main():
             except Exception as error:  # noqa: BLE001
                 reason, active = f"audio callback failed: {error!r}", False
 
+        def read_line(pending):
+            while b"\n" not in pending:
+                chunk = os.read(0, 64)
+                if not chunk:
+                    os._exit(0)  # Parent vanished; do not retain its mic.
+                pending += chunk
+                if len(pending) > 64:
+                    raise CaptureError("invalid microphone command")
+            line, _, rest = pending.partition(b"\n")
+            return line, rest
+
+        emit("ready")
+        command, pending = read_line(b"")
+        if command != b"open":
+            os._exit(0)  # A discarded standby: the microphone was never opened.
+        # A standby may have waited minutes since sounddevice enumerated the
+        # devices. Refreshing costs 1-2 ms and picks up a headset plugged in
+        # meanwhile, or a new system default.
+        sd._terminate()
+        sd._initialize()
         stream = sd.InputStream(device=json.loads(args.device), samplerate=SAMPLE_RATE,
                                 channels=1, dtype="float32", callback=receive)
         stream.start()
         emit("started")
         published = 0
         while True:
-            readable, _, _ = select.select([0], [], [], 0.02)
-            if readable:
-                command = os.read(0, 64)
-                if not command:
-                    os._exit(0)  # Parent vanished; do not retain its mic.
-                if command != b"stop\n":
+            if pending or select.select([0], [], [], 0.02)[0]:
+                command, pending = read_line(pending)
+                if command != b"stop":
                     raise CaptureError("invalid microphone command")
                 with lock:
                     active = False

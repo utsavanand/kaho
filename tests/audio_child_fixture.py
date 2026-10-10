@@ -4,6 +4,7 @@ import argparse
 import json
 import mmap
 import os
+import pathlib
 import struct
 import sys
 import time
@@ -23,6 +24,8 @@ if args.mode.startswith("native_"):
         def __init__(self, *, callback, **_):
             if args.mode == "native_open_hang":
                 time.sleep(30)
+            if os.environ.get("KAHO_TEST_OPENED"):
+                pathlib.Path(os.environ["KAHO_TEST_OPENED"]).write_text("opened")
             self.callback = callback
 
         def start(self):
@@ -35,7 +38,8 @@ if args.mode.startswith("native_"):
         def close(self):
             pass
 
-    sys.modules["sounddevice"] = types.SimpleNamespace(InputStream=NativeStream)
+    sys.modules["sounddevice"] = types.SimpleNamespace(
+        InputStream=NativeStream, _terminate=lambda: None, _initialize=lambda: None)
     sys.argv = [sys.argv[0], *sys.argv[2:]]
     audio_capture.child_main()
 
@@ -50,6 +54,10 @@ if args.mode == "start_error":
     emit("error", message="device unavailable")
     os._exit(1)
 storage = mmap.mmap(args.audio_fd, os.fstat(args.audio_fd).st_size)
+# Same handshake as the real child: ready, then nothing until "open"
+emit("ready")
+if os.read(0, 64) != b"open\n":
+    os._exit(0)
 emit("started")
 storage[:6400] = struct.pack("<1600f", *([0.25] * 1600))
 emit("frames", frames=1600)

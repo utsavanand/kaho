@@ -181,6 +181,7 @@ class KahoTestCase(unittest.TestCase):
 
         # A fresh stream object per open, so the tests can tell them apart
         self.enterContext(mock.patch.object(kaho.audio_capture, "InputStream"))
+        self.enterContext(mock.patch.object(kaho, "standby", None))
         kaho.audio_capture.InputStream.side_effect = lambda **_: mock.MagicMock(name="stream")
         kaho.AppKit.NSTimer.reset_mock()
         kaho.AppKit.NSPasteboard.reset_mock()
@@ -350,10 +351,65 @@ class TestRecordingHandoff(KahoTestCase):
         kaho.start_recording()
         kaho.stop_recording()  # key released while the open is still queued
         self.run_audio_ops()
-        self.assertEqual(len(opened), 1, "expected exactly one stream to be opened")
+        # The standby prepared afterwards is created but never started
+        started = [s for s in opened if s.start.called]
+        self.assertEqual(len(started), 1, "expected exactly one stream to be opened")
         opened[0].stop.assert_called_once()
         opened[0].close.assert_called_once()
         self.assertIsNone(kaho.stream)
+
+    def record_once(self):
+        kaho.start_recording()
+        self.run_audio_ops()
+        kaho.stop_recording()
+        self.run_audio_ops()
+
+    def test_the_next_recording_opens_the_standby_prepared_after_the_last(self):
+        opened = []
+        kaho.audio_capture.InputStream.side_effect = lambda **_: opened.append(mock.MagicMock()) or opened[-1]
+        self.record_once()
+        standby = kaho.standby
+        standby.prepare.assert_called_once()
+        standby.start.assert_not_called()
+        standby.usable.return_value = True
+        standby.device = kaho._capture_device()
+        created = len(opened)
+
+        kaho.start_recording()
+        self.run_audio_ops()
+        self.assertEqual(len(opened), created, "a new process was started instead of the standby")
+        standby.start.assert_called_once()
+        self.assertIs(kaho.stream, standby)
+        # Its audio lands in this recording, not the one it was prepared after
+        chunk = object()
+        standby.callback(chunk)
+        self.assertEqual(kaho.record_buf, [chunk])
+
+    def test_a_standby_that_died_is_replaced_by_a_fresh_process(self):
+        opened = []
+        kaho.audio_capture.InputStream.side_effect = lambda **_: opened.append(mock.MagicMock()) or opened[-1]
+        self.record_once()
+        dead = kaho.standby
+        dead.usable.return_value = False
+
+        kaho.start_recording()
+        self.run_audio_ops()
+        dead.start.assert_not_called()
+        dead.close.assert_called_once()
+        self.assertIs(kaho.stream, opened[-1])
+        opened[-1].start.assert_called_once()
+
+    def test_a_standby_for_another_device_is_not_used(self):
+        self.record_once()
+        old = kaho.standby
+        old.usable.return_value = True
+        old.device = "MacBook Pro Microphone"
+        with mock.patch.object(kaho, "input_device", 3), \
+             mock.patch.object(kaho, "input_name", "AirPods Pro"):
+            kaho.start_recording()
+            self.run_audio_ops()
+        old.start.assert_not_called()
+        old.close.assert_called_once()
 
     def test_an_unexpected_open_error_still_returns_to_ready(self):
         """QA finding: only PortAudioError was handled.
