@@ -34,12 +34,40 @@ jobs:
           f=stats/downloads.csv
           [ -f "$f" ] || echo "day,tag,asset,downloads" > "$f"
           if grep -q "^${day}," "$f"; then
-            echo "rows for $day already recorded"; exit 0
+            echo "rows for $day already recorded"
+          else
+            gh api --paginate "repos/${REPO}/releases" \
+              --jq '.[] | .tag_name as $t | .assets[] | [$t, .name, .download_count] | @csv' \
+              | sed "s/^/${day},/" >> "$f"
           fi
           gh api --paginate "repos/${REPO}/releases" \
-            --jq '.[] | .tag_name as $t | .assets[] | [$t, .name, .download_count] | @csv' \
-            | sed "s/^/${day},/" >> "$f"
-          git add "$f"
+            --jq '.[] | .tag_name as $t | .published_at as $p | .assets[] | [$t, .name, ($p // "")[:10], .download_count] | @csv' \
+            > releases.csv
+          python3 - "$day" <<'PY'
+          import csv, sys
+          from collections import defaultdict
+          day = sys.argv[1]
+          totals = defaultdict(int)
+          for r in csv.DictReader(open("stats/downloads.csv")):
+              totals[r["day"]] += int(r["downloads"])
+          rel = sorted(csv.reader(open("releases.csv")), key=lambda r: r[2], reverse=True)
+          lines = ["# Kaho downloads", "",
+                   f"**Total downloads: {sum(int(r[3]) for r in rel):,}** (all releases and files, updated {day}).", "",
+                   "Counts every download of a release file, including Homebrew installs and the website's Download button.", "",
+                   "## By release", "", "| Release | File | Published | Downloads |", "|---|---|---|---:|"]
+          lines += [f"| {t} | {a} | {p} | {int(n):,} |" for t, a, p, n in rel]
+          lines += ["", "## Daily trend (last 60 days)", "", "| Day | Total downloads | Change |", "|---|---:|---:|"]
+          days = sorted(totals)
+          for i in range(len(days) - 1, max(-1, len(days) - 61), -1):
+              d = days[i]
+              ch = "" if i == 0 else f"{totals[d] - totals[days[i - 1]]:+,}"
+              lines.append(f"| {d} | {totals[d]:,} | {ch} |")
+          lines += ["", "Raw data: [stats/downloads.csv](stats/downloads.csv). Updated daily at 06:15 UTC by `.github/workflows/download-stats.yml` on main."]
+          open("README.md", "w").write("\n".join(lines) + "\n")
+          PY
+          rm releases.csv
+          git add "$f" README.md
+          if git diff --cached --quiet; then echo "nothing changed"; exit 0; fi
           git commit -q -m "Download counts for ${day}"
           git push -q origin stats
-          grep "^${day}," "$f"
+          cat README.md
