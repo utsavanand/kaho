@@ -54,6 +54,11 @@ def run(args):
     engines.transcribe(rec, np.zeros(engines.SAMPLE_RATE // 2, dtype=np.float32))  # warm-up
     log(f"ready in {time.monotonic() - t:.1f}s — hold {KEY_NAMES[args.hotkey]}, talk, release. Ctrl+C here to quit.")
 
+    try:
+        sd.query_devices(kind="input")
+    except Exception:  # noqa: BLE001 — PortAudio raises its own error types
+        log("no microphone found yet; dictation will use one as soon as it is connected")
+
     app = QtWidgets.QApplication([])
     pill = Pill()
     clip = WinClipboard()
@@ -64,7 +69,22 @@ def run(args):
         with lock:
             chunks.append(indata[:, 0].copy())
 
-    stream = sd.InputStream(samplerate=engines.SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio)
+    stream = [None]
+
+    def open_mic():
+        """A fresh stream per recording, so a mic plugged in after launch is picked
+        up and a missing one becomes a message instead of a crash."""
+        try:
+            # PortAudio snapshots the device list when it initialises
+            sd._terminate()
+            sd._initialize()
+            s = sd.InputStream(samplerate=engines.SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio)
+            s.start()
+            return s
+        except Exception as e:  # noqa: BLE001
+            log(f"no microphone: {e!r}")
+            pill.show_state.emit("No microphone found")
+            return None
 
     def finish(audio):
         try:
@@ -87,16 +107,26 @@ def run(args):
             with lock:
                 chunks.clear()
             started[0] = time.monotonic()
-            stream.start()
-            pill.show_state.emit("Recording")
+            stream[0] = open_mic()
+            if stream[0] is not None:
+                pill.show_state.emit("Recording")
         elif action in (STOP, CANCEL):
-            stream.stop()
+            if stream[0] is None:  # the missing mic was already reported
+                return
+            stream[0].stop()
+            stream[0].close()
+            stream[0] = None
             held = time.monotonic() - started[0]
             with lock:
                 audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
             if action == CANCEL or held < MIN_SECONDS:
                 log("cancelled (shortcut or too short)")
                 pill.show_state.emit("Cancelled")
+                return
+            if audio.size and not np.any(audio):
+                # Windows delivers digital silence when microphone access is blocked
+                log("recorded pure silence: check Settings > Privacy & security > Microphone")
+                pill.show_state.emit("Mic blocked? Check Privacy settings")
                 return
             pill.show_state.emit("Transcribing…")
             threading.Thread(target=finish, args=(audio,), daemon=True).start()

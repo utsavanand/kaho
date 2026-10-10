@@ -69,6 +69,21 @@ jobs:
           ./kaho-spike.exe bench --models-dir "$env:RUNNER_TEMP/fresh-models" --out "$env:RUNNER_TEMP/bench-fresh.md"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: The packaged app stays up without a microphone (runners have none)
+        shell: pwsh
+        working-directory: dist/kaho-spike
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process -FilePath ./kaho-spike.exe -ArgumentList "--engine parakeet --models-dir ../../models" -PassThru -RedirectStandardOutput run.out -RedirectStandardError run.err
+          Start-Sleep -Seconds 60
+          $alive = -not $p.HasExited
+          if ($alive) { Stop-Process -Id $p.Id -Force }
+          Get-Content run.out, run.err -ErrorAction SilentlyContinue | Select-Object -Last 20
+          if (-not $alive) { Write-Error "kaho-spike exited without a microphone"; exit 1 }
+          # Hard requirement is staying up; whether a runner exposes an input device varies
+          if (Select-String -Path run.out, run.err -Pattern 'no microphone' -Quiet) { 'reported the missing microphone' } else { Write-Warning 'no missing-microphone message (this runner may have an input device)' }
+
       - name: Stage artifact
         run: |
           Copy-Item README.txt ../dist/kaho-spike/README.txt
