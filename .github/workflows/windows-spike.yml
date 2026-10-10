@@ -1,0 +1,106 @@
+name: Windows spike
+
+# Milestone 1 of the Windows port: benchmark the speech engines on a Windows
+# runner and build a test exe for the owner's PC. Separate from the Mac CI
+# on purpose; nothing here touches kaho.py.
+on:
+  push:
+    branches: [windows-spike]
+    paths: ["windows/**", ".github/workflows/windows-spike.yml"]
+  workflow_dispatch:
+
+jobs:
+  spike:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      PYTHONUTF8: "1"  # the tables contain ×, – and the odd non-Latin transcript
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller==6.22.3
+
+      - name: Unit tests (pure logic)
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Keyboard hook installs on Windows
+        run: python hook_smoke.py
+
+      # 1.3 GB of models; cache them so reruns don't redownload
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: models
+          key: sherpa-models-qwen3-0.6b-20260325-parakeet-v3-moonshine-tiny-20260227
+
+      - name: Engine benchmark (source)
+        run: |
+          python -m kaho_spike bench --models-dir ../models --out ../bench.md --details ../bench-details.json
+          Get-Content ../bench.md | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Build kaho-spike.exe
+        run: >
+          pyinstaller --noconfirm --clean --onedir --console --name kaho-spike
+          --paths . --collect-all sherpa_onnx --collect-all _sounddevice_data --collect-all _soundfile_data
+          --add-data "bench/clips;bench/clips" --distpath ../dist --workpath ../build
+          kaho_spike/__main__.py
+
+      - name: Packaged exe runs (help, and one engine end to end)
+        working-directory: dist/kaho-spike
+        run: |
+          ./kaho-spike.exe --help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./kaho-spike.exe bench --models-dir ../../models --out ../../bench-packaged.md
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "`n### Same benchmark from the packaged exe`n" | Add-Content $env:GITHUB_STEP_SUMMARY
+          Get-Content ../../bench-packaged.md | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: First-run model download from the packaged exe (empty models dir)
+        shell: pwsh
+        working-directory: dist/kaho-spike
+        run: |
+          # The earlier steps reuse cached models, so this is the only check that a
+          # fresh install can download them (it once failed on certificate checks)
+          ./kaho-spike.exe bench --models-dir "$env:RUNNER_TEMP/fresh-models" --out "$env:RUNNER_TEMP/bench-fresh.md"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: The packaged app stays up without a microphone (runners have none)
+        shell: pwsh
+        working-directory: dist/kaho-spike
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process -FilePath ./kaho-spike.exe -ArgumentList "--engine parakeet --models-dir ../../models" -PassThru -RedirectStandardOutput run.out -RedirectStandardError run.err
+          Start-Sleep -Seconds 60
+          $alive = -not $p.HasExited
+          if ($alive) { Stop-Process -Id $p.Id -Force }
+          Get-Content run.out, run.err -ErrorAction SilentlyContinue | Select-Object -Last 20
+          if (-not $alive) { Write-Error "kaho-spike exited without a microphone"; exit 1 }
+          # Hard requirement is staying up; whether a runner exposes an input device varies
+          if (Select-String -Path run.out, run.err -Pattern 'no microphone' -Quiet) { 'reported the missing microphone' } else { Write-Warning 'no missing-microphone message (this runner may have an input device)' }
+
+      - name: Stage artifact
+        run: |
+          Copy-Item README.txt ../dist/kaho-spike/README.txt
+          Copy-Item ../bench.md ../dist/kaho-spike/runner-benchmark.md
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kaho-spike-windows-x64
+          path: dist/kaho-spike
+          retention-days: 30
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: benchmark-details
+          path: |
+            bench.md
+            bench-details.json
+            bench-packaged.md
+          if-no-files-found: ignore
