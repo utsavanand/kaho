@@ -162,14 +162,14 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 # polling costs nothing. It also means a lost credential is reported as
 # such rather than silently reading as "still in progress" forever.
 await_notarization() {
-    local id="$1" waited=0 status="" info=""
+    local id="$1" waited=0 verdict="" info=""
     while (( waited < 3600 )); do
         info="$(xcrun notarytool info "$id" --keychain-profile "$NOTARY_PROFILE" 2>&1 || true)"
-        status="$(/usr/bin/awk '/^  status:/ {print $2; exit}' <<< "$info")"
-        case "$status" in
+        verdict="$(/usr/bin/awk '/^  status:/ {print $2; exit}' <<< "$info")"
+        case "$verdict" in
             Accepted) return 0 ;;
             Invalid|Rejected)
-                echo "notarization $status — details:"
+                echo "notarization $verdict — details:"
                 xcrun notarytool log "$id" --keychain-profile "$NOTARY_PROFILE"
                 return 1 ;;
             "")
