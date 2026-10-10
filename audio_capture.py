@@ -288,6 +288,10 @@ def child_main():
         stream = sd.InputStream(device=json.loads(args.device), samplerate=SAMPLE_RATE,
                                 channels=1, dtype="float32", callback=receive)
         stream.start()
+        with lock:
+            # Standby may have waited minutes with the mic closed. Start the
+            # no-audio grace period when capture opens, not when the child did.
+            last_audio = time.monotonic()
         emit("started")
         published = 0
         while True:

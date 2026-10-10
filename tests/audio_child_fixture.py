@@ -7,6 +7,7 @@ import os
 import pathlib
 import struct
 import sys
+import threading
 import time
 import types
 
@@ -30,6 +31,13 @@ if args.mode.startswith("native_"):
 
         def start(self):
             data = types.SimpleNamespace(tobytes=lambda: struct.pack("<1600f", *([0.25] * 1600)))
+            if args.mode == "native_delayed_first_audio":
+                timer = threading.Timer(0.1, self.callback, args=(data, 1600, None, None))
+                timer.daemon = True
+                timer.start()
+                return
+            if args.mode == "native_no_audio":
+                return
             self.callback(data, 1600, None, None)
 
         def stop(self):

@@ -5,6 +5,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -180,3 +181,33 @@ class TestStandby(unittest.TestCase):
         stream.reader.join(5)
         self.assertTrue(stream.frozen.is_set())
         self.assertEqual(sum(len(c) for c in chunks), 1600)
+
+    def test_idle_standby_does_not_time_out_before_the_first_audio_callback(self):
+        stream, chunks, errors = self.make_stream("native_delayed_first_audio")
+        received = threading.Event()
+
+        def receive(chunk, *_):
+            chunks.append(chunk)
+            received.set()
+
+        stream.callback = receive
+        stream.prepare()
+        self.assertTrue(stream.ready.wait(5))
+        # Longer than the two-second no-audio watchdog, but the mic is closed.
+        time.sleep(2.1)
+        stream.start()
+        self.assertTrue(received.wait(1), f"first audio was lost: {errors}")
+        stream.freeze()
+        self.assertEqual(sum(len(c) for c in chunks), 1600)
+        self.assertEqual(errors, [])
+
+    def test_a_started_microphone_without_audio_still_times_out(self):
+        stream, chunks, errors = self.make_stream("native_no_audio")
+        stream.prepare()
+        self.assertTrue(stream.ready.wait(5))
+        stream.start()
+        self.assertFalse(stream.frozen.wait(0.2), "watchdog fired before its grace period")
+        stream.reader.join(3)
+        self.assertFalse(stream.reader.is_alive(), "missing microphone audio was not detected")
+        self.assertEqual(chunks, [])
+        self.assertEqual(errors, ["microphone stopped delivering audio"])
