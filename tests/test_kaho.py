@@ -2128,3 +2128,133 @@ class TestScreenWords(KahoTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_NUMPY, "run_job splits real audio buffers")
+class TestEditSelection(KahoTestCase):
+    """Select text, then hold Shift for the whole dictation to say how to change it."""
+
+    def run_instruction_only(self, transcripts, selected="draft text"):
+        """A two-second recording whose last 1.9 s were spoken with Shift held."""
+        with mock.patch.object(kaho, "transcribe", side_effect=transcripts), \
+             mock.patch.object(kaho, "read_selection", return_value=selected), \
+             mock.patch.object(kaho, "rewrite_with_instruction",
+                               return_value="Formal draft.") as rw, \
+             mock.patch.object(kaho, "paste") as paste, \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 2, dtype="float32")
+            kaho.run_job(audio, kaho.job_generation,
+                         [[int(kaho.SAMPLE_RATE * 0.1), len(audio)]], None, self.clock.now)
+        return rw, paste
+
+    def test_an_instruction_with_no_dictation_rewrites_the_selection(self):
+        # Shift went down 0.1 s after the hotkey: too little to be a message
+        rw, paste = self.run_instruction_only(["make it formal"])
+        rw.assert_called_once_with("draft text", "make it formal")
+        paste.assert_called_once_with("Formal draft.")
+
+    def test_a_silent_pause_before_shift_still_edits_the_selection(self):
+        with mock.patch.object(kaho, "transcribe", side_effect=["make it formal", ""]), \
+             mock.patch.object(kaho, "read_selection", return_value="draft text"), \
+             mock.patch.object(kaho, "rewrite_with_instruction",
+                               return_value="Formal draft.") as rw, \
+             mock.patch.object(kaho, "paste") as paste, \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 3, dtype="float32")
+            # A full second before Shift, but nothing was said in it
+            kaho.run_job(audio, kaho.job_generation,
+                         [[kaho.SAMPLE_RATE, len(audio)]], None, self.clock.now)
+        rw.assert_called_once_with("draft text", "make it formal")
+        paste.assert_called_once_with("Formal draft.")
+
+    def test_with_nothing_selected_it_says_so_and_pastes_nothing(self):
+        kaho.overlay.showProblem_.reset_mock()
+        rw, paste = self.run_instruction_only(["make it formal"], selected=None)
+        rw.assert_not_called()
+        paste.assert_not_called()
+        kaho.AppHelper.callAfter.assert_any_call(kaho.overlay.showProblem_, "Select text to edit")
+
+    def test_a_dictated_message_still_gets_the_instruction_not_the_selection(self):
+        with mock.patch.object(kaho, "transcribe",
+                               side_effect=["make it formal", "cant make the offsite"]), \
+             mock.patch.object(kaho, "read_selection") as read, \
+             mock.patch.object(kaho, "rewrite_with_instruction",
+                               return_value="I am unable to attend.") as rw, \
+             mock.patch.object(kaho, "paste"), \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE * 2, dtype="float32")
+            kaho.run_job(audio, kaho.job_generation,
+                         [[kaho.SAMPLE_RATE, len(audio)]], None, self.clock.now)
+        read.assert_not_called()
+        rw.assert_called_once_with("cant make the offsite", "make it formal")
+
+
+class TestReadSelection(KahoTestCase):
+    """Accessibility when the app answers, ⌘C only when it can't."""
+
+    def setUp(self):
+        super().setUp()
+        self.ax = mock.MagicMock()
+        self.enterContext(mock.patch.object(kaho, "ApplicationServices", self.ax))
+        self.copy = self.enterContext(mock.patch.object(kaho, "copy_selection",
+                                                        return_value="copied"))
+
+    def answers(self, selected):
+        focused = object()
+
+        def attribute(element, name, _):
+            if name == "AXFocusedUIElement":
+                return 0, focused
+            return (0, selected) if selected is not None else (-25205, None)
+        self.ax.AXUIElementCopyAttributeValue.side_effect = attribute
+
+    def test_accessibility_selection_is_used_without_touching_the_clipboard(self):
+        self.answers("the selected words")
+        self.assertEqual(kaho.read_selection(), "the selected words")
+        self.copy.assert_not_called()
+
+    def test_an_app_that_cannot_answer_falls_back_to_copy(self):
+        self.answers(None)
+        self.assertEqual(kaho.read_selection(), "copied")
+
+    def test_an_empty_selection_is_nothing_selected_not_a_reason_to_copy(self):
+        # ⌘C with no selection copies the whole line in VS Code
+        self.answers("")
+        self.assertIsNone(kaho.read_selection())
+        self.copy.assert_not_called()
+
+
+class TestCopySelection(KahoTestCase):
+    """⌘C borrows the clipboard and gives it back."""
+
+    def setUp(self):
+        super().setUp()
+        # Its own pasteboard: side effects on the shared stub would outlive
+        # this class, since reset_mock() leaves side_effect in place
+        self.pb = mock.MagicMock()
+        self.enterContext(mock.patch.object(kaho.AppKit.NSPasteboard, "generalPasteboard",
+                                            return_value=self.pb))
+        self.clipboard = {"text": "what the user had copied", "count": 7}
+        self.pb.changeCount.side_effect = lambda: self.clipboard["count"]
+        self.pb.stringForType_.side_effect = lambda _t: self.clipboard["text"]
+
+        def set_string(text, _t):
+            self.clipboard["text"] = text
+        self.pb.setString_forType_.side_effect = set_string
+
+    def test_the_selection_is_returned_and_the_clipboard_restored(self):
+        def app_copies(_keycode):
+            self.clipboard.update(text="selected in the app", count=8)
+        with mock.patch.object(kaho, "press_command", side_effect=app_copies):
+            self.assertEqual(kaho.copy_selection(), "selected in the app")
+        self.assertEqual(self.clipboard["text"], "what the user had copied")
+
+    def test_nothing_copied_returns_none_and_leaves_the_clipboard(self):
+        # The test clock is frozen, so waiting has to move it on
+        with mock.patch.object(kaho, "press_command"), \
+             mock.patch.object(kaho.time, "sleep", side_effect=self.clock.advance):
+            self.assertIsNone(kaho.copy_selection())
+        self.pb.setString_forType_.assert_not_called()

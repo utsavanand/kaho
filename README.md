@@ -69,6 +69,13 @@ log, and one-click bug reports:
   how it reads: *"drop the part about shipping"*, *"it's 4 pm, not 3"*, *"the
   PR is number six"*. Nothing to configure and nothing stored — the
   instruction is spoken once and forgotten.
+- **Edit text you've already written** — select it in any app, then hold the
+  hotkey *and* Shift and say what to change: *"make this more formal"*,
+  *"shorten it to one line"*, *"the date is Friday, not Thursday"*. Kaho
+  rewrites the selection and pastes over it. Holding the hotkey alone over a
+  selection still replaces it with what you dictate. Kaho reads the selection
+  through Accessibility, and in apps that don't expose it (some terminals and
+  web apps) copies it with ⌘C and puts your clipboard back.
 - **Rewrite model** — on this Mac by default. You can point the rewrite step
   at OpenAI, Anthropic, or any OpenAI-compatible endpoint (Groq, OpenRouter,
   a local Ollama) with your own key, which is worth it for "turn this ramble

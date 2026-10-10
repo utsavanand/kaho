@@ -34,6 +34,7 @@ from PyObjCTools import AppHelper
 # off the main thread, which macOS 15 kills with EXC_BREAKPOINT
 # (dispatch_assert_queue).
 V_KEYCODE = 9
+C_KEYCODE = 8
 # Each hotkey pairs its keycode with the NX_DEVICE*KEYMASK bit from IOKit's
 # IOLLEvent.h. The device-specific bit is essential: the aggregate
 # NSEventModifierFlagOption stays set while LEFT Option is held, which made a
@@ -359,6 +360,11 @@ ENGLISH_WORDS_PATH = "/usr/share/dict/words"
 # which reads in 10-40 ms. A name written in the thread being replied to went
 # from 3/15 to 10/15 spelled right in an offline test with these as hotwords.
 SCREEN_READ_SECONDS = 0.15
+# Editing a selection waits on the user's app twice: once to read it, and
+# once more for ⌘C when Accessibility can't. Both are short because the
+# user is waiting with nothing on screen but the pill.
+SELECTION_READ_SECONDS = 0.5
+SELECTION_COPY_SECONDS = 0.5
 SCREEN_MAX_NODES = 4000
 # Fewer than the dictionary's cap: these are guesses about what the user will
 # say, and every one dilutes the bias on the words they actually do say
@@ -1850,6 +1856,52 @@ def paste_blocked_reason():
     return None
 
 
+def press_command(keycode):
+    """Send ⌘ plus a key to the front app."""
+    for key_down in (True, False):
+        event = Quartz.CGEventCreateKeyboardEvent(None, keycode, key_down)
+        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+
+def read_selection():
+    """The text selected in the front app, or None if there is none.
+
+    Accessibility first. Only when the app can't answer at all (some
+    terminals and web views) does Kaho copy the selection with ⌘C. An app
+    that answers with an empty selection really has nothing selected, and
+    ⌘C there could copy something else: VS Code copies the whole line.
+    """
+    system = ApplicationServices.AXUIElementCreateSystemWide()
+    # A hung app would otherwise block the worker for the system default of
+    # about six seconds
+    ApplicationServices.AXUIElementSetMessagingTimeout(system, SELECTION_READ_SECONDS)
+    focused = _ax(system, "AXFocusedUIElement")
+    selected = _ax(focused, "AXSelectedText") if focused is not None else None
+    if not isinstance(selected, str):
+        return copy_selection()
+    return selected if selected.strip() else None
+
+
+def copy_selection():
+    """Copy the selection with ⌘C, then put the user's clipboard back."""
+    pb = AppKit.NSPasteboard.generalPasteboard()
+    before = pb.changeCount()
+    previous = pb.stringForType_(AppKit.NSPasteboardTypeString)
+    press_command(C_KEYCODE)
+    deadline = time.monotonic() + SELECTION_COPY_SECONDS
+    while pb.changeCount() == before:
+        if time.monotonic() >= deadline:
+            # Nothing selected, or the app ignored ⌘C
+            return None
+        time.sleep(0.02)
+    copied = pb.stringForType_(AppKit.NSPasteboardTypeString)
+    if previous is not None:
+        pb.clearContents()
+        pb.setString_forType_(previous, AppKit.NSPasteboardTypeString)
+    return copied if copied and copied.strip() else None
+
+
 def paste(text):
     """Paste the transcript, then hand the clipboard back.
 
@@ -1866,10 +1918,7 @@ def paste(text):
     pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
     change_count = pb.changeCount()
 
-    for key_down in (True, False):
-        event = Quartz.CGEventCreateKeyboardEvent(None, V_KEYCODE, key_down)
-        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+    press_command(V_KEYCODE)
 
     if previous is None:
         return
@@ -1929,10 +1978,7 @@ def run_job(audio, generation, spans, released, t0, session=None):
     instruction = None
     message_audio, instruction_audio = split_audio(audio, spans)
     if instruction_audio is not None:
-        if len(message_audio) < SAMPLE_RATE * MIN_SECONDS:
-            # Nothing to apply it to; the whole recording was instruction
-            log("nothing dictated to apply the instruction to — pasting as-is")
-        elif len(instruction_audio) < SAMPLE_RATE * MIN_SECONDS:
+        if len(instruction_audio) < SAMPLE_RATE * MIN_SECONDS:
             # Too brief to be an instruction, but the user still marked it as
             # one, so it must not be transcribed into their message. Keeping
             # the full audio here spoke the instruction back at them.
@@ -1945,7 +1991,12 @@ def run_job(audio, generation, spans, released, t0, session=None):
             instruction = transcribe(instruction_audio).strip()
             if not instruction:
                 log("instruction was empty — pasting the dictation as-is")
-    text = transcribe(audio, screen=screen)
+    # Shift pressed a moment after the hotkey leaves a sliver of message
+    # audio before the instruction; there is nothing in it to transcribe
+    if instruction and len(audio) < SAMPLE_RATE * MIN_SECONDS:
+        text = ""
+    else:
+        text = transcribe(audio, screen=screen)
     if generation != job_generation:
         # The models did run, so this still counts against idle warmup
         last_inference = time.monotonic()
@@ -1954,6 +2005,10 @@ def run_job(audio, generation, spans, released, t0, session=None):
     if looks_hallucinated(text):
         log(f"dropped: transcription looks like a repetition loop ({len(text.split())} words)")
         AppHelper.callAfter(overlay.hide)
+        return
+    if instruction and not text.strip():
+        # Only an instruction was spoken, so it is about text already written
+        edit_selection(instruction, generation, released, t0)
         return
     mode = settings["rewrite"]
     if text and instruction:
@@ -1973,25 +2028,56 @@ def run_job(audio, generation, spans, released, t0, session=None):
             log("cancelled during rewriting — nothing pasted")
             return
     if text:
-        reason = paste_blocked_reason()
-        if reason is None:
-            paste(text)
-            append_history(text)
-            AppHelper.callAfter(overlay.finishStale_)
-        else:
-            # Leave the transcript on the clipboard (no restore) so one manual
-            # Cmd+V recovers the dictation, and say so on the pill — a silent
-            # no-op here reads as a dead app.
-            set_clipboard(text)
-            append_history(text)
-            log(f"paste blocked: {reason} — transcript is on the clipboard")
-            AppHelper.callAfter(overlay.showProblem_, blocked_pill_text(reason))
-            if "Accessibility" in reason:
-                AppHelper.callAfter(accessibility_lost)
+        deliver(text)
     else:
         AppHelper.callAfter(overlay.hideStale_)
     last_inference = time.monotonic()
     log(f"[{job_timing(released, t0)}] {text or '(empty transcription, nothing pasted)'}")
+
+
+def deliver(text):
+    """Paste the result, or leave it on the clipboard and say why not."""
+    reason = paste_blocked_reason()
+    if reason is None:
+        paste(text)
+        append_history(text)
+        AppHelper.callAfter(overlay.finishStale_)
+        return
+    # Leave the transcript on the clipboard (no restore) so one manual
+    # Cmd+V recovers the dictation, and say so on the pill — a silent
+    # no-op here reads as a dead app.
+    set_clipboard(text)
+    append_history(text)
+    log(f"paste blocked: {reason} — transcript is on the clipboard")
+    AppHelper.callAfter(overlay.showProblem_, blocked_pill_text(reason))
+    if "Accessibility" in reason:
+        AppHelper.callAfter(accessibility_lost)
+
+
+def edit_selection(instruction, generation, released, t0):
+    """Rewrite the text selected in the front app the way the instruction says.
+
+    The rewrite is pasted while the selection is still active, so it
+    replaces the selection.
+    """
+    global last_inference
+    selected = read_selection()
+    if not selected:
+        log(f'nothing selected to apply the instruction to: "{instruction}"')
+        AppHelper.callAfter(overlay.showProblem_, "Select text to edit")
+        return
+    AppHelper.callAfter(overlay.setPhase_, "rewriting")
+    text = rewrite_with_instruction(selected, instruction)
+    last_inference = time.monotonic()
+    if generation != job_generation:
+        log("cancelled during rewriting — selection left as it was")
+        return
+    if not text:
+        # rewrite_with_instruction already logged why
+        AppHelper.callAfter(overlay.showProblem_, "Couldn't rewrite — unchanged")
+        return
+    deliver(text)
+    log(f'[{job_timing(released, t0)}] edited {len(selected)} selected characters: "{instruction}"')
 
 
 def job_timing(released, t0):
