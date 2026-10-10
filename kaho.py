@@ -1,6 +1,17 @@
 """Kaho: hold the hotkey (right Option by default) anywhere, speak, release —
 locally transcribed text is pasted into the focused app. See DESIGN.md."""
 
+# The packaged audio child must dispatch before importing GUI/model packages.
+import sys
+
+# A source-installed bundle is signed too; do not add __pycache__ files inside it.
+sys.dont_write_bytecode = True
+
+import audio_capture
+
+if __name__ == "__main__" and "--kaho-audio-helper" in sys.argv:
+    audio_capture.child_main()
+
 import collections
 import ctypes
 import difflib
@@ -13,7 +24,6 @@ import platform
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -412,6 +422,7 @@ STALE_GRANT_SECONDS = 45
 
 jobs = queue.Queue()
 audio_ops = queue.Queue()  # serialized PortAudio operations, see audio_control()
+standby = None  # a capture process started ahead of the next recording; audio thread only
 audio_op_started = None  # monotonic start of the op in flight, None when idle
 # Guards the recording handoff — state, record_buf, stream, locked — between the
 # main run loop (hotkey, UI) and the audio thread. Without it _open_stream's
@@ -473,7 +484,8 @@ class Recording:
     moment the user is mid-sentence.
     """
 
-    __slots__ = ("buf", "cancelled", "released_at", "screen_done", "screen_terms", "spans")
+    __slots__ = ("buf", "cancelled", "pending", "released_at", "screen_done",
+                 "screen_terms", "spans")
 
     def __init__(self):
         self.buf = []
@@ -484,6 +496,7 @@ class Recording:
         # in the dictation it was taken for
         self.screen_terms = None
         self.screen_done = False
+        self.pending = False  # released, but final audio has not reached the worker
         # When the user let go of the key. The number that matters to them
         # starts here, not when the worker picks the job up: the old timer
         # began after jobs.get(), so microphone shutdown and queue waiting
@@ -557,7 +570,7 @@ def _private_opener(path, flags):
 def log(msg):
     # Best-effort by design: log() runs inside the exception handlers that
     # keep the workers alive, so it must never raise (full disk, broken pipe)
-    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
     try:
         print(line, flush=True)
     except OSError:
@@ -862,12 +875,9 @@ def pick_input_device():
     return None, sd.query_devices(kind="input")["name"] + " (system default)"
 
 
-# CoreAudio open/stop can block indefinitely on a HAL mutex held by another
-# audio client (observed as a full main-thread deadlock with Wispr Flow
-# running), so every PortAudio call runs on one dedicated audio thread — the
-# hotkey and UI stay alive no matter what the audio stack does, and
-# serializing the ops means a wedged device pins at most that one thread
-# instead of leaking a new one per recording.
+# Serialize capture ownership on one executor. Native microphone calls now run
+# in replaceable child processes: a CoreAudio hang cannot pin this executor and
+# permanently disable later recordings. Models stay in the parent process.
 def audio_control():
     global audio_op_started
     while True:
@@ -1213,17 +1223,84 @@ def start_recording():
     audio_ops.put(lambda: _open_stream(buf))
 
 
+def _capture_device():
+    # PortAudio indices can differ between independently initialized
+    # processes after hotplug. Resolve the selected name in the child.
+    return input_name if input_device is not None else None
+
+
+def _new_capture(callback=None, on_error=None):
+    return audio_capture.InputStream(
+        device=_capture_device(), samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+        callback=callback, on_error=on_error, log=log,
+    )
+
+
+def prepare_standby():
+    """Start the next recording's capture process now, on the audio thread.
+
+    The key press then only opens the microphone. Starting the process takes
+    about 200 ms, over a second on a cold launch, and words spoken before the
+    microphone opens are lost. The standby imports sounddevice and waits, with
+    the microphone closed.
+    """
+    global standby
+    if standby is not None and standby.usable() and standby.device == _capture_device():
+        return
+    _discard_standby()
+    try:
+        s = _new_capture()
+        s.prepare()
+    except Exception as e:  # noqa: BLE001
+        # Not fatal: the next recording starts its own process, as before
+        log(f"could not prepare the next microphone capture: {e!r}")
+        return
+    standby = s
+
+
+def _take_standby():
+    global standby
+    s, standby = standby, None
+    if s is not None and s.usable() and s.device == _capture_device():
+        return s
+    if s is not None:
+        _close_quietly(s)
+    return None
+
+
+def _discard_standby():
+    global standby
+    s, standby = standby, None
+    if s is not None:
+        _close_quietly(s)
+
+
+def _close_quietly(s):
+    try:
+        s.close()
+    except audio_capture.CaptureError as e:
+        log(f"could not discard the standby microphone process: {e}")
+
+
 def _open_stream(buf):
     global stream, state, locked
     s = None
     try:
-        s = sd.InputStream(
-            device=input_device,
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            callback=lambda data, *_: buf.append(data.copy()),
-        )
+        def interrupted(message):
+            def finish_interrupted():
+                if record_buf is buf and state == "recording":
+                    log(f"microphone interrupted — preserving captured speech: {message}")
+                    stop_recording()
+            AppHelper.callAfter(finish_interrupted)
+
+        def capture(data, *_):
+            buf.append(data)  # the reader supplies an owned array
+
+        s = _take_standby()
+        if s is None:
+            s = _new_capture(callback=capture, on_error=interrupted)
+        else:
+            s.callback, s.on_error = capture, interrupted
         s.start()
     except Exception as e:  # noqa: BLE001
         # Not just PortAudioError: anything else escaped to audio_control,
@@ -1240,6 +1317,7 @@ def _open_stream(buf):
             except Exception as close_error:  # noqa: BLE001
                 log(f"could not close the failed stream: {close_error!r}")
         log(f"mic open failed: {e!r}\n(System Settings > Privacy & Security > Microphone)")
+        prepare_standby()
         with recording_lock:
             current = buf is record_buf and state == "recording"
             if current:
@@ -1267,13 +1345,13 @@ def _shutdown_stream(s):
     # keep the microphone device busy and wedge every later open
     try:
         s.stop()
-    except sd.PortAudioError as e:
+    except (sd.PortAudioError, audio_capture.CaptureError) as e:
         log(f"mic stop failed: {e}")
     finally:
         try:
             s.close()
-        except sd.PortAudioError:
-            pass
+        except (sd.PortAudioError, audio_capture.CaptureError) as e:
+            log(f"mic close failed: {e}")
 
 
 def stop_recording():
@@ -1287,6 +1365,7 @@ def stop_recording():
         s, buf, session = stream, record_buf, recording
         if session is not None:
             session.released_at = time.monotonic()
+            session.pending = True
         stream = None
         record_buf = None
     # The pill stays up: the worker switches it to "Transcribing…" and hides
@@ -1329,16 +1408,25 @@ def _audio_or_drop_reason(buf):
 def _finish_recording(s, buf, session=None):
     """Hand the recording to the worker, then release the device.
 
-    Enqueue first, shut down second. The buffer is already complete by the
-    time this runs — the callback stopped appending when stop_recording took
-    the stream — so nothing about the transcript depends on the device
-    closing. CoreAudio's stop can block forever on a HAL mutex (seen in
-    process samples, and both stop() and abort() route through
-    FinishStoppingStream), and doing it first meant a hung device threw away
-    speech the user had already finished saying.
+    Freeze and drain the capture pipe first, then enqueue the immutable audio
+    before native shutdown. The old callback kept appending to buf after release;
+    moving its stream reference did not stop it. Child cleanup has a hard deadline
+    and cannot leave the audio executor permanently unable to open the next mic.
     """
+    if s is not None:
+        try:
+            s.freeze()
+        except audio_capture.CaptureError as e:
+            if session is not None:
+                session.pending = False
+            log(f"could not finalize microphone capture: {e}")
+            _shutdown_stream(s)
+            AppHelper.callAfter(overlay.showProblem_, "Mic interrupted — try again")
+            prepare_standby()
+            return
     # This recording's own cancel flag, not a global one: cancelling a later
     # dictation used to discard whichever recording finalized next.
+    generation = job_generation
     if session is not None and session.cancelled:
         AppHelper.callAfter(overlay.hide)
     else:
@@ -1354,13 +1442,17 @@ def _finish_recording(s, buf, session=None):
             released = session.released_at if session is not None else None
             global job_outstanding
             job_outstanding = True
-            jobs.put((audio, job_generation, spans, released, session))
+            jobs.put((audio, generation, spans, released, session))
+
+    if session is not None:
+        session.pending = False
 
     if s is not None:
         t0 = time.monotonic()
         _shutdown_stream(s)
         if time.monotonic() - t0 > 3:
             log("audio device was slow to release — another audio app may be fighting for the mic")
+    prepare_standby()
 
 
 def schedule_deferred_stop(tap_time):
@@ -1484,9 +1576,12 @@ def cancel_pending_job():
     really is stopped.
     """
     global job_generation, locked
-    if state != "recording" and not overlay.is_working():
+    pending = recording is not None and recording.pending
+    if state != "recording" and not overlay.is_working() and not pending:
         return False
     job_generation += 1
+    if pending:
+        recording.cancelled = True
     if state == "recording":
         # Marked on this recording, not on a global: the generation counter
         # cannot cover it either, because _finish_recording runs later on the
@@ -2194,6 +2289,9 @@ def backend():
     try:
         input_device, input_name = pick_input_device()
         log(f"mic: {input_name}")
+        # Started while the models load, so not even the first dictation
+        # waits for the capture process
+        audio_ops.put(prepare_standby)
         log(f"loading {MODEL_REPO}@{MODEL_REVISION[:8]} (first run downloads {MODEL_SIZE_LABEL})...")
         t0 = time.monotonic()
         path, downloaded = download_model()
@@ -3592,6 +3690,7 @@ def main():
         os.remove(RELAUNCH_MARKER_PATH)
     except OSError:
         pass
+    log(f"Kaho {APP_VERSION} pid={os.getpid()} — isolated microphone capture enabled")
     ensure_dictionary_file()
     # Migrate transcript files created by older versions to private mode;
     # _private_opener only covers newly created files

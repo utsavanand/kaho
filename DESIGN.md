@@ -1,5 +1,47 @@
 # kaho — design
 
+## Local audio recovery fix (2026-10-06)
+
+The source install now captures through `audio_capture.py`. Each recording owns
+an audio-only subprocess using the same sounddevice/PortAudio input format.
+Microphone open has a five-second deadline. Release freezes the producer and
+drains its final published samples before the parent snapshots the recording.
+Only then does the child call native stop/close. The existing audio executor
+hands speech to inference immediately and gives native cleanup 350 ms, then
+kills and reaps an unresponsive child. The next recording gets a fresh child;
+the UI and loaded models stay alive. This replaces the permanent thread wedge
+described in the historical design below.
+
+The next recording's child is started ahead of time: at launch while the
+models load, and after each recording. It imports sounddevice, reports
+`ready`, and waits for `open` with the microphone closed, so macOS shows no
+indicator. Measured in the packaged app on an M-series MacBook Pro, key press
+to open microphone was about 300 ms with a fresh child per recording (1.4 s on
+the first after launch) and 102–111 ms with the standby, against about 100 ms
+for the old in-process stream. Words spoken before the microphone opens are
+lost, so that difference is audible. The idle standby uses about 44 MB. Just
+before opening, it refreshes PortAudio's device list (1–2 ms), since it may
+have been waiting since before a headset was connected. A standby that died
+or was prepared for another input device is discarded, and the recording
+starts a fresh child as before.
+
+Anonymous shared storage carries samples; the pipe carries frame counts. The
+producer appends only, so a published range is immutable. The parent reader
+supplies owned NumPy arrays to the existing level meter/instruction buffer.
+Capture is capped at ten minutes; lack of samples for two seconds, a callback
+error, or an input overflow finalizes partial speech with a diagnostic. A child
+watches its parent and exits if Kaho disappears, including during native stop.
+No named audio file survives normal or abnormal parent exit.
+
+The installed-source launcher copies this module beside kaho.py. A packaged
+child dispatches `--kaho-audio-helper` before GUI/model imports; the PyInstaller
+spec includes the module. Source installation and real microphone capture are
+validated locally; the signed distributed bundle must receive its own packaged
+smoke test before a release.
+
+Run `python -m unittest discover -s tests -t .` for the IPC, native-hang injection,
+cancellation, resource cleanup, and existing dictation regression tests.
+
 A local clone of Wispr Flow's core loop: hold a key anywhere on macOS, speak,
 release, and the transcribed text is inserted into whatever app has focus.
 Transcription runs entirely on-device.

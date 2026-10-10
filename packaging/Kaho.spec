@@ -48,6 +48,7 @@ a = Analysis(
     # its submodules have to be named explicitly or the app dies on first
     # import with "No module named 'mlx._reprlib_fix'".
     hiddenimports=[
+        "audio_capture",
         "mlx",
         "mlx.core",
         "mlx.nn",
