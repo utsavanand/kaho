@@ -209,9 +209,17 @@ if [[ "${2:-}" == "--zip" ]]; then
     xcrun stapler staple "$APP"
     xcrun stapler validate "$APP"
     # Re-zipped around the stapled app, so a first launch offline still
-    # passes Gatekeeper without an online check
+    # passes Gatekeeper without an online check. Without extended attributes:
+    # ditto stores them as ._ entries, and Archive Utility, which can't put
+    # an xattr on a symlink, writes the ones for Python.framework's symlinks
+    # out as ._Python and ._Resources. Files in a framework's root break its
+    # seal, and Gatekeeper then says Apple could not verify Kaho.
     rm -f "$ZIP"
-    ditto -c -k --keepParent "$APP" "$ZIP"
+    ditto -c -k --norsrc --noextattr --noqtn --noacl --keepParent "$APP" "$ZIP"
+    if unzip -l "$ZIP" | grep -qE '/\._'; then
+        echo "the zip still carries ._ entries; Archive Utility would break the signature"
+        exit 1
+    fi
     spctl -a -t exec -vv "$APP"
     echo ""
     echo "done: $ZIP"
