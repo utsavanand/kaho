@@ -402,6 +402,8 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 # CHANGELOG.md disagrees — the Kaho.spec copy had silently sat at 1.7.3 for six
 # releases, which is what a bundle built without KAHO_VERSION would have shipped.
 APP_VERSION = "2.4.1"
+WEBSITE_URL = "https://kaho.utsava.xyz/"
+RELEASE_NOTES_URL = f"https://github.com/utsavanand/kaho/releases/tag/v{APP_VERSION}"
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 # One Kaho per user. A tester reopened Kaho to "apply" the Accessibility grant
@@ -2933,7 +2935,7 @@ class SettingsWindow(AppKit.NSObject):
             | AppKit.NSWindowStyleMaskMiniaturizable
         )
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (460, 522)), mask, AppKit.NSBackingStoreBuffered, False
+            ((0, 0), (460, 522 + ABOUT_HEIGHT)), mask, AppKit.NSBackingStoreBuffered, False
         )
         window.setTitle_("Kaho Settings")
         window.setReleasedWhenClosed_(False)
@@ -3028,6 +3030,25 @@ class SettingsWindow(AppKit.NSObject):
         self.notice.setFrame_(((24, 8), (412, 30)))
         self.notice.cell().setWraps_(True)
         content.addSubview_(self.notice)
+
+        # Everything above is laid out from the bottom edge; lift it to make
+        # room for About underneath rather than renumbering every control
+        for view in content.subviews():
+            (x, y), size = view.frame()
+            view.setFrame_(((x, y + ABOUT_HEIGHT), size))
+        divider = AppKit.NSBox.alloc().initWithFrame_(((24, ABOUT_HEIGHT - 4), (412, 1)))
+        divider.setBoxType_(AppKit.NSBoxSeparator)
+        content.addSubview_(divider)
+        content.addSubview_(make_label("About Kaho", 24, 44, 13, bold=True))
+        content.addSubview_(make_label(f"Version {APP_VERSION}", 24, 24, 11, dim=True))
+        for title, action, x, width in (("Release Notes", "openReleaseNotes:", 226, 114),
+                                        ("Website", "openWebsite:", 346, 90)):
+            button = AppKit.NSButton.alloc().initWithFrame_(((x, 30), (width, 26)))
+            button.setTitle_(title)
+            button.setBezelStyle_(AppKit.NSBezelStyleRounded)
+            button.setTarget_(self)
+            button.setAction_(action)
+            content.addSubview_(button)
         self.window = window
 
     def syncControls(self):
@@ -3074,6 +3095,12 @@ class SettingsWindow(AppKit.NSObject):
     def openDictionary_(self, _sender):
         open_dictionary()
 
+    def openReleaseNotes_(self, _sender):
+        open_url(RELEASE_NOTES_URL)
+
+    def openWebsite_(self, _sender):
+        open_url(WEBSITE_URL)
+
     def hotkeyChanged_(self, sender):
         apply_hotkey(sender.selectedItem().representedObject())
 
@@ -3088,6 +3115,14 @@ class SettingsWindow(AppKit.NSObject):
 
     def screenWordsChanged_(self, sender):
         apply_screen_words(sender.state() == AppKit.NSControlStateValueOn)
+
+
+# Room at the bottom of Settings for the About section
+ABOUT_HEIGHT = 76
+
+
+def open_url(url):
+    AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(url))
 
 
 def make_label(text, x, y, size, bold=False, dim=False):
