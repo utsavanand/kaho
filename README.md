@@ -1,6 +1,6 @@
 # Kaho downloads
 
-**Total downloads: 34** (all releases and files, updated 2026-10-10).
+**Total downloads: 34** (all releases and files, updated 2026-10-11).
 
 Counts every download of a release file, including Homebrew installs and the website's Download button.
 
@@ -8,7 +8,9 @@ Counts every download of a release file, including Homebrew installs and the web
 
 | Release | File | Published | Downloads |
 |---|---|---|---:|
-| v2.4.0 | Kaho-2.4.0.zip | 2026-10-07 | 3 |
+| v2.4.1 | Kaho-2.4.1.dmg | 2026-10-11 | 1 |
+| v2.4.1 | Kaho-2.4.1.zip | 2026-10-11 | 1 |
+| v2.4.0 | Kaho-2.4.0.zip | 2026-10-07 | 1 |
 | v2.2.0 | Kaho-2.2.0.dmg | 2026-10-02 | 12 |
 | v2.1.0 | Kaho-2.1.0.dmg | 2026-10-02 | 4 |
 | v2.0.0 | Kaho-2.0.0.dmg | 2026-09-30 | 6 |
@@ -22,6 +24,7 @@ Counts every download of a release file, including Homebrew installs and the web
 
 | Day | Total downloads | Change |
 |---|---:|---:|
+| 2026-10-11 | 34 | +0 |
 | 2026-10-10 | 34 |  |
 
 Raw data: [stats/downloads.csv](stats/downloads.csv). Updated daily at 06:15 UTC by `.github/workflows/download-stats.yml` on main.
