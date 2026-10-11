@@ -39,8 +39,15 @@ ways to change text by saying how.
     settings page.
   - The speech model download shows its progress in the menu.
   - A paste that can't happen says why and how to fix it.
-- Releases are notarized again. Apple held, then dropped, Kaho's 45 MB
-  launcher. It is now 124 KB, with the rest of the code beside it.
+- Settings shows which Kaho is installed: an About section with the
+  version, the release notes and the website.
+- Back to a DMG: open it and drag Kaho to Applications. Apple had been
+  holding, then dropping, Kaho's 45 MB launcher; it is now 124 KB, with
+  the rest of the code beside it, and the DMG is notarized in minutes.
+- The 2.4.0 zip failed Gatekeeper ("Apple could not verify Kaho is free
+  of malware") when unzipped by double-clicking: Archive Utility turned
+  stored file attributes into stray files inside the bundled Python, which
+  broke its signature. Release zips no longer carry those attributes.
 
 ## 2.4.0 — 2026-10-04
 
