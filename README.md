@@ -1,6 +1,6 @@
 # Kaho downloads
 
-**Total downloads: 34** (all releases and files, updated 2026-10-11).
+**Total downloads: 34** (all releases and files, updated 2026-10-12).
 
 Counts every download of a release file, including Homebrew installs and the website's Download button.
 
@@ -24,6 +24,7 @@ Counts every download of a release file, including Homebrew installs and the web
 
 | Day | Total downloads | Change |
 |---|---:|---:|
+| 2026-10-12 | 34 | +0 |
 | 2026-10-11 | 34 | +0 |
 | 2026-10-10 | 34 |  |
 
