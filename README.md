@@ -50,7 +50,9 @@ log, and one-click bug reports:
 
 <img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey, Trigger, Language and Rewrite submenus, Settings, History, Open Log, Report a Bug">
 
-- **Settings…** — a real window (⌘,) for hotkey, trigger, language and rewrite
+- **Settings…** — a real window (⌘,) for hotkey, trigger, language and
+  rewrite. **About Kaho** at the bottom shows the installed version, and says
+  when a newer one is out; the menu also shows **Kaho x.y.z is available…**
 - **Edit Dictionary…** — names and jargon the model should spell your way
 - **Use Words on Screen** — on by default; untick it (here or in Settings) to
   stop Kaho reading the focused window at all. Some apps don't expose their
@@ -262,7 +264,10 @@ Audio is captured only while the hotkey is held, processed in memory, never
 written to disk or sent anywhere. Transcripts go to the clipboard, the local
 log, and the local history file (`~/Library/Application Support/Kaho/`) —
 delete them any time. Rewriting runs entirely on-device too. The models are
-fetched once from Hugging Face; nothing else touches the network.
+fetched once from Hugging Face. Once a day Kaho asks GitHub for the latest
+version number, and sends nothing about you or your dictation; untick
+**Check for new versions** in Settings to stop it. Nothing else touches the
+network.
 
 Words on Screen reads only the window you're dictating into, only when you
 press the hotkey, and only its visible text. The names and jargon it picks

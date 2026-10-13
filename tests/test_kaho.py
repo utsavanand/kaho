@@ -13,6 +13,7 @@ Run with:  python -m unittest discover -s tests -t .
 """
 
 import ctypes
+import io
 import json
 import os
 import pathlib
@@ -159,7 +160,7 @@ class KahoTestCase(unittest.TestCase):
         self.enterContext(mock.patch.object(
             kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True}
+             "api_url": "", "api_model": "", "screen_words": True, "check_updates": True}
         ))
         self.enterContext(mock.patch.object(kaho, "overlay", mock.MagicMock()))
         # A real read starts a thread against the stubbed accessibility API;
@@ -499,7 +500,7 @@ class TestSettings(KahoTestCase):
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True},
+             "api_url": "", "api_model": "", "screen_words": True, "check_updates": True},
         )
 
     def test_a_non_finite_timestamp_is_skipped_not_fatal(self):
@@ -535,6 +536,15 @@ class TestSettings(KahoTestCase):
         self.assertEqual(kaho.settings["rewrite"], "off")
         self.assertEqual(kaho.settings["language"], "auto")
 
+    def test_turning_off_update_checks_survives_a_restart(self):
+        pathlib.Path(kaho.SETTINGS_PATH).write_text(json.dumps({"check_updates": False}))
+        kaho.load_settings()
+        self.assertFalse(kaho.settings["check_updates"])
+        pathlib.Path(kaho.SETTINGS_PATH).write_text(json.dumps({"check_updates": "no"}))
+        kaho.settings["check_updates"] = True
+        kaho.load_settings()
+        self.assertTrue(kaho.settings["check_updates"], "a non-boolean must not change it")
+
     def test_malformed_json_keeps_the_defaults(self):
         pathlib.Path(kaho.SETTINGS_PATH).write_text("{not json")
         kaho.load_settings()
@@ -555,7 +565,7 @@ class TestSettings(KahoTestCase):
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True},
+             "api_url": "", "api_model": "", "screen_words": True, "check_updates": True},
         )
 
     def test_saved_settings_round_trip_and_stay_private(self):
@@ -2381,3 +2391,68 @@ class TestCopySelection(KahoTestCase):
              mock.patch.object(kaho.time, "sleep", side_effect=self.clock.advance):
             self.assertIsNone(kaho.copy_selection())
         self.pb.setString_forType_.assert_not_called()
+
+
+class TestUpdateCheck(KahoTestCase):
+    """Tell people a newer Kaho exists; ask GitHub for nothing but the number."""
+
+    def release(self, tag="v2.4.2", **extra):
+        return {"tag_name": tag, "html_url": f"https://github.com/utsavanand/kaho/releases/tag/{tag}",
+                "draft": False, "prerelease": False, **extra}
+
+    def test_versions_compare_as_numbers_not_text(self):
+        self.assertEqual(kaho.parse_version("v2.10.0"), (2, 10, 0))
+        self.assertGreater(kaho.parse_version("2.10.0"), kaho.parse_version("2.9.9"))
+        for bad in ("v2.4", "2.4.1-beta", "latest", ""):
+            self.assertIsNone(kaho.parse_version(bad), bad)
+
+    def test_only_a_newer_published_release_counts(self):
+        self.assertEqual(kaho.newer_release(self.release("v2.4.2"), "2.4.1"),
+                         ("2.4.2", "https://github.com/utsavanand/kaho/releases/tag/v2.4.2"))
+        self.assertEqual(kaho.newer_release(self.release("v2.10.0"), "2.9.0")[0], "2.10.0")
+        not_newer = {
+            "same version": self.release("v2.4.1"),
+            "older": self.release("v2.4.0"),
+            "draft": self.release(draft=True),
+            "prerelease": self.release(prerelease=True),
+            "odd tag": self.release("nightly"),
+            "not https": self.release(html_url="http://example.com/kaho"),
+            "not a release": ["unexpected"],
+        }
+        for name, release in not_newer.items():
+            self.assertIsNone(kaho.newer_release(release, "2.4.1"), name)
+
+    def test_a_newer_release_is_remembered_and_shown(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = io.BytesIO(json.dumps(self.release()).encode())
+        with mock.patch.object(kaho.urllib.request, "urlopen", return_value=response) as urlopen, \
+             mock.patch.object(kaho, "APP_VERSION", "2.4.1"), \
+             mock.patch.object(kaho, "latest_release", None):
+            kaho.check_for_update()
+            self.assertEqual(kaho.latest_release[0], "2.4.2")
+        sent = urlopen.call_args.args[0]
+        self.assertEqual(sent.full_url, kaho.LATEST_RELEASE_API)
+        self.assertIsNone(sent.data, "the check must send nothing but the request")
+        kaho.AppHelper.callAfter.assert_any_call(kaho.refresh_settings_ui)
+
+    def test_turned_off_it_never_contacts_github(self):
+        kaho.settings["check_updates"] = False
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            kaho.check_for_update()
+        urlopen.assert_not_called()
+
+    def test_offline_is_quiet_and_keeps_what_was_known(self):
+        known = ("2.4.2", "https://github.com/utsavanand/kaho/releases/tag/v2.4.2")
+        with mock.patch.object(kaho.urllib.request, "urlopen",
+                               side_effect=kaho.urllib.error.URLError("offline")), \
+             mock.patch.object(kaho, "latest_release", known):
+            kaho.check_for_update()
+            self.assertEqual(kaho.latest_release, known)
+        self.assertTrue(any("update check skipped" in m for m in self.logged))
+
+    def test_turning_it_off_forgets_the_offer(self):
+        with mock.patch.object(kaho, "latest_release", ("2.4.2", "https://x")), \
+             mock.patch.object(kaho, "save_settings"):
+            kaho.apply_check_updates(False)
+            self.assertIsNone(kaho.latest_release)
+        self.assertFalse(kaho.settings["check_updates"])
