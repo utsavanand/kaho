@@ -23,6 +23,7 @@ import os
 import platform
 import queue
 import re
+import ssl
 import subprocess
 import threading
 import time
@@ -404,6 +405,10 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 APP_VERSION = "2.4.1"
 WEBSITE_URL = "https://kaho.utsava.xyz/"
 RELEASE_NOTES_URL = f"https://github.com/utsavanand/kaho/releases/tag/v{APP_VERSION}"
+# Asked at launch and then once a day, only for the latest version number.
+# GitHub's public API needs no account; nothing about the user is sent.
+LATEST_RELEASE_API = "https://api.github.com/repos/utsavanand/kaho/releases/latest"
+UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 # One Kaho per user. A tester reopened Kaho to "apply" the Accessibility grant
@@ -549,7 +554,7 @@ last_tap = 0.0
 lock_time = 0.0  # when hands-free last engaged, for the grace period
 settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto",
             "trigger": "hold", "rewrite_backend": "local",
-            "api_url": "", "api_model": "", "screen_words": True}
+            "api_url": "", "api_model": "", "screen_words": True, "check_updates": True}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
@@ -630,8 +635,9 @@ def load_settings():
     for key in ("api_url", "api_model"):
         if isinstance(saved.get(key), str):
             settings[key] = saved[key]
-    if isinstance(saved.get("screen_words"), bool):
-        settings["screen_words"] = saved["screen_words"]
+    for key in ("screen_words", "check_updates"):
+        if isinstance(saved.get(key), bool):
+            settings[key] = saved[key]
 
 
 def save_settings():
@@ -1843,7 +1849,7 @@ def call_rewrite_api(backend, prompt):
         # outside it that escaped as a crash instead of falling back.
         req = urllib.request.Request(
             url, data=json.dumps(body).encode(), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as r:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS, context=https_context()) as r:
             data = json.loads(r.read())
     except Exception as e:  # noqa: BLE001
         # Never log the key, and never log the response body: both can carry
@@ -2309,6 +2315,7 @@ def backend():
         transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), use_dictionary=False)
         last_inference = time.monotonic()
         log(f"model ready in {time.monotonic() - t0:.1f}s — hold {hotkey_label()} to dictate")
+        threading.Thread(target=update_loop, name="Kaho update check", daemon=True).start()
         state = "ready"
         if downloaded and not needs_accessibility:
             # After minutes of a progress counter, say plainly that it's done
@@ -3039,16 +3046,27 @@ class SettingsWindow(AppKit.NSObject):
         divider = AppKit.NSBox.alloc().initWithFrame_(((24, ABOUT_HEIGHT - 4), (412, 1)))
         divider.setBoxType_(AppKit.NSBoxSeparator)
         content.addSubview_(divider)
-        content.addSubview_(make_label("About Kaho", 24, 44, 13, bold=True))
-        content.addSubview_(make_label(f"Version {APP_VERSION}", 24, 24, 11, dim=True))
+        content.addSubview_(make_label("About Kaho", 24, 70, 13, bold=True))
+        self.version_label = make_label("", 24, 50, 11, dim=True)
+        self.version_label.setFrame_(((24, 50), (196, 18)))
+        content.addSubview_(self.version_label)
+        buttons = []
         for title, action, x, width in (("Release Notes", "openReleaseNotes:", 226, 114),
                                         ("Website", "openWebsite:", 346, 90)):
-            button = AppKit.NSButton.alloc().initWithFrame_(((x, 30), (width, 26)))
+            button = AppKit.NSButton.alloc().initWithFrame_(((x, 56), (width, 26)))
             button.setTitle_(title)
             button.setBezelStyle_(AppKit.NSBezelStyleRounded)
             button.setTarget_(self)
             button.setAction_(action)
             content.addSubview_(button)
+            buttons.append(button)
+        self.notes_button = buttons[0]
+        self.updates_box = AppKit.NSButton.alloc().initWithFrame_(((24, 16), (412, 22)))
+        self.updates_box.setButtonType_(AppKit.NSButtonTypeSwitch)
+        self.updates_box.setTitle_("Check for new versions (asks GitHub once a day)")
+        self.updates_box.setTarget_(self)
+        self.updates_box.setAction_("checkUpdatesChanged:")
+        content.addSubview_(self.updates_box)
         self.window = window
 
     def syncControls(self):
@@ -3067,6 +3085,15 @@ class SettingsWindow(AppKit.NSObject):
         self.screen_box.setState_(
             AppKit.NSControlStateValueOn if settings["screen_words"] else AppKit.NSControlStateValueOff
         )
+        self.updates_box.setState_(
+            AppKit.NSControlStateValueOn if settings["check_updates"] else AppKit.NSControlStateValueOff
+        )
+        if latest_release:
+            self.version_label.setStringValue_(f"Version {APP_VERSION} · {latest_release[0]} is out")
+            self.notes_button.setTitle_(f"Get {latest_release[0]}")
+        else:
+            self.version_label.setStringValue_(f"Version {APP_VERSION}")
+            self.notes_button.setTitle_("Release Notes")
         self.refreshHint()
 
     def refreshHint(self):
@@ -3096,7 +3123,11 @@ class SettingsWindow(AppKit.NSObject):
         open_dictionary()
 
     def openReleaseNotes_(self, _sender):
-        open_url(RELEASE_NOTES_URL)
+        # The newer release once there is one: its page has the download
+        open_url(latest_release[1] if latest_release else RELEASE_NOTES_URL)
+
+    def checkUpdatesChanged_(self, sender):
+        apply_check_updates(sender.state() == AppKit.NSControlStateValueOn)
 
     def openWebsite_(self, _sender):
         open_url(WEBSITE_URL)
@@ -3118,7 +3149,7 @@ class SettingsWindow(AppKit.NSObject):
 
 
 # Room at the bottom of Settings for the About section
-ABOUT_HEIGHT = 76
+ABOUT_HEIGHT = 102
 
 
 def open_url(url):
@@ -3347,6 +3378,96 @@ def apply_trigger(mode):
     refresh_settings_ui()
 
 
+def apply_check_updates(on):
+    settings["check_updates"] = bool(on)
+    save_settings()
+    log(f"update check: {'on' if on else 'off'}")
+    if on:
+        threading.Thread(target=check_for_update, daemon=True).start()
+    else:
+        set_latest_release(None)
+    refresh_settings_ui()
+
+
+_https_context = None
+
+
+def https_context():
+    """Certificates for Kaho's own HTTPS requests.
+
+    Releases bundle python.org's Python, which has no CA certificates of its
+    own and does not read the macOS keychain, so every urllib HTTPS request in
+    the packaged app failed verification. That silently sent a cloud rewrite
+    back to the on-device model. certifi's bundle ships inside the app already
+    (huggingface_hub depends on it). A source install's Python works without it.
+    """
+    global _https_context
+    if _https_context is None:
+        try:
+            import certifi
+            _https_context = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            _https_context = ssl.create_default_context()
+    return _https_context
+
+
+def parse_version(text):
+    """(2, 4, 1) from "v2.4.1" or "2.4.1", or None for anything else."""
+    parts = text.removeprefix("v").split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def newer_release(release, current):
+    """(version, page URL) when GitHub's latest release is newer than ours."""
+    if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+        return None
+    tag, url = release.get("tag_name"), release.get("html_url")
+    if not isinstance(tag, str) or not isinstance(url, str) or not url.startswith("https://"):
+        return None
+    latest, ours = parse_version(tag), parse_version(current)
+    if latest is None or ours is None or latest <= ours:
+        return None
+    return tag.removeprefix("v"), url
+
+
+latest_release = None  # (version, URL) of a newer release, once one is known
+
+
+def set_latest_release(found):
+    global latest_release
+    if found == latest_release:
+        return
+    latest_release = found
+    if found:
+        log(f"Kaho {found[0]} is available: {found[1]}")
+    AppHelper.callAfter(refresh_settings_ui)
+
+
+def check_for_update():
+    if not settings["check_updates"]:
+        return
+    request = urllib.request.Request(
+        LATEST_RELEASE_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"Kaho/{APP_VERSION}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10, context=https_context()) as response:
+            release = json.load(response)
+    except (OSError, ValueError) as e:
+        # Offline is normal for an app that works offline; try again tomorrow
+        log(f"update check skipped: {e}")
+        return
+    set_latest_release(newer_release(release, APP_VERSION))
+
+
+def update_loop():
+    while True:
+        check_for_update()
+        time.sleep(UPDATE_INTERVAL_SECONDS)
+
+
 def apply_screen_words(on):
     settings["screen_words"] = bool(on)
     save_settings()
@@ -3508,6 +3629,13 @@ class StatusItem(AppKit.NSObject):
             fix.setTarget_(self)
             menu.addItem_(fix)
             menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        if latest_release:
+            update = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"Kaho {latest_release[0]} is available…", "openUpdate:", ""
+            )
+            update.setTarget_(self)
+            menu.addItem_(update)
+            menu.addItem_(AppKit.NSMenuItem.separatorItem())
         line = status_line()
         if line:
             note = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(line, None, "")
@@ -3650,6 +3778,10 @@ class StatusItem(AppKit.NSObject):
                 f"&body={urllib.parse.quote(body)}"
             )
             AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(url))
+
+    def openUpdate_(self, _sender):
+        if latest_release:
+            open_url(latest_release[1])
 
     def allowAccessibility_(self, _sender):
         open_privacy_settings()
