@@ -1,4 +1,17 @@
 # Changelog
+## 2.4.2 — 2026-10-13
+
+- Kaho now says when a newer version is out. At launch and once a day it
+  asks GitHub for the latest version number, sending nothing about you or
+  your dictation. A newer one shows as "Kaho x.y.z is available…" at the
+  top of the menu and in About in Settings, with a button to its release
+  page. "Check for new versions" in Settings turns it off.
+- Cloud rewrite works again in the downloaded app. 2.4.0 and 2.4.1 bundle a
+  Python with no certificates of its own, so every request to OpenAI,
+  Anthropic or a custom endpoint failed to verify, and Kaho quietly used
+  the on-device model instead. Requests now use the certificate bundle
+  that ships inside the app.
+
 ## 2.4.1 — 2026-10-10
 
 Dictation that keeps working, a first run that needs no help, and two
