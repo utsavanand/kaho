@@ -1,6 +1,6 @@
 # Kaho downloads
 
-**Total downloads: 40** (all releases and files, updated 2026-10-16).
+**Total downloads: 41** (all releases and files, updated 2026-10-17).
 
 Counts every download of a release file, including Homebrew installs and the website's Download button.
 
@@ -14,7 +14,7 @@ Counts every download of a release file, including Homebrew installs and the web
 | v2.4.1 | Kaho-2.4.1.zip | 2026-10-11 | 1 |
 | v2.4.0 | Kaho-2.4.0.zip | 2026-10-07 | 1 |
 | v2.2.0 | Kaho-2.2.0.dmg | 2026-10-02 | 12 |
-| v2.1.0 | Kaho-2.1.0.dmg | 2026-10-02 | 4 |
+| v2.1.0 | Kaho-2.1.0.dmg | 2026-10-02 | 5 |
 | v2.0.0 | Kaho-2.0.0.dmg | 2026-09-30 | 6 |
 | v1.7.10 | Sotto-1.7.10.dmg | 2026-09-29 | 1 |
 | v1.7.8 | Sotto-1.7.8.dmg | 2026-09-27 | 0 |
@@ -26,6 +26,7 @@ Counts every download of a release file, including Homebrew installs and the web
 
 | Day | Total downloads | Change |
 |---|---:|---:|
+| 2026-10-17 | 41 | +1 |
 | 2026-10-16 | 40 | +0 |
 | 2026-10-15 | 40 | +0 |
 | 2026-10-14 | 40 | +1 |
