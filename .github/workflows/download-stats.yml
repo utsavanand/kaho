@@ -14,6 +14,9 @@ jobs:
   snapshot:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: main
       - name: Append today's per-asset download counts
         env:
           GH_TOKEN: ${{ github.token }}
@@ -43,28 +46,10 @@ jobs:
           gh api --paginate "repos/${REPO}/releases" \
             --jq '.[] | .tag_name as $t | .published_at as $p | .assets[] | [$t, .name, ($p // "")[:10], .download_count] | @csv' \
             > releases.csv
-          python3 - "$day" <<'PY'
-          import csv, sys
-          from collections import defaultdict
-          day = sys.argv[1]
-          totals = defaultdict(int)
-          for r in csv.DictReader(open("stats/downloads.csv")):
-              totals[r["day"]] += int(r["downloads"])
-          rel = sorted(csv.reader(open("releases.csv")), key=lambda r: r[2], reverse=True)
-          lines = ["# Kaho downloads", "",
-                   f"**Total downloads: {sum(int(r[3]) for r in rel):,}** (all releases and files, updated {day}).", "",
-                   "Counts every download of a release file, including Homebrew installs and the website's Download button.", "",
-                   "## By release", "", "| Release | File | Published | Downloads |", "|---|---|---|---:|"]
-          lines += [f"| {t} | {a} | {p} | {int(n):,} |" for t, a, p, n in rel]
-          lines += ["", "## Daily trend (last 60 days)", "", "| Day | Total downloads | Change |", "|---|---:|---:|"]
-          days = sorted(totals)
-          for i in range(len(days) - 1, max(-1, len(days) - 61), -1):
-              d = days[i]
-              ch = "" if i == 0 else f"{totals[d] - totals[days[i - 1]]:+,}"
-              lines.append(f"| {d} | {totals[d]:,} | {ch} |")
-          lines += ["", "Raw data: [stats/downloads.csv](stats/downloads.csv). Updated daily at 06:15 UTC by `.github/workflows/download-stats.yml` on main."]
-          open("README.md", "w").write("\n".join(lines) + "\n")
-          PY
+          # The README's numbers come from tools/download_stats.py on main:
+          # lifetime counts through replaced files, and our own downloads
+          # (stats/internal.csv) kept apart from everyone else's
+          python3 ../main/tools/download_stats.py stats releases.csv "$day" > README.md
           rm releases.csv
           git add "$f" README.md
           if git diff --cached --quiet; then echo "nothing changed"; exit 0; fi
