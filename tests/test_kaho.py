@@ -382,7 +382,7 @@ class TestRecordingHandoff(KahoTestCase):
         standby.start.assert_called_once()
         self.assertIs(kaho.stream, standby)
         # Its audio lands in this recording, not the one it was prepared after
-        chunk = object()
+        chunk = [[0.0]] * 160  # a buffer's worth of frames
         standby.callback(chunk)
         self.assertEqual(kaho.record_buf, [chunk])
 
@@ -2456,3 +2456,125 @@ class TestUpdateCheck(KahoTestCase):
             kaho.apply_check_updates(False)
             self.assertIsNone(kaho.latest_release)
         self.assertFalse(kaho.settings["check_updates"])
+
+
+@unittest.skipUnless(HAVE_NUMPY, "streaming works on real audio buffers")
+class TestStreaming(KahoTestCase):
+    """Long dictations are transcribed while the user is still talking."""
+
+    SR = 16_000
+
+    def speech(self, seconds, quiet_at=()):
+        """Loud audio with near-silent 300 ms gaps at the given seconds."""
+        a = REAL_NUMPY.full(int(self.SR * seconds), 0.3, dtype="float32")
+        for t in quiet_at:
+            a[int(t * self.SR):int((t + 0.3) * self.SR)] = 0.0
+        return a
+
+    def session_with(self, audio):
+        s = kaho.Recording()
+        s.buf.append(audio.reshape(-1, 1))
+        s.frames = len(audio)
+        return s
+
+    def test_short_dictations_never_stream(self):
+        s = kaho.Recording()
+        kaho.maybe_stream(s, self.SR * 25)
+        self.assertTrue(kaho.jobs.empty())
+        self.assertIsNone(kaho.find_cut(self.speech(25), 0))
+
+    def test_a_long_dictation_queues_one_stretch_at_a_time(self):
+        s = kaho.Recording()
+        kaho.maybe_stream(s, self.SR * 31)
+        kaho.maybe_stream(s, self.SR * 3)  # still queued: no second job
+        jobs = []
+        while not kaho.jobs.empty():
+            jobs.append(kaho.jobs.get())
+        self.assertEqual(len(jobs), 1)
+        self.assertIs(jobs[0][0], kaho.STREAM)
+        self.assertIs(jobs[0][1], s)
+
+    def test_the_cut_lands_on_a_pause_near_fifteen_seconds(self):
+        audio = self.speech(40, quiet_at=(13.2,))
+        cut = kaho.find_cut(audio, 0)
+        self.assertAlmostEqual(cut / self.SR, 13.3, delta=0.15)
+
+    def test_a_stretch_is_transcribed_cleaned_and_remembered(self):
+        kaho.settings["rewrite"] = "clean"
+        s = self.session_with(self.speech(40, quiet_at=(15.0,)))
+        with mock.patch.object(kaho, "transcribe", return_value="um so the plan") as tr, \
+             mock.patch.object(kaho, "rewrite", return_value="So the plan.") as rw:
+            kaho.stream_chunk(s, kaho.job_generation)
+        self.assertAlmostEqual(len(tr.call_args.args[0]) / self.SR, 15.1, delta=0.15)
+        rw.assert_called_once_with("um so the plan", "clean")
+        self.assertEqual(s.parts, [("um so the plan", "So the plan.")])
+        self.assertAlmostEqual(s.done_frames / self.SR, 15.1, delta=0.15)
+
+    def test_an_instruction_stops_streaming(self):
+        s = self.session_with(self.speech(40))
+        s.spans = [[self.SR * 35, None]]
+        with mock.patch.object(kaho, "transcribe") as tr:
+            kaho.stream_chunk(s, kaho.job_generation)
+        tr.assert_not_called()
+        self.assertFalse(s.streaming)
+
+    def test_a_cancelled_recording_does_no_streaming_work(self):
+        s = self.session_with(self.speech(40))
+        s.cancelled = True
+        with mock.patch.object(kaho, "transcribe") as tr:
+            kaho.stream_chunk(s, kaho.job_generation)
+        tr.assert_not_called()
+
+    def run_final(self, session, audio, mode, tail="and that is all", spans=()):
+        kaho.settings["rewrite"] = mode
+        with mock.patch.object(kaho, "transcribe", return_value=tail) as tr, \
+             mock.patch.object(kaho, "rewrite", side_effect=lambda t, m: f"<{m}:{t}>") as rw, \
+             mock.patch.object(kaho, "deliver") as deliver:
+            kaho.run_job(audio, kaho.job_generation, list(spans), None, self.clock.now, session)
+        return tr, rw, deliver
+
+    def test_release_only_transcribes_what_was_not_streamed(self):
+        audio = self.speech(50)
+        s = self.session_with(audio)
+        s.parts, s.done_frames = [("first part", "First part."), ("second", "Second.")], self.SR * 44
+        tr, rw, deliver = self.run_final(s, audio, "clean")
+        self.assertAlmostEqual(len(tr.call_args.args[0]) / self.SR, 6.0, delta=0.01)
+        rw.assert_called_once_with("and that is all", "clean")
+        deliver.assert_called_once_with("First part. Second. <clean:and that is all>")
+
+    def test_whole_text_modes_rewrite_once_at_the_end(self):
+        audio = self.speech(50)
+        s = self.session_with(audio)
+        s.parts, s.done_frames = [("first part", None), ("second", None)], self.SR * 44
+        _, rw, deliver = self.run_final(s, audio, "structured")
+        rw.assert_called_once_with("first part second and that is all", "structured")
+        deliver.assert_called_once_with("<structured:first part second and that is all>")
+
+    def test_off_mode_joins_the_raw_stretches(self):
+        audio = self.speech(50)
+        s = self.session_with(audio)
+        s.parts, s.done_frames = [("first part", "First part.")], self.SR * 30
+        _, rw, deliver = self.run_final(s, audio, "off")
+        rw.assert_not_called()
+        deliver.assert_called_once_with("first part and that is all")
+
+    def test_an_instruction_ignores_the_streamed_stretches(self):
+        audio = self.speech(50)
+        s = self.session_with(audio)
+        s.parts, s.done_frames = [("stale", "Stale.")], self.SR * 30
+        spans = [[self.SR * 45, self.SR * 50]]
+        with mock.patch.object(kaho, "rewrite_with_instruction", return_value="Formal.") as rwi, \
+             mock.patch.object(kaho, "transcribe", side_effect=["make it formal", "the whole message"]) as tr, \
+             mock.patch.object(kaho, "deliver") as deliver:
+            kaho.run_job(audio, kaho.job_generation, spans, None, self.clock.now, s)
+        self.assertAlmostEqual(len(tr.call_args.args[0]) / self.SR, 45.0, delta=0.01)
+        rwi.assert_called_once_with("the whole message", "make it formal")
+        deliver.assert_called_once_with("Formal.")
+
+    def test_a_garbled_last_stretch_keeps_the_streamed_ones(self):
+        audio = self.speech(50)
+        s = self.session_with(audio)
+        s.parts, s.done_frames = [("first part", None)], self.SR * 30
+        with mock.patch.object(kaho, "looks_hallucinated", side_effect=lambda t: t == "loop loop"):
+            _, _, deliver = self.run_final(s, audio, "off", tail="loop loop")
+        deliver.assert_called_once_with("first part")
