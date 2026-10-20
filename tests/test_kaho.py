@@ -1527,6 +1527,21 @@ class TestSpokenInstruction(KahoTestCase):
             kaho.settings["hotkey"] = name
             self.assertNotIn(kaho.HOTKEYS[name][0], kaho.instruction_keys(), name)
 
+    def test_shift_pressed_just_before_the_hotkey_still_counts(self):
+        # No flags-changed event arrives for a Shift that was already down
+        with mock.patch.object(kaho.Quartz, "CGEventSourceFlagsState",
+                               return_value=kaho.LEFT_SHIFT[1]):
+            self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        self.release_instruction(kaho.LEFT_SHIFT[0])
+        self.assertEqual(kaho.recording.spans, [[0, kaho.SAMPLE_RATE]])
+
+    def test_no_instruction_key_held_starts_a_plain_dictation(self):
+        with mock.patch.object(kaho.Quartz, "CGEventSourceFlagsState", return_value=0):
+            self.down()
+        self.assertEqual(kaho.recording.spans, [])
+
     def test_left_shift_marks_an_instruction_too(self):
         # Pressed with the left Shift, the instruction used to be dictated
         # into the message: only the right one was listened to
