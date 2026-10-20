@@ -108,6 +108,19 @@ def instruction_keys():
     return {keycode: mask, LEFT_SHIFT[0]: LEFT_SHIFT[1]}
 
 
+def instruction_held():
+    """Whether an instruction key is down right now.
+
+    Shift pressed a moment before the hotkey sends no flags-changed event
+    once recording has started, so it went unnoticed and the instruction was
+    dictated into the message. Most likely when editing a selection, where
+    both keys go down together. The HID state carries the device-specific
+    bits that tell left Shift from right.
+    """
+    flags = int(Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState))
+    return bool(flags & sum(instruction_keys().values()))
+
+
 def instruction_label():
     name = INSTRUCTION_FALLBACK
     if settings["hotkey"] == name:
@@ -175,7 +188,7 @@ REWRITE_MODES = {
 }
 REWRITE_HINTS = {
     "off": "Paste exactly what was heard.",
-    "clean": "Remove filler words and fix punctuation. Your wording is kept.",
+    "clean": "Remove filler words, keep only the fix when you correct yourself, and fix punctuation. Your wording is kept.",
     "structured": "Give the dictation the shape it needs — crisp sentences, steps, or bullets.",
     "caveman": "Compress hard for prompting an LLM — every instruction kept, words minimised.",
 }
@@ -209,16 +222,63 @@ INSTRUCTION_PROMPT = (
 )
 
 REWRITE_PROMPTS = {
+    # Self-corrections ("Thursday no wait Friday") were one bullet among the
+    # fillers, and Qwen3-4B kept the replaced words almost every time: 2 of 60
+    # resolved on Disfl-QA (tools/model_benchmark.py). Spelling out what a
+    # correction looks like, with worked examples, took that to 13 of 60, and
+    # 20 of 100 on rows the prompt was never tuned on. The guard cases (a real
+    # "no", "not" contrasting two things, "or" between options) are there
+    # because the first version deleted "I mean it" and "not the red one".
     "clean": (
         "You clean up dictated speech. Rewrite the transcript below:\n"
-        "- remove filler words (um, uh, like, you know, I mean, so, basically, "
-        "actually, sort of, kind of, yeah)\n"
-        "- drop false starts, self-corrections, and repeated words\n"
+        "- remove filler words (um, uh, like, you know, so, basically, sort "
+        "of, kind of, yeah)\n"
+        "- resolve self-corrections. A speaker often starts saying something, "
+        "breaks off with a phrase like \"no\", \"no wait\", \"sorry\", \"I mean\", "
+        "\"or rather\", \"make that\" or \"oops\", and says the replacement. The "
+        "words before the break that the replacement stands in for are wrong: "
+        "delete them along with the break phrase, and put the replacement in "
+        "their place. If the speaker restarts the whole sentence, keep only "
+        "the restart. When \"rather\" or \"instead\" comes after the replacement "
+        "(\"sell it or claim it rather\"), the same applies.\n"
+        "- drop false starts and repeated words\n"
         "- fix punctuation, capitalization, and sentence breaks\n"
+        "Only resolve a correction when the speaker is replacing what they "
+        "just said. \"No\" as an answer, \"not\" contrasting two things, \"or\" "
+        "between real options, \"I mean it\", and \"sorry\" as an apology are "
+        "part of the message — keep them.\n"
         "Keep the speaker's own words, tone, and meaning. Do not summarize, "
-        "shorten, reorder, or add anything. Never answer questions that appear "
-        "in the transcript — only clean them up. Reply with the cleaned text "
-        "only — no preamble, no quotes.\n\nTranscript:\n{text}"
+        "shorten, reorder, or add anything else. A question stays a question: "
+        "never answer it — only clean it up. Reply with the cleaned text only "
+        "— no preamble, no quotes.\n"
+        "\n"
+        "Example transcript:\n"
+        "let's meet on Thursday no wait Friday at uh three\n"
+        "Example reply:\n"
+        "Let's meet on Friday at three.\n"
+        "\n"
+        "Example transcript:\n"
+        "can you ask the design team sorry the marketing team for the deck\n"
+        "Example reply:\n"
+        "Can you ask the marketing team for the deck?\n"
+        "\n"
+        "Example transcript:\n"
+        "when is the no where is the offsite this year\n"
+        "Example reply:\n"
+        "Where is the offsite this year?\n"
+        "\n"
+        "Example transcript:\n"
+        "we should cancel the contract or renew it rather\n"
+        "Example reply:\n"
+        "We should renew the contract.\n"
+        "\n"
+        "Example transcript:\n"
+        "no I can't do Thursday, um, ship it Monday not Tuesday\n"
+        "Example reply:\n"
+        "No, I can't do Thursday. Ship it Monday, not Tuesday.\n"
+        "\n"
+        "Transcript:\n"
+        "{text}"
     ),
     # Structured picks the shape from the content instead of forcing bullets
     # onto everything — a single thought stays a paragraph.
@@ -315,6 +375,19 @@ CLEAN_CHECK_PROMPT = (
     "B) No, it needs cleanup\n"
     "Answer with the letter only.\n\nTranscript:\n{text}"
 )
+# Resolving a correction means deleting words, and the model sometimes
+# deletes a "not" the meaning hangs on: "what can not be achieved" came back
+# "what can be achieved". Filler in the paste is a nuisance; a reversed
+# sentence is wrong, so a Clean up that loses a negation is thrown away.
+NEGATION = re.compile(r"\b(?:not|never|cannot)\b|n't\b", re.IGNORECASE)
+
+
+def lost_negation(before, after):
+    def count(text):
+        return len(NEGATION.findall(text.replace("’", "'")))
+    return count(after) < count(before)
+
+
 # A wrong skip pastes filler the user asked to have removed; a wrong rewrite
 # only costs time. So skip only when the check is close to certain.
 SKIP_REWRITE_CONFIDENCE = 0.9
@@ -398,6 +471,9 @@ SCREEN_READ_SECONDS = 0.15
 # user is waiting with nothing on screen but the pill.
 SELECTION_READ_SECONDS = 0.5
 SELECTION_COPY_SECONDS = 0.5
+# Finding the text field to put the pill on its screen happens on the key
+# press, on the main thread, so a slow app gets very little time
+PILL_SCREEN_READ_SECONDS = 0.1
 SCREEN_MAX_NODES = 4000
 # Fewer than the dictionary's cap: these are guesses about what the user will
 # say, and every one dilutes the bias on the words they actually do say
@@ -424,7 +500,7 @@ TITLES = {"loading": "…", "ready": "🎙", "recording": "🔴", "error": "⚠�
 # it from here, and tools/check_docs_sync.py fails the build when the top of
 # CHANGELOG.md disagrees — the Kaho.spec copy had silently sat at 1.7.3 for six
 # releases, which is what a bundle built without KAHO_VERSION would have shipped.
-APP_VERSION = "2.4.2"
+APP_VERSION = "2.4.3"
 WEBSITE_URL = "https://kaho.utsava.xyz/"
 RELEASE_NOTES_URL = f"https://github.com/utsavanand/kaho/releases/tag/v{APP_VERSION}"
 # Asked at launch and then once a day, only for the latest version number.
@@ -1197,6 +1273,55 @@ def _ax(element, attribute):
     return value if err == 0 else None
 
 
+def _ax_rect(element):
+    """(x, y, width, height) of an element, in screen coordinates measured
+    from the top left of the primary display, or None."""
+    position, size = _ax(element, "AXPosition"), _ax(element, "AXSize")
+    if position is None or size is None:
+        return None
+    ok_p, point = ApplicationServices.AXValueGetValue(
+        position, ApplicationServices.kAXValueCGPointType, None)
+    ok_s, extent = ApplicationServices.AXValueGetValue(
+        size, ApplicationServices.kAXValueCGSizeType, None)
+    if not (ok_p and ok_s):
+        return None
+    return point.x, point.y, extent.width, extent.height
+
+
+def focused_rect():
+    """Where the user is typing: the focused element, else its window."""
+    try:
+        system = ApplicationServices.AXUIElementCreateSystemWide()
+        ApplicationServices.AXUIElementSetMessagingTimeout(system, PILL_SCREEN_READ_SECONDS)
+        element = _ax(system, "AXFocusedUIElement")
+        if element is None:
+            return None
+        return _ax_rect(element) or _ax_rect(_ax(element, "AXWindow"))
+    except Exception:  # noqa: BLE001
+        # Another app's accessibility tree can be anything; the pill then
+        # falls back to the mouse's screen
+        return None
+
+
+def screen_containing(point, frames):
+    """Index of the frame containing a Cocoa point (origin bottom left)."""
+    x, y = point
+    for i, (fx, fy, fw, fh) in enumerate(frames):
+        if fx <= x < fx + fw and fy <= y < fy + fh:
+            return i
+    return None
+
+
+def screen_for_rect(rect, frames):
+    """Index of the screen holding the centre of an accessibility rect.
+
+    Accessibility measures from the primary display's top left, y down;
+    Cocoa from its bottom left, y up. frames[0] is the primary display.
+    """
+    x, y, w, h = rect
+    return screen_containing((x + w / 2, frames[0][3] - (y + h / 2)), frames)
+
+
 def window_texts(pid):
     """The visible text of an app's focused window, within the time and node budget."""
     app = ApplicationServices.AXUIElementCreateApplication(pid)
@@ -1248,6 +1373,9 @@ def start_recording():
     if settings["screen_words"]:
         start_screen_read(recording)
     overlay.show()
+    if instruction_held():
+        recording.mark_instruction(True)
+        overlay.setPhase_("instructing")
     # Fire a warmup while the user is still speaking: the page-in of idle
     # model weights overlaps the recording instead of delaying the paste.
     # Same queue as real jobs, so it can never race the model.
@@ -1811,6 +1939,9 @@ def rewrite(text, mode):
         return None
     if not out:
         log("rewrite returned nothing — pasted the raw transcript")
+        return None
+    if mode == "clean" and lost_negation(text, out):
+        log("rewrite dropped a negation — pasted the raw transcript")
         return None
     log(f"[rewrite {mode} {time.monotonic() - t0:.2f}s]")
     return out
@@ -2960,9 +3091,22 @@ class Overlay(AppKit.NSObject):
         self.startTimer()
 
     def place(self):
-        """Bottom-centre of the main screen. Also before an announcement: on
-        a first launch nothing has positioned the pill yet."""
-        screen = AppKit.NSScreen.mainScreen().frame()
+        """Bottom-centre of the screen being typed on. Also before an
+        announcement: on a first launch nothing has positioned the pill yet.
+
+        mainScreen() alone put it on whichever display macOS considered main
+        for Kaho, which is not where the user is typing when Kaho is in the
+        background. That's the text field's screen, else the pointer's.
+        """
+        screens = list(AppKit.NSScreen.screens())
+        frames = [((f := sc.frame()).origin.x, f.origin.y, f.size.width, f.size.height)
+                  for sc in screens]
+        rect = focused_rect() if frames else None
+        index = screen_for_rect(rect, frames) if rect else None
+        if index is None and frames:
+            mouse = AppKit.NSEvent.mouseLocation()
+            index = screen_containing((mouse.x, mouse.y), frames)
+        screen = (screens[index] if index is not None else AppKit.NSScreen.mainScreen()).frame()
         w, h = OVERLAY_SIZE
         x = screen.origin.x + (screen.size.width - w) / 2
         self.panel.setFrame_display_(((x, screen.origin.y + 110), (w, h)), True)

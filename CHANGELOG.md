@@ -1,4 +1,14 @@
 # Changelog
+## 2.4.3 — 2026-10-19
+
+- Clean up keeps only the fix when you correct yourself. "Let's meet
+  Thursday, no wait, Friday" now comes out as "Let's meet Friday." Before,
+  both days were kept almost every time. A real "no", "not" contrasting
+  two things, and "or" between options are left alone.
+- A cleanup that would drop a "not" or "never" pastes what you said
+  instead. Removing a correction means deleting words, and in testing the
+  model once deleted a "not" and reversed the sentence.
+
 ## 2.4.2 — 2026-10-13
 
 - Kaho now says when a newer version is out. At launch and once a day it

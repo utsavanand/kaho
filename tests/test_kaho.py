@@ -724,6 +724,36 @@ class TestCleanSkip(KahoTestCase):
             self.assertEqual(kaho.rewrite("Thanks, that works for me.", mode), "Rewritten.")
         check.assert_not_called()
 
+    def test_a_clean_up_that_drops_a_negation_pastes_the_transcript(self):
+        self.check_returns(0.0)
+        self.mlx_lm.generate.return_value = "What can be achieved?"
+        self.assertIsNone(kaho.rewrite("what can not be achieved", "clean"))
+
+    def test_a_resolved_correction_still_pastes_the_rewrite(self):
+        self.check_returns(0.0)
+        self.mlx_lm.generate.return_value = "Let's meet on Friday."
+        self.assertEqual(kaho.rewrite("let's meet Thursday no wait Friday", "clean"),
+                         "Let's meet on Friday.")
+
+
+class TestLostNegation(unittest.TestCase):
+    def test_counts_each_way_of_saying_not(self):
+        for before, after in (
+            ("I can't make it", "I can make it"),
+            ("it's not ready", "it's ready"),
+            ("we never ship on Friday", "we ship on Friday"),
+            ("what cannot be done", "what can be done"),
+            ("I don’t know", "I know"),  # curly apostrophe, as the model writes it
+        ):
+            self.assertTrue(kaho.lost_negation(before, after), before)
+
+    def test_a_dropped_correction_word_is_not_a_negation(self):
+        self.assertFalse(kaho.lost_negation("Thursday no wait Friday", "Friday"))
+
+    def test_keeping_or_contracting_a_negation_is_fine(self):
+        self.assertFalse(kaho.lost_negation("I do not know", "I don't know"))
+        self.assertFalse(kaho.lost_negation("um I can't", "I can't."))
+
 
 class TestAudioDropRules(KahoTestCase):
     """What reaches Whisper, and what is dropped before it can hallucinate."""
@@ -1526,6 +1556,21 @@ class TestSpokenInstruction(KahoTestCase):
         for name in kaho.HOTKEYS:
             kaho.settings["hotkey"] = name
             self.assertNotIn(kaho.HOTKEYS[name][0], kaho.instruction_keys(), name)
+
+    def test_shift_pressed_just_before_the_hotkey_still_counts(self):
+        # No flags-changed event arrives for a Shift that was already down
+        with mock.patch.object(kaho.Quartz, "CGEventSourceFlagsState",
+                               return_value=kaho.LEFT_SHIFT[1]):
+            self.down()
+        self.run_audio_ops()
+        self.speak(1.0)
+        self.release_instruction(kaho.LEFT_SHIFT[0])
+        self.assertEqual(kaho.recording.spans, [[0, kaho.SAMPLE_RATE]])
+
+    def test_no_instruction_key_held_starts_a_plain_dictation(self):
+        with mock.patch.object(kaho.Quartz, "CGEventSourceFlagsState", return_value=0):
+            self.down()
+        self.assertEqual(kaho.recording.spans, [])
 
     def test_left_shift_marks_an_instruction_too(self):
         # Pressed with the left Shift, the instruction used to be dictated
@@ -2667,3 +2712,55 @@ class TestStreaming(KahoTestCase):
             _, _, deliver = self.run_final(s, audio, "clean", tail="the threshold be time based")
         rj.assert_called_once_with("I would rather.", "<clean:the threshold be time based>")
         deliver.assert_called_once_with("I would rather the threshold be time-based.")
+
+
+class TestPillScreen(KahoTestCase):
+    """The pill shows on the display being typed on, not whichever macOS calls main."""
+
+    # A MacBook (primary) with a monitor to its right and one above it, in
+    # Cocoa coordinates: origin at the primary's bottom left, y up
+    PRIMARY = (0, 0, 1512, 982)
+    RIGHT = (1512, -98, 1920, 1080)
+    ABOVE = (0, 982, 1728, 1117)
+
+    def test_a_field_on_the_right_monitor_picks_it(self):
+        # Accessibility measures from the primary's top left, y down
+        rect = (2000, 400, 300, 30)
+        self.assertEqual(kaho.screen_for_rect(rect, [self.PRIMARY, self.RIGHT, self.ABOVE]), 1)
+
+    def test_a_field_on_a_monitor_above_has_negative_y_and_picks_it(self):
+        rect = (500, -600, 400, 30)
+        self.assertEqual(kaho.screen_for_rect(rect, [self.PRIMARY, self.RIGHT, self.ABOVE]), 2)
+
+    def test_a_field_on_the_laptop_screen_picks_it(self):
+        self.assertEqual(kaho.screen_for_rect((100, 700, 600, 40), [self.PRIMARY, self.RIGHT]), 0)
+
+    def test_a_window_straddling_two_screens_goes_where_its_centre_is(self):
+        rect = (1300, 300, 800, 400)  # mostly on the right monitor
+        self.assertEqual(kaho.screen_for_rect(rect, [self.PRIMARY, self.RIGHT]), 1)
+
+    def place_with(self, rect, mouse):
+        screens = []
+        for x, y, w, h in (self.PRIMARY, self.RIGHT):
+            sc = mock.MagicMock()
+            sc.frame.return_value = types.SimpleNamespace(
+                origin=types.SimpleNamespace(x=x, y=y), size=types.SimpleNamespace(width=w, height=h))
+            screens.append(sc)
+        fake = types.SimpleNamespace(panel=mock.MagicMock())
+        with mock.patch.object(kaho.AppKit.NSScreen, "screens", return_value=screens), \
+             mock.patch.object(kaho.AppKit.NSEvent, "mouseLocation",
+                               return_value=types.SimpleNamespace(x=mouse[0], y=mouse[1])), \
+             mock.patch.object(kaho, "focused_rect", return_value=rect):
+            kaho.Overlay.place(fake)
+        (x, _y), _size = fake.panel.setFrame_display_.call_args.args[0]
+        return x
+
+    def test_the_pill_is_centred_on_the_text_fields_screen(self):
+        x = self.place_with((2000, 400, 300, 30), mouse=(100, 100))
+        self.assertGreater(x, self.RIGHT[0], "the pill stayed on the laptop screen")
+
+    def test_without_a_readable_field_it_follows_the_pointer(self):
+        x = self.place_with(None, mouse=(2500, 200))
+        self.assertGreater(x, self.RIGHT[0])
+        x = self.place_with(None, mouse=(300, 300))
+        self.assertLess(x, self.RIGHT[0])

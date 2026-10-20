@@ -106,7 +106,8 @@ History stay reachable — no alert, no lost settings.
 
 A second on-device model (Qwen3-4B-Instruct, ~2.3 GB on first enable,
 ~0.5 s per dictation) polishes the transcript before it's pasted. Three
-modes: **Clean up** keeps your wording and strips filler, **Structured**
+modes: **Clean up** keeps your wording, strips filler and keeps only the
+fix when you correct yourself ("Thursday, no wait, Friday"), **Structured**
 gives the dictation the shape it needs (crisp prose, bullets for parallel
 items, numbered steps for a sequence), and **Caveman** compresses hard for
 pasting into an AI assistant — one line, every instruction kept, the words and
@@ -117,6 +118,9 @@ formatting around them cut.
 In Clean up, Kaho first asks the same model whether the transcript is
 already clean — one forward pass, ~85 ms, no text generated — and pastes it
 as-is when the model is at least 90% sure, skipping the rewrite entirely.
+If a cleanup would drop a "not" or "never", the transcript is pasted
+instead: resolving a correction means deleting words, and a deleted "not"
+reverses what you said.
 
 Off by default. If the model isn't loaded yet or a rewrite fails, the raw
 transcript is pasted — you never lose words.
