@@ -2611,6 +2611,27 @@ class TestStreaming(KahoTestCase):
         self.assertEqual(before, "Lag went up to forty-five")
         self.assertEqual(after, "thousand messages on Tuesday.")
 
+    def test_a_join_repair_only_touches_the_join(self):
+        # The model lowercased everything it saw, which made a whole dictation lowercase
+        rw, lm = self.fake_join_model("i told kaho it went up to forty-five thousand messages on tuesday")
+        with rw, lm:
+            before, after = kaho.repair_join("I told Kaho it went up to forty-five.",
+                                             "Thousand messages on Tuesday.")
+        self.assertEqual(before, "I told Kaho it went up to forty-five")
+        self.assertEqual(after, "thousand messages on Tuesday.")
+
+    def test_a_join_that_really_ends_a_sentence_is_left_alone(self):
+        rw, lm = self.fake_join_model("Kaho went up on Tuesday. we agreed on three priorities")
+        with rw, lm:
+            out = kaho.repair_join("Kaho went up on Tuesday.", "We agreed on three priorities.")
+        self.assertEqual(out, ("Kaho went up on Tuesday.", "We agreed on three priorities."))
+
+    def test_i_keeps_its_capital_after_a_repaired_join(self):
+        rw, lm = self.fake_join_model("I agree but i'd rather the threshold be time")
+        with rw, lm:
+            out = kaho.repair_join("I agree, but.", "I'd rather the threshold be time.")
+        self.assertEqual(out, ("I agree, but", "I'd rather the threshold be time."))
+
     def test_a_join_repair_that_changes_a_word_is_ignored(self):
         rw, lm = self.fake_join_model("Lag went up to fifty thousand messages on Tuesday.")
         with rw, lm:

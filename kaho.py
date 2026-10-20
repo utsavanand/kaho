@@ -2250,8 +2250,19 @@ def repair_join(before, after):
     fixed = out.replace(" | ", " ").split()
     if len(fixed) != len(head) + len(tail) or _bare_words(" ".join(fixed)) != _bare_words(" ".join(head + tail)):
         return before, after
-    return (" ".join(a[:-len(head)] + fixed[:len(head)]),
-            " ".join(fixed[len(head):] + b[len(tail):]))
+    # Only the join itself is taken from the answer: the last word's
+    # punctuation and the next word's capital. The model also lowercased
+    # everything else it saw, "I" and names included, which turned most of a
+    # 110 s dictation lowercase.
+    last, first = fixed[len(head) - 1], fixed[len(head)]
+    joined = not re.search(r"[.?!]['\"]?$", last) and re.search(r"[.?!]['\"]?$", a[-1])
+    if joined and first[:1].islower() and not re.fullmatch(r"I(['’].*)?", re.sub(r"[^\w'’]", "", b[0])):
+        first = b[0][:1].lower() + b[0][1:]
+    else:
+        first = b[0]
+    if not joined:
+        last = a[-1]
+    return " ".join(a[:-1] + [last]), " ".join([first] + b[1:])
 
 
 def _join_field():
