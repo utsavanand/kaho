@@ -2456,3 +2456,55 @@ class TestUpdateCheck(KahoTestCase):
             kaho.apply_check_updates(False)
             self.assertIsNone(kaho.latest_release)
         self.assertFalse(kaho.settings["check_updates"])
+
+
+class TestPillScreen(KahoTestCase):
+    """The pill shows on the display being typed on, not whichever macOS calls main."""
+
+    # A MacBook (primary) with a monitor to its right and one above it, in
+    # Cocoa coordinates: origin at the primary's bottom left, y up
+    PRIMARY = (0, 0, 1512, 982)
+    RIGHT = (1512, -98, 1920, 1080)
+    ABOVE = (0, 982, 1728, 1117)
+
+    def test_a_field_on_the_right_monitor_picks_it(self):
+        # Accessibility measures from the primary's top left, y down
+        rect = (2000, 400, 300, 30)
+        self.assertEqual(kaho.screen_for_rect(rect, [self.PRIMARY, self.RIGHT, self.ABOVE]), 1)
+
+    def test_a_field_on_a_monitor_above_has_negative_y_and_picks_it(self):
+        rect = (500, -600, 400, 30)
+        self.assertEqual(kaho.screen_for_rect(rect, [self.PRIMARY, self.RIGHT, self.ABOVE]), 2)
+
+    def test_a_field_on_the_laptop_screen_picks_it(self):
+        self.assertEqual(kaho.screen_for_rect((100, 700, 600, 40), [self.PRIMARY, self.RIGHT]), 0)
+
+    def test_a_window_straddling_two_screens_goes_where_its_centre_is(self):
+        rect = (1300, 300, 800, 400)  # mostly on the right monitor
+        self.assertEqual(kaho.screen_for_rect(rect, [self.PRIMARY, self.RIGHT]), 1)
+
+    def place_with(self, rect, mouse):
+        screens = []
+        for x, y, w, h in (self.PRIMARY, self.RIGHT):
+            sc = mock.MagicMock()
+            sc.frame.return_value = types.SimpleNamespace(
+                origin=types.SimpleNamespace(x=x, y=y), size=types.SimpleNamespace(width=w, height=h))
+            screens.append(sc)
+        fake = types.SimpleNamespace(panel=mock.MagicMock())
+        with mock.patch.object(kaho.AppKit.NSScreen, "screens", return_value=screens), \
+             mock.patch.object(kaho.AppKit.NSEvent, "mouseLocation",
+                               return_value=types.SimpleNamespace(x=mouse[0], y=mouse[1])), \
+             mock.patch.object(kaho, "focused_rect", return_value=rect):
+            kaho.Overlay.place(fake)
+        (x, _y), _size = fake.panel.setFrame_display_.call_args.args[0]
+        return x
+
+    def test_the_pill_is_centred_on_the_text_fields_screen(self):
+        x = self.place_with((2000, 400, 300, 30), mouse=(100, 100))
+        self.assertGreater(x, self.RIGHT[0], "the pill stayed on the laptop screen")
+
+    def test_without_a_readable_field_it_follows_the_pointer(self):
+        x = self.place_with(None, mouse=(2500, 200))
+        self.assertGreater(x, self.RIGHT[0])
+        x = self.place_with(None, mouse=(300, 300))
+        self.assertLess(x, self.RIGHT[0])

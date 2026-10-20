@@ -376,6 +376,9 @@ SCREEN_READ_SECONDS = 0.15
 # user is waiting with nothing on screen but the pill.
 SELECTION_READ_SECONDS = 0.5
 SELECTION_COPY_SECONDS = 0.5
+# Finding the text field to put the pill on its screen happens on the key
+# press, on the main thread, so a slow app gets very little time
+PILL_SCREEN_READ_SECONDS = 0.1
 SCREEN_MAX_NODES = 4000
 # Fewer than the dictionary's cap: these are guesses about what the user will
 # say, and every one dilutes the bias on the words they actually do say
@@ -1164,6 +1167,55 @@ def _read_screen(session, pid):
 def _ax(element, attribute):
     err, value = ApplicationServices.AXUIElementCopyAttributeValue(element, attribute, None)
     return value if err == 0 else None
+
+
+def _ax_rect(element):
+    """(x, y, width, height) of an element, in screen coordinates measured
+    from the top left of the primary display, or None."""
+    position, size = _ax(element, "AXPosition"), _ax(element, "AXSize")
+    if position is None or size is None:
+        return None
+    ok_p, point = ApplicationServices.AXValueGetValue(
+        position, ApplicationServices.kAXValueCGPointType, None)
+    ok_s, extent = ApplicationServices.AXValueGetValue(
+        size, ApplicationServices.kAXValueCGSizeType, None)
+    if not (ok_p and ok_s):
+        return None
+    return point.x, point.y, extent.width, extent.height
+
+
+def focused_rect():
+    """Where the user is typing: the focused element, else its window."""
+    try:
+        system = ApplicationServices.AXUIElementCreateSystemWide()
+        ApplicationServices.AXUIElementSetMessagingTimeout(system, PILL_SCREEN_READ_SECONDS)
+        element = _ax(system, "AXFocusedUIElement")
+        if element is None:
+            return None
+        return _ax_rect(element) or _ax_rect(_ax(element, "AXWindow"))
+    except Exception:  # noqa: BLE001
+        # Another app's accessibility tree can be anything; the pill then
+        # falls back to the mouse's screen
+        return None
+
+
+def screen_containing(point, frames):
+    """Index of the frame containing a Cocoa point (origin bottom left)."""
+    x, y = point
+    for i, (fx, fy, fw, fh) in enumerate(frames):
+        if fx <= x < fx + fw and fy <= y < fy + fh:
+            return i
+    return None
+
+
+def screen_for_rect(rect, frames):
+    """Index of the screen holding the centre of an accessibility rect.
+
+    Accessibility measures from the primary display's top left, y down;
+    Cocoa from its bottom left, y up. frames[0] is the primary display.
+    """
+    x, y, w, h = rect
+    return screen_containing((x + w / 2, frames[0][3] - (y + h / 2)), frames)
 
 
 def window_texts(pid):
@@ -2717,9 +2769,22 @@ class Overlay(AppKit.NSObject):
         self.startTimer()
 
     def place(self):
-        """Bottom-centre of the main screen. Also before an announcement: on
-        a first launch nothing has positioned the pill yet."""
-        screen = AppKit.NSScreen.mainScreen().frame()
+        """Bottom-centre of the screen being typed on. Also before an
+        announcement: on a first launch nothing has positioned the pill yet.
+
+        mainScreen() alone put it on whichever display macOS considered main
+        for Kaho, which is not where the user is typing when Kaho is in the
+        background. That's the text field's screen, else the pointer's.
+        """
+        screens = list(AppKit.NSScreen.screens())
+        frames = [((f := sc.frame()).origin.x, f.origin.y, f.size.width, f.size.height)
+                  for sc in screens]
+        rect = focused_rect() if frames else None
+        index = screen_for_rect(rect, frames) if rect else None
+        if index is None and frames:
+            mouse = AppKit.NSEvent.mouseLocation()
+            index = screen_containing((mouse.x, mouse.y), frames)
+        screen = (screens[index] if index is not None else AppKit.NSScreen.mainScreen()).frame()
         w, h = OVERLAY_SIZE
         x = screen.origin.x + (screen.size.width - w) / 2
         self.panel.setFrame_display_(((x, screen.origin.y + 110), (w, h)), True)
