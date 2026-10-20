@@ -1,4 +1,12 @@
 # Changelog
+## 2.4.5 — 2026-10-20
+
+- See your words while a long dictation is still going. Once Kaho starts
+  transcribing a long dictation as you talk (past about 15 seconds), the
+  pill widens and shows the last few words so far, updated every stretch.
+  It clears the moment you stop, cancel or speak an instruction, and the
+  words are never written to the log.
+
 ## 2.4.4 — 2026-10-20
 
 - Long dictations paste in about a second instead of up to half a minute.
