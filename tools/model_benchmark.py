@@ -74,8 +74,8 @@ def fetch_rows(dataset, config, split, total, n, blocks=6):
     per = -(-n // blocks)
     rows = []
     for b in range(blocks):
-        q = urllib.parse.urlencode(dict(dataset=dataset, config=config, split=split,
-                                        offset=int(b * total / blocks), length=per))
+        q = urllib.parse.urlencode({"dataset": dataset, "config": config, "split": split,
+                                    "offset": int(b * total / blocks), "length": per})
         for attempt in range(6):
             try:
                 with urllib.request.urlopen(f"{ROWS_API}?{q}", timeout=120) as r:
@@ -132,7 +132,7 @@ def rewrite_sets(n):
         for split in ("validation", "train"):
             path = huggingface_hub.hf_hub_download("grammarly/coedit", f"{split}.jsonl",
                                                    repo_type="dataset")
-            rows[split] = [json.loads(line) for line in open(path)]
+            rows[split] = [json.loads(line) for line in pathlib.Path(path).read_text().splitlines()]
         rng = random.Random(0)
         out = []
         for task in COEDIT_TASKS:
