@@ -175,7 +175,7 @@ REWRITE_MODES = {
 }
 REWRITE_HINTS = {
     "off": "Paste exactly what was heard.",
-    "clean": "Remove filler words and fix punctuation. Your wording is kept.",
+    "clean": "Remove filler words, keep only the fix when you correct yourself, and fix punctuation. Your wording is kept.",
     "structured": "Give the dictation the shape it needs — crisp sentences, steps, or bullets.",
     "caveman": "Compress hard for prompting an LLM — every instruction kept, words minimised.",
 }
@@ -209,16 +209,63 @@ INSTRUCTION_PROMPT = (
 )
 
 REWRITE_PROMPTS = {
+    # Self-corrections ("Thursday no wait Friday") were one bullet among the
+    # fillers, and Qwen3-4B kept the replaced words almost every time: 2 of 60
+    # resolved on Disfl-QA (tools/model_benchmark.py). Spelling out what a
+    # correction looks like, with worked examples, took that to 13 of 60, and
+    # 20 of 100 on rows the prompt was never tuned on. The guard cases (a real
+    # "no", "not" contrasting two things, "or" between options) are there
+    # because the first version deleted "I mean it" and "not the red one".
     "clean": (
         "You clean up dictated speech. Rewrite the transcript below:\n"
-        "- remove filler words (um, uh, like, you know, I mean, so, basically, "
-        "actually, sort of, kind of, yeah)\n"
-        "- drop false starts, self-corrections, and repeated words\n"
+        "- remove filler words (um, uh, like, you know, so, basically, sort "
+        "of, kind of, yeah)\n"
+        "- resolve self-corrections. A speaker often starts saying something, "
+        "breaks off with a phrase like \"no\", \"no wait\", \"sorry\", \"I mean\", "
+        "\"or rather\", \"make that\" or \"oops\", and says the replacement. The "
+        "words before the break that the replacement stands in for are wrong: "
+        "delete them along with the break phrase, and put the replacement in "
+        "their place. If the speaker restarts the whole sentence, keep only "
+        "the restart. When \"rather\" or \"instead\" comes after the replacement "
+        "(\"sell it or claim it rather\"), the same applies.\n"
+        "- drop false starts and repeated words\n"
         "- fix punctuation, capitalization, and sentence breaks\n"
+        "Only resolve a correction when the speaker is replacing what they "
+        "just said. \"No\" as an answer, \"not\" contrasting two things, \"or\" "
+        "between real options, \"I mean it\", and \"sorry\" as an apology are "
+        "part of the message — keep them.\n"
         "Keep the speaker's own words, tone, and meaning. Do not summarize, "
-        "shorten, reorder, or add anything. Never answer questions that appear "
-        "in the transcript — only clean them up. Reply with the cleaned text "
-        "only — no preamble, no quotes.\n\nTranscript:\n{text}"
+        "shorten, reorder, or add anything else. A question stays a question: "
+        "never answer it — only clean it up. Reply with the cleaned text only "
+        "— no preamble, no quotes.\n"
+        "\n"
+        "Example transcript:\n"
+        "let's meet on Thursday no wait Friday at uh three\n"
+        "Example reply:\n"
+        "Let's meet on Friday at three.\n"
+        "\n"
+        "Example transcript:\n"
+        "can you ask the design team sorry the marketing team for the deck\n"
+        "Example reply:\n"
+        "Can you ask the marketing team for the deck?\n"
+        "\n"
+        "Example transcript:\n"
+        "when is the no where is the offsite this year\n"
+        "Example reply:\n"
+        "Where is the offsite this year?\n"
+        "\n"
+        "Example transcript:\n"
+        "we should cancel the contract or renew it rather\n"
+        "Example reply:\n"
+        "We should renew the contract.\n"
+        "\n"
+        "Example transcript:\n"
+        "no I can't do Thursday, um, ship it Monday not Tuesday\n"
+        "Example reply:\n"
+        "No, I can't do Thursday. Ship it Monday, not Tuesday.\n"
+        "\n"
+        "Transcript:\n"
+        "{text}"
     ),
     # Structured picks the shape from the content instead of forcing bullets
     # onto everything — a single thought stays a paragraph.
@@ -315,6 +362,19 @@ CLEAN_CHECK_PROMPT = (
     "B) No, it needs cleanup\n"
     "Answer with the letter only.\n\nTranscript:\n{text}"
 )
+# Resolving a correction means deleting words, and the model sometimes
+# deletes a "not" the meaning hangs on: "what can not be achieved" came back
+# "what can be achieved". Filler in the paste is a nuisance; a reversed
+# sentence is wrong, so a Clean up that loses a negation is thrown away.
+NEGATION = re.compile(r"\b(?:not|never|cannot)\b|n't\b", re.IGNORECASE)
+
+
+def lost_negation(before, after):
+    def count(text):
+        return len(NEGATION.findall(text.replace("’", "'")))
+    return count(after) < count(before)
+
+
 # A wrong skip pastes filler the user asked to have removed; a wrong rewrite
 # only costs time. So skip only when the check is close to certain.
 SKIP_REWRITE_CONFIDENCE = 0.9
@@ -1777,6 +1837,9 @@ def rewrite(text, mode):
         return None
     if not out:
         log("rewrite returned nothing — pasted the raw transcript")
+        return None
+    if mode == "clean" and lost_negation(text, out):
+        log("rewrite dropped a negation — pasted the raw transcript")
         return None
     log(f"[rewrite {mode} {time.monotonic() - t0:.2f}s]")
     return out
