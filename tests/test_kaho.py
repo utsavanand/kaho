@@ -724,6 +724,36 @@ class TestCleanSkip(KahoTestCase):
             self.assertEqual(kaho.rewrite("Thanks, that works for me.", mode), "Rewritten.")
         check.assert_not_called()
 
+    def test_a_clean_up_that_drops_a_negation_pastes_the_transcript(self):
+        self.check_returns(0.0)
+        self.mlx_lm.generate.return_value = "What can be achieved?"
+        self.assertIsNone(kaho.rewrite("what can not be achieved", "clean"))
+
+    def test_a_resolved_correction_still_pastes_the_rewrite(self):
+        self.check_returns(0.0)
+        self.mlx_lm.generate.return_value = "Let's meet on Friday."
+        self.assertEqual(kaho.rewrite("let's meet Thursday no wait Friday", "clean"),
+                         "Let's meet on Friday.")
+
+
+class TestLostNegation(unittest.TestCase):
+    def test_counts_each_way_of_saying_not(self):
+        for before, after in (
+            ("I can't make it", "I can make it"),
+            ("it's not ready", "it's ready"),
+            ("we never ship on Friday", "we ship on Friday"),
+            ("what cannot be done", "what can be done"),
+            ("I don’t know", "I know"),  # curly apostrophe, as the model writes it
+        ):
+            self.assertTrue(kaho.lost_negation(before, after), before)
+
+    def test_a_dropped_correction_word_is_not_a_negation(self):
+        self.assertFalse(kaho.lost_negation("Thursday no wait Friday", "Friday"))
+
+    def test_keeping_or_contracting_a_negation_is_fine(self):
+        self.assertFalse(kaho.lost_negation("I do not know", "I don't know"))
+        self.assertFalse(kaho.lost_negation("um I can't", "I can't."))
+
 
 class TestAudioDropRules(KahoTestCase):
     """What reaches Whisper, and what is dropped before it can hallucinate."""
