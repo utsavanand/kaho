@@ -2714,6 +2714,110 @@ class TestStreaming(KahoTestCase):
         deliver.assert_called_once_with("I would rather the threshold be time-based.")
 
 
+@unittest.skipUnless(HAVE_NUMPY, "streaming works on real audio buffers")
+class TestLiveText(KahoTestCase):
+    """A long dictation shows its words so far on the pill while it records."""
+
+    SR, speech, session_with = TestStreaming.SR, TestStreaming.speech, TestStreaming.session_with
+
+    def recording_session(self, seconds=40):
+        s = self.session_with(self.speech(seconds, quiet_at=(kaho.STREAM_CHUNK_SECONDS,)))
+        kaho.state, kaho.recording = "recording", s
+        return s
+
+    def stream(self, s, said, cleaned=None):
+        kaho.AppHelper.callAfter.reset_mock()
+        with mock.patch.object(kaho, "transcribe", return_value=said), \
+             mock.patch.object(kaho, "rewrite", return_value=cleaned or said):
+            kaho.stream_chunk(s, kaho.job_generation)
+        # Run what the worker posted, as the main thread would
+        for c in kaho.AppHelper.callAfter.call_args_list:
+            if c.args[0] is kaho.show_live_text:
+                c.args[0](*c.args[1:])
+
+    def real_overlay(self):
+        o = kaho.Overlay()
+        o.panel, o.view = mock.MagicMock(), mock.MagicMock(live_text=None)
+        o.timer = o.watchdog = o.done_timer = None
+        frame = types.SimpleNamespace(origin=types.SimpleNamespace(x=600, y=110),
+                                      size=types.SimpleNamespace(width=kaho.OVERLAY_SIZE[0]))
+        o.panel.frame.return_value = frame
+
+        def set_frame(rect, _display):
+            (frame.origin.x, frame.origin.y), (frame.size.width, _h) = rect
+        o.panel.setFrame_display_.side_effect = set_frame
+        return o, frame
+
+    def test_the_words_so_far_show_after_each_stretch(self):
+        kaho.settings["rewrite"] = "clean"
+        s = self.recording_session()
+        self.stream(s, "um so the plan", cleaned="So the plan.")
+        kaho.overlay.setLiveText_.assert_called_with("So the plan.")
+        s.parts.insert(0, ("one two three four five six seven", "One two three four five six seven."))
+        self.stream(s, "eight nine", cleaned="Eight nine.")
+        kaho.overlay.setLiveText_.assert_called_with(
+            "… five six seven. So the plan. Eight nine.")
+
+    def test_without_clean_up_the_raw_words_show(self):
+        s = self.recording_session()
+        self.stream(s, "um so the plan")
+        kaho.overlay.setLiveText_.assert_called_with("um so the plan")
+
+    def test_the_words_are_never_logged(self):
+        s = self.recording_session()
+        self.stream(s, "a private sentence")
+        self.assertFalse([m for m in self.logged if "private" in m])
+
+    def test_dictations_under_the_streaming_threshold_show_nothing(self):
+        s = self.recording_session(seconds=kaho.STREAM_AFTER_SECONDS - 1)
+        self.stream(s, "should not appear")
+        kaho.overlay.setLiveText_.assert_not_called()
+
+    def test_a_stretch_finishing_after_cancel_shows_nothing(self):
+        s = self.recording_session()
+        kaho.AppHelper.callAfter.reset_mock()
+        with mock.patch.object(kaho, "transcribe", return_value="too late"):
+            kaho.stream_chunk(s, kaho.job_generation)
+        s.cancelled, kaho.state = True, "ready"
+        for c in kaho.AppHelper.callAfter.call_args_list:
+            c.args[0](*c.args[1:])
+        kaho.overlay.setLiveText_.assert_not_called()
+
+    def test_a_stretch_finishing_during_the_next_recording_shows_nothing(self):
+        s = self.recording_session()
+        kaho.show_live_text(s, "from the last one")
+        kaho.overlay.setLiveText_.assert_called_once()
+        kaho.overlay.setLiveText_.reset_mock()
+        kaho.recording = kaho.Recording()
+        kaho.show_live_text(s, "from the last one")
+        kaho.overlay.setLiveText_.assert_not_called()
+
+    def test_live_text_widens_the_pill_and_cancel_clears_it(self):
+        o, frame = self.real_overlay()
+        o.setLiveText_("so the plan")
+        self.assertEqual(o.view.live_text, "so the plan")
+        self.assertEqual(frame.size.width, kaho.LIVE_TEXT_WIDTH)
+        # Still centred where it was
+        self.assertEqual(frame.origin.x + frame.size.width / 2, 600 + kaho.OVERLAY_SIZE[0] / 2)
+        o.hide()
+        self.assertIsNone(o.view.live_text)
+        self.assertEqual(frame.size.width, kaho.OVERLAY_SIZE[0])
+
+    def test_release_clears_live_text(self):
+        o, frame = self.real_overlay()
+        o.setLiveText_("so the plan")
+        o.setPhase_("transcribing")
+        self.assertIsNone(o.view.live_text)
+        self.assertEqual(frame.size.width, kaho.OVERLAY_SIZE[0])
+
+    def test_a_new_recording_starts_without_live_text(self):
+        o, _ = self.real_overlay()
+        o.setLiveText_("so the plan")
+        with mock.patch.object(kaho, "focused_rect", return_value=None):
+            o.show()
+        self.assertIsNone(o.view.live_text)
+
+
 class TestPillScreen(KahoTestCase):
     """The pill shows on the display being typed on, not whichever macOS calls main."""
 

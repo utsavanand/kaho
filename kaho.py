@@ -2337,6 +2337,27 @@ def stream_chunk(session, generation):
             session.parts[-2], session.parts[-1] = tuple(prev), tuple(cur)
     last_inference = time.monotonic()
     log(f"[streamed {len(piece) / SAMPLE_RATE:.1f}s in {time.monotonic() - t0:.2f}s]")
+    # Never logged: transcripts only ever go to history
+    AppHelper.callAfter(show_live_text, session, live_text(session.parts))
+
+
+def live_text(parts):
+    """The last few words streamed so far, as the pill shows them."""
+    words = join_parts(parts, "", cleaned=settings["rewrite"] == "clean").split()
+    return ("… " if len(words) > LIVE_WORDS else "") + " ".join(words[-LIVE_WORDS:])
+
+
+def show_live_text(session, text):
+    """Caption the pill with the words so far, on the main thread.
+
+    Posted from the worker after a stretch, so it can land after release,
+    Escape, an instruction or the next recording; only the recording it was
+    transcribed for, still being dictated, may show it.
+    """
+    if (not text or state != "recording" or recording is not session
+            or session.cancelled or session.spans):
+        return
+    overlay.setLiveText_(text)
 
 
 JOIN_WORDS = 12  # words either side of a join that the repair looks at
@@ -2931,6 +2952,10 @@ def status_item_onscreen():
 
 OVERLAY_SIZE = (196, 36)
 BAR_COUNT = 22
+# A dictation long enough to stream shows its last few words beside the
+# level meter, on a pill widened to fit them
+LIVE_WORDS = 8
+LIVE_TEXT_WIDTH = 520
 # Labels for the phases that run after the key is released. Without these the
 # pill vanished on release and multi-second transcribe+rewrite work looked
 # like nothing was happening.
@@ -2975,6 +3000,7 @@ class LevelView(AppKit.NSView):
                     ((30 + i * 4.6, mid - h / 2), (3, h)), 1.5, 1.5
                 )
                 bar.fill()
+            draw_live_text(self, bounds)
             draw_elapsed(self, bounds)
             return
         draw_phase(phase, ticks, bounds, getattr(self, "message", None))
@@ -3006,6 +3032,31 @@ def draw_elapsed(view, bounds):
     text.drawAtPoint_(
         (bounds.size.width - size.width - 12, (bounds.size.height - size.height) / 2)
     )
+
+
+def draw_live_text(view, bounds):
+    """The words so far, between the level meter and the elapsed time.
+
+    Leading words are dropped until the rest fits, so the newest stay in view.
+    """
+    words = (getattr(view, "live_text", None) or "").split()
+    if not words:
+        return
+    attrs = {
+        AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(12),
+        AppKit.NSForegroundColorAttributeName: AppKit.NSColor.colorWithCalibratedWhite_alpha_(
+            1.0, 0.92
+        ),
+    }
+    left = 30 + BAR_COUNT * 4.6 + 10
+    room = bounds.size.width - left - 52  # the elapsed time's corner
+    while True:
+        text = AppKit.NSAttributedString.alloc().initWithString_attributes_(" ".join(words), attrs)
+        size = text.size()
+        if size.width <= room or len(words) <= 2:
+            break
+        words = ["…"] + words[2:] if words[0] == "…" else ["…"] + words[1:]
+    text.drawAtPoint_((left, (bounds.size.height - size.height) / 2))
 
 
 def draw_phase(phase, ticks, bounds, message=None):
@@ -3068,6 +3119,8 @@ class Overlay(AppKit.NSObject):
         effect.layer().setMasksToBounds_(True)
         panel.setContentView_(effect)
         view = LevelView.alloc().initWithFrame_(((0, 0), size))
+        # Follows the panel when live text widens it
+        view.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
         effect.addSubview_(view)
         self.panel, self.view, self.timer = panel, view, None
         self.watchdog = None
@@ -3081,6 +3134,8 @@ class Overlay(AppKit.NSObject):
         if self.done_timer:
             self.done_timer.invalidate()
             self.done_timer = None
+        # Before place(), which sets the pill back to its usual width
+        self.view.live_text = None
         self.place()
         self.view.levels = []
         self.view.phase = "recording"
@@ -3129,12 +3184,38 @@ class Overlay(AppKit.NSObject):
             # Cleared here rather than in hide(): a message that outlived its
             # phase would caption the next recording
             self.view.message = None
+        # Words so far belong to the level meter: release, an instruction and
+        # every later phase take them down
+        self.clearLiveText()
         self.view.phase = phase
         self.view.setNeedsDisplay_(True)
         if not self.panel.isVisible():
             self.panel.orderFrontRegardless()
         if not self.timer:
             self.startTimer()
+
+    def setLiveText_(self, text):
+        """Caption a long recording with its last few words.
+
+        Only the caption changes: the level meter keeps drawing from its own
+        timer, so a slow stretch never holds it up.
+        """
+        self.view.live_text = text
+        self.setWidth_(LIVE_TEXT_WIDTH)
+        self.view.setNeedsDisplay_(True)
+
+    def clearLiveText(self):
+        if getattr(self.view, "live_text", None):
+            self.view.live_text = None
+            self.setWidth_(OVERLAY_SIZE[0])
+
+    def setWidth_(self, width):
+        """Widen or narrow the pill about its centre; the views follow."""
+        frame = self.panel.frame()
+        if frame.size.width == width:
+            return
+        x = frame.origin.x + (frame.size.width - width) / 2
+        self.panel.setFrame_display_(((x, frame.origin.y), (width, OVERLAY_SIZE[1])), True)
 
     def armWatchdog(self):
         """Hide the pill if the pipeline never reports back.
@@ -3263,6 +3344,7 @@ class Overlay(AppKit.NSObject):
         self.hide()
 
     def hide(self):
+        self.clearLiveText()
         self.cancelWatchdog()
         if self.done_timer:
             self.done_timer.invalidate()
