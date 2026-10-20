@@ -327,13 +327,15 @@ MIN_SECONDS = 0.3
 # the floor costs nothing on real speech.
 MIN_PEAK = 0.025
 # Long dictations are transcribed while the user is still talking, a stretch
-# at a time, so stopping only leaves the last stretch to process. A 3.7-minute
-# test recording waited 18 s after release (9.6 s transcribing, 8.3 s clean
-# rewrite) and 1.2 s streamed, with the same word error rate at 15 s
-# stretches cut at pauses. Short dictations never stream.
-STREAM_AFTER_SECONDS = 30
-STREAM_CHUNK_SECONDS = 15
-STREAM_SEARCH_SECONDS = 4  # the cut goes at the quietest point within this of the target
+# at a time, so stopping only leaves the last stretch to process: about a
+# second, against 18-33 s for a three-minute dictation done at the end.
+# Smaller stretches don't shorten that wait, but they cost accuracy: with the
+# dictionary on, word errors went from 1.2% (whole) to 2.8% at 12 s and 4.4%
+# at 5 s for one voice. 12 s was the most accurate streaming size, and
+# dictations under 15 s are never split.
+STREAM_AFTER_SECONDS = 15
+STREAM_CHUNK_SECONDS = 12
+STREAM_SEARCH_SECONDS = 3  # the cut goes at the quietest point within this of the target
 STREAM_CHECK_SECONDS = 2
 # Delay before handing the clipboard back after a paste. Slow apps read the
 # pasteboard well after the Cmd+V keystroke; restoring too early makes them

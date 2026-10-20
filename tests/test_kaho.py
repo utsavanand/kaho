@@ -2478,14 +2478,15 @@ class TestStreaming(KahoTestCase):
         return s
 
     def test_short_dictations_never_stream(self):
+        short = kaho.STREAM_AFTER_SECONDS - 1
         s = kaho.Recording()
-        kaho.maybe_stream(s, self.SR * 25)
+        kaho.maybe_stream(s, self.SR * short)
         self.assertTrue(kaho.jobs.empty())
-        self.assertIsNone(kaho.find_cut(self.speech(25), 0))
+        self.assertIsNone(kaho.find_cut(self.speech(short), 0))
 
     def test_a_long_dictation_queues_one_stretch_at_a_time(self):
         s = kaho.Recording()
-        kaho.maybe_stream(s, self.SR * 31)
+        kaho.maybe_stream(s, self.SR * (kaho.STREAM_AFTER_SECONDS + kaho.STREAM_CHUNK_SECONDS))
         kaho.maybe_stream(s, self.SR * 3)  # still queued: no second job
         jobs = []
         while not kaho.jobs.empty():
@@ -2494,21 +2495,23 @@ class TestStreaming(KahoTestCase):
         self.assertIs(jobs[0][0], kaho.STREAM)
         self.assertIs(jobs[0][1], s)
 
-    def test_the_cut_lands_on_a_pause_near_fifteen_seconds(self):
-        audio = self.speech(40, quiet_at=(13.2,))
+    def test_the_cut_lands_on_a_pause_near_the_target(self):
+        pause = kaho.STREAM_CHUNK_SECONDS - 1.8
+        audio = self.speech(40, quiet_at=(pause,))
         cut = kaho.find_cut(audio, 0)
-        self.assertAlmostEqual(cut / self.SR, 13.3, delta=0.15)
+        self.assertAlmostEqual(cut / self.SR, pause + 0.1, delta=0.15)
 
     def test_a_stretch_is_transcribed_cleaned_and_remembered(self):
         kaho.settings["rewrite"] = "clean"
-        s = self.session_with(self.speech(40, quiet_at=(15.0,)))
+        pause = kaho.STREAM_CHUNK_SECONDS
+        s = self.session_with(self.speech(40, quiet_at=(pause,)))
         with mock.patch.object(kaho, "transcribe", return_value="um so the plan") as tr, \
              mock.patch.object(kaho, "rewrite", return_value="So the plan.") as rw:
             kaho.stream_chunk(s, kaho.job_generation)
-        self.assertAlmostEqual(len(tr.call_args.args[0]) / self.SR, 15.1, delta=0.15)
+        self.assertAlmostEqual(len(tr.call_args.args[0]) / self.SR, pause + 0.1, delta=0.15)
         rw.assert_called_once_with("um so the plan", "clean")
         self.assertEqual(s.parts, [("um so the plan", "So the plan.")])
-        self.assertAlmostEqual(s.done_frames / self.SR, 15.1, delta=0.15)
+        self.assertAlmostEqual(s.done_frames / self.SR, pause + 0.1, delta=0.15)
 
     def test_an_instruction_stops_streaming(self):
         s = self.session_with(self.speech(40))
