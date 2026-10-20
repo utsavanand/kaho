@@ -1,4 +1,22 @@
 # Changelog
+## 2.4.4 — 2026-10-20
+
+- Long dictations paste in about a second instead of up to half a minute.
+  Once a dictation passes 15 seconds, Kaho transcribes and cleans it up in
+  stretches while you are still talking, so stopping leaves only the last
+  few seconds to process. A two-minute dictation that waited 15-30 s now
+  pastes in about 1-2 s. Stretches are cut at sentence pauses, and the
+  punctuation where they meet is checked, so a sentence isn't split by a
+  stray full stop. Dictations under 15 seconds work exactly as before.
+- The recording pill shows on the screen you're typing on. With several
+  displays it used to appear on whichever one macOS considered main; it
+  now follows the text field, or the mouse pointer when an app doesn't
+  say where its field is.
+- Shift pressed a moment before the hotkey now counts. Only a Shift
+  pressed after recording had started was noticed, so an instruction
+  begun with Shift first was typed into the message. That's the usual
+  order when editing selected text.
+
 ## 2.4.3 — 2026-10-19
 
 - Clean up keeps only the fix when you correct yourself. "Let's meet
