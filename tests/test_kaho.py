@@ -2464,11 +2464,11 @@ class TestStreaming(KahoTestCase):
 
     SR = 16_000
 
-    def speech(self, seconds, quiet_at=()):
-        """Loud audio with near-silent 300 ms gaps at the given seconds."""
+    def speech(self, seconds, quiet_at=(), gap=0.5):
+        """Loud audio with silent gaps (0.5 s unless given) at the given seconds."""
         a = REAL_NUMPY.full(int(self.SR * seconds), 0.3, dtype="float32")
         for t in quiet_at:
-            a[int(t * self.SR):int((t + 0.3) * self.SR)] = 0.0
+            a[int(t * self.SR):int((t + gap) * self.SR)] = 0.0
         return a
 
     def session_with(self, audio):
@@ -2499,7 +2499,7 @@ class TestStreaming(KahoTestCase):
         pause = kaho.STREAM_CHUNK_SECONDS - 1.8
         audio = self.speech(40, quiet_at=(pause,))
         cut = kaho.find_cut(audio, 0)
-        self.assertAlmostEqual(cut / self.SR, pause + 0.1, delta=0.15)
+        self.assertAlmostEqual(cut / self.SR, pause + 0.25, delta=0.05)
 
     def test_a_stretch_is_transcribed_cleaned_and_remembered(self):
         kaho.settings["rewrite"] = "clean"
@@ -2508,10 +2508,10 @@ class TestStreaming(KahoTestCase):
         with mock.patch.object(kaho, "transcribe", return_value="um so the plan") as tr, \
              mock.patch.object(kaho, "rewrite", return_value="So the plan.") as rw:
             kaho.stream_chunk(s, kaho.job_generation)
-        self.assertAlmostEqual(len(tr.call_args.args[0]) / self.SR, pause + 0.1, delta=0.15)
+        self.assertAlmostEqual(len(tr.call_args.args[0]) / self.SR, pause + 0.25, delta=0.05)
         rw.assert_called_once_with("um so the plan", "clean")
         self.assertEqual(s.parts, [("um so the plan", "So the plan.")])
-        self.assertAlmostEqual(s.done_frames / self.SR, pause + 0.1, delta=0.15)
+        self.assertAlmostEqual(s.done_frames / self.SR, pause + 0.25, delta=0.05)
 
     def test_an_instruction_stops_streaming(self):
         s = self.session_with(self.speech(40))
@@ -2581,3 +2581,68 @@ class TestStreaming(KahoTestCase):
         with mock.patch.object(kaho, "looks_hallucinated", side_effect=lambda t: t == "loop loop"):
             _, _, deliver = self.run_final(s, audio, "off", tail="loop loop")
         deliver.assert_called_once_with("first part")
+
+    def test_a_real_pause_beats_a_brief_gap_between_words(self):
+        # A 0.2 s word gap nearer the target, a 0.6 s pause between sentences later
+        audio = self.speech(30, quiet_at=(11.5,), gap=0.2)
+        audio[int(14 * self.SR):int(14.6 * self.SR)] = 0.0
+        cut = kaho.find_cut(audio, 0)
+        self.assertAlmostEqual(cut / self.SR, 14.3, delta=0.05)
+
+    def test_it_waits_for_a_pause_rather_than_cutting_mid_sentence(self):
+        audio = self.speech(20, quiet_at=(12,), gap=0.2)  # only a word gap so far
+        self.assertIsNone(kaho.find_cut(audio, 0))
+
+    def test_after_the_limit_it_cuts_at_the_quietest_moment_anyway(self):
+        audio = self.speech(kaho.STREAM_MAX_SECONDS + 1, quiet_at=(12,), gap=0.2)
+        cut = kaho.find_cut(audio, 0)
+        self.assertAlmostEqual(cut / self.SR, 12.1, delta=0.15)
+
+    def fake_join_model(self, answer):
+        tok = mock.MagicMock()
+        tok.encode.side_effect = lambda t: t.split()
+        return (mock.patch.object(kaho, "rewriter", (mock.MagicMock(), tok)),
+                mock.patch.object(kaho, "mlx_lm", mock.MagicMock(**{"generate.return_value": answer})))
+
+    def test_a_join_loses_its_false_full_stop(self):
+        rw, lm = self.fake_join_model("Lag went up to forty-five thousand messages on Tuesday.")
+        with rw, lm:
+            before, after = kaho.repair_join("Lag went up to forty-five.", "Thousand messages on Tuesday.")
+        self.assertEqual(before, "Lag went up to forty-five")
+        self.assertEqual(after, "thousand messages on Tuesday.")
+
+    def test_a_join_repair_that_changes_a_word_is_ignored(self):
+        rw, lm = self.fake_join_model("Lag went up to fifty thousand messages on Tuesday.")
+        with rw, lm:
+            out = kaho.repair_join("Lag went up to forty-five.", "Thousand messages on Tuesday.")
+        self.assertEqual(out, ("Lag went up to forty-five.", "Thousand messages on Tuesday."))
+
+    def test_streaming_repairs_the_join_with_the_previous_stretch(self):
+        kaho.settings["rewrite"] = "clean"
+        s = self.session_with(self.speech(40, quiet_at=(kaho.STREAM_CHUNK_SECONDS,)))
+        s.parts = [("up to forty five", "Up to forty-five.")]
+        with mock.patch.object(kaho, "transcribe", return_value="thousand messages"), \
+             mock.patch.object(kaho, "rewrite", return_value="Thousand messages."), \
+             mock.patch.object(kaho, "repair_join", return_value=("Up to forty-five", "thousand messages.")) as rj:
+            kaho.stream_chunk(s, kaho.job_generation)
+        rj.assert_called_once_with("Up to forty-five.", "Thousand messages.")
+        self.assertEqual([c for _, c in s.parts], ["Up to forty-five", "thousand messages."])
+
+    def test_whole_text_modes_leave_joins_to_the_final_rewrite(self):
+        kaho.settings["rewrite"] = "structured"
+        s = self.session_with(self.speech(40, quiet_at=(kaho.STREAM_CHUNK_SECONDS,)))
+        s.parts = [("up to forty five", None)]
+        with mock.patch.object(kaho, "transcribe", return_value="thousand messages"), \
+             mock.patch.object(kaho, "repair_join") as rj:
+            kaho.stream_chunk(s, kaho.job_generation)
+        rj.assert_not_called()
+
+    def test_release_repairs_the_last_join(self):
+        audio = self.speech(50)
+        s = self.session_with(audio)
+        s.parts, s.done_frames = [("i would rather", "I would rather.")], self.SR * 44
+        with mock.patch.object(kaho, "repair_join",
+                               return_value=("I would rather", "the threshold be time-based.")) as rj:
+            _, _, deliver = self.run_final(s, audio, "clean", tail="the threshold be time based")
+        rj.assert_called_once_with("I would rather.", "<clean:the threshold be time based>")
+        deliver.assert_called_once_with("I would rather the threshold be time-based.")

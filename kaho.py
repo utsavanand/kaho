@@ -335,7 +335,18 @@ MIN_PEAK = 0.025
 # dictations under 15 s are never split.
 STREAM_AFTER_SECONDS = 15
 STREAM_CHUNK_SECONDS = 12
-STREAM_SEARCH_SECONDS = 3  # the cut goes at the quietest point within this of the target
+STREAM_SEARCH_SECONDS = 3  # the earliest a cut may come before the target
+# A cut goes in the longest pause after that. A real stretch needs one at
+# least this long: the gaps between words inside a sentence are shorter, and
+# cutting in one put a full stop mid-sentence ("forty-five. Thousand").
+STREAM_MIN_PAUSE_SECONDS = 0.35
+# A pause this long usually ends a sentence, while a 0.35-0.5 s one is often
+# a comma. Taking the first long-enough pause cut after commas; waiting for a
+# sentence-length one until STREAM_PATIENT_SECONDS into the stretch doesn't.
+STREAM_SENTENCE_PAUSE_SECONDS = 0.6
+STREAM_PATIENT_SECONDS = 20
+# Without such a pause by then, cut at the quietest moment anyway
+STREAM_MAX_SECONDS = 25
 STREAM_CHECK_SECONDS = 2
 # Delay before handing the clipboard back after a paste. Slow apps read the
 # pasteboard well after the Cmd+V keystroke; restoring too early makes them
@@ -2119,15 +2130,41 @@ def maybe_stream(session, frames):
 
 
 def find_cut(audio, start):
-    """Where the next stretch should end: the quietest 200 ms near
-    STREAM_CHUNK_SECONDS past `start`, or None if it's too early to cut."""
+    """Where the next stretch should end, or None to wait for more audio.
+
+    The middle of the longest pause from STREAM_CHUNK_SECONDS -
+    STREAM_SEARCH_SECONDS past `start`: one of sentence length until
+    STREAM_PATIENT_SECONDS in, any real pause after that. Waiting costs
+    nothing, since the work still happens while the user talks. Past
+    STREAM_MAX_SECONDS without one, the quietest 200 ms near the target.
+    """
     if (len(audio) < SAMPLE_RATE * STREAM_AFTER_SECONDS
             or len(audio) - start < SAMPLE_RATE * (STREAM_CHUNK_SECONDS + STREAM_SEARCH_SECONDS)):
         return None
-    window = SAMPLE_RATE // 5
     lo = start + SAMPLE_RATE * (STREAM_CHUNK_SECONDS - STREAM_SEARCH_SECONDS)
-    hi = start + SAMPLE_RATE * (STREAM_CHUNK_SECONDS + STREAM_SEARCH_SECONDS)
-    quietest = min(range(lo, hi - window, window // 2),
+    hi = min(len(audio), start + SAMPLE_RATE * STREAM_MAX_SECONDS)
+    frame = SAMPLE_RATE // 50  # 20 ms
+    region = audio[lo:hi][: (hi - lo) // frame * frame].reshape(-1, frame)
+    rms = np.sqrt(np.mean(np.square(region), axis=1))
+    # Relative to this speaker's loudness here: a pause is 20 dB under it
+    quiet = rms < max(0.002, 0.1 * float(np.percentile(rms, 90)))
+    best_len = best_mid = 0
+    run = 0
+    for i, q in enumerate(quiet):
+        run = run + 1 if q else 0
+        if run > best_len:
+            best_len, best_mid = run, i - run // 2
+    have = len(audio) - start
+    needed = (STREAM_SENTENCE_PAUSE_SECONDS if have < SAMPLE_RATE * STREAM_PATIENT_SECONDS
+              else STREAM_MIN_PAUSE_SECONDS)
+    if best_len * frame >= SAMPLE_RATE * needed:
+        return lo + best_mid * frame + frame // 2
+    if have < SAMPLE_RATE * STREAM_MAX_SECONDS:
+        return None
+    window = SAMPLE_RATE // 5
+    target_lo = start + SAMPLE_RATE * (STREAM_CHUNK_SECONDS - STREAM_SEARCH_SECONDS)
+    target_hi = start + SAMPLE_RATE * (STREAM_CHUNK_SECONDS + STREAM_SEARCH_SECONDS)
+    quietest = min(range(target_lo, target_hi - window, window // 2),
                    key=lambda i: float(np.mean(np.square(audio[i:i + window]))))
     return quietest + window // 2
 
@@ -2161,8 +2198,66 @@ def stream_chunk(session, generation):
         cleaned = rewrite(text, "clean") or text
     session.parts.append((text, cleaned))
     session.done_frames = cut
+    field = _join_field()
+    if field is not None and len(session.parts) > 1:
+        prev, cur = list(session.parts[-2]), list(session.parts[-1])
+        if prev[field] and cur[field]:
+            prev[field], cur[field] = repair_join(prev[field], cur[field])
+            session.parts[-2], session.parts[-1] = tuple(prev), tuple(cur)
     last_inference = time.monotonic()
     log(f"[streamed {len(piece) / SAMPLE_RATE:.1f}s in {time.monotonic() - t0:.2f}s]")
+
+
+JOIN_WORDS = 12  # words either side of a join that the repair looks at
+JOIN_PROMPT = (
+    "Two pieces of one dictation were transcribed separately and joined at "
+    "\" | \". Fix only the punctuation and capitalization where they meet, so "
+    "it reads as one continuous speaker: remove a full stop that splits a "
+    "sentence, and lowercase a word that was capitalized only because a piece "
+    "started there. Do not add, remove, reorder or change any word. Reply "
+    "with the text only, without the \" | \".\n\nText:\n{text}"
+)
+
+
+def _bare_words(text):
+    return [w for w in re.sub(r"[^\w'\s-]", " ", text.lower()).split() if w]
+
+
+def repair_join(before, after):
+    """`before` and `after` with the punctuation where they meet made continuous.
+
+    Stretches are transcribed separately, so each one's end can get a full
+    stop and the next a capital even mid-sentence. Only the words at the join
+    go to the model, and its answer is used only if every word is unchanged.
+    """
+    if not before or not after or rewriter is None:
+        return before, after
+    a, b = before.split(), after.split()
+    head, tail = a[-JOIN_WORDS:], b[:JOIN_WORDS]
+    model, tokenizer = rewriter
+    try:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": JOIN_PROMPT.format(
+                text=" ".join(head) + " | " + " ".join(tail))}],
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        out = mlx_lm.generate(model, tokenizer, prompt=prompt,
+                              max_tokens=2 * len(tokenizer.encode(" ".join(head + tail))) + 16).strip()
+    except Exception as e:  # noqa: BLE001
+        log(f"join repair failed: {e!r} — kept as transcribed")
+        return before, after
+    fixed = out.replace(" | ", " ").split()
+    if len(fixed) != len(head) + len(tail) or _bare_words(" ".join(fixed)) != _bare_words(" ".join(head + tail)):
+        return before, after
+    return (" ".join(a[:-len(head)] + fixed[:len(head)]),
+            " ".join(fixed[len(head):] + b[len(tail):]))
+
+
+def _join_field():
+    """Which version of each stretch is pasted: cleaned in clean mode, raw
+    when rewriting is off, and none for modes that rewrite the whole text."""
+    return {"clean": 1, "off": 0}.get(settings["rewrite"])
 
 
 def join_parts(parts, tail, cleaned):
@@ -2235,11 +2330,17 @@ def run_job(audio, generation, spans, released, t0, session=None):
             log("cancelled during rewriting — nothing pasted")
             return
     elif parts:
+        # Each streamed stretch was cleaned as it came; only the last is left
+        if mode == "clean" and text:
+            AppHelper.callAfter(overlay.setPhase_, "rewriting")
+            text = rewrite(text, "clean") or text
+        field = _join_field()
+        if field is not None and text:
+            last = list(parts[-1])
+            if last[field]:
+                last[field], text = repair_join(last[field], text)
+                parts = [*parts[:-1], tuple(last)]
         if mode == "clean":
-            # Each streamed stretch was cleaned as it came; only the last is left
-            if text:
-                AppHelper.callAfter(overlay.setPhase_, "rewriting")
-                text = rewrite(text, "clean") or text
             text = join_parts(parts, text, cleaned=True)
         else:
             text = join_parts(parts, text, cleaned=False)
