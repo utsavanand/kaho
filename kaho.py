@@ -399,6 +399,28 @@ MIN_SECONDS = 0.3
 # peaks at 0.05+, every hallucination under 0.02. Kept for the current model:
 # the floor costs nothing on real speech.
 MIN_PEAK = 0.025
+# Long dictations are transcribed while the user is still talking, a stretch
+# at a time, so stopping only leaves the last stretch to process: about a
+# second, against 18-33 s for a three-minute dictation done at the end.
+# Smaller stretches don't shorten that wait, but they cost accuracy: with the
+# dictionary on, word errors went from 1.2% (whole) to 2.8% at 12 s and 4.4%
+# at 5 s for one voice. 12 s was the most accurate streaming size, and
+# dictations under 15 s are never split.
+STREAM_AFTER_SECONDS = 15
+STREAM_CHUNK_SECONDS = 12
+STREAM_SEARCH_SECONDS = 3  # the earliest a cut may come before the target
+# A cut goes in the longest pause after that. A real stretch needs one at
+# least this long: the gaps between words inside a sentence are shorter, and
+# cutting in one put a full stop mid-sentence ("forty-five. Thousand").
+STREAM_MIN_PAUSE_SECONDS = 0.35
+# A pause this long usually ends a sentence, while a 0.35-0.5 s one is often
+# a comma. Taking the first long-enough pause cut after commas; waiting for a
+# sentence-length one until STREAM_PATIENT_SECONDS into the stretch doesn't.
+STREAM_SENTENCE_PAUSE_SECONDS = 0.6
+STREAM_PATIENT_SECONDS = 20
+# Without such a pause by then, cut at the quietest moment anyway
+STREAM_MAX_SECONDS = 25
+STREAM_CHECK_SECONDS = 2
 # Delay before handing the clipboard back after a paste. Slow apps read the
 # pasteboard well after the Cmd+V keystroke; restoring too early makes them
 # paste the previous contents instead of the transcript.
@@ -567,8 +589,9 @@ class Recording:
     moment the user is mid-sentence.
     """
 
-    __slots__ = ("buf", "cancelled", "pending", "released_at", "screen_done",
-                 "screen_terms", "spans")
+    __slots__ = ("buf", "cancelled", "chunk_queued", "done_frames", "frames", "next_check",
+                 "parts", "pending", "released_at", "screen_done", "screen_terms", "spans",
+                 "streaming")
 
     def __init__(self):
         self.buf = []
@@ -580,6 +603,14 @@ class Recording:
         self.screen_terms = None
         self.screen_done = False
         self.pending = False  # released, but final audio has not reached the worker
+        # Streaming of long dictations: what has been transcribed so far, as
+        # (transcript, cleaned or None) per stretch, and where it ends
+        self.frames = 0
+        self.next_check = 0
+        self.done_frames = 0
+        self.parts = []
+        self.chunk_queued = False
+        self.streaming = True
         # When the user let go of the key. The number that matters to them
         # starts here, not when the worker picks the job up: the old timer
         # began after jobs.get(), so microphone shutdown and queue waiting
@@ -1356,7 +1387,8 @@ def start_recording():
         if not warmup_queued:
             warmup_queued = True
             jobs.put(WARMUP)
-    audio_ops.put(lambda: _open_stream(buf))
+    session = recording
+    audio_ops.put(lambda: _open_stream(buf, session))
 
 
 def _capture_device():
@@ -1418,7 +1450,7 @@ def _close_quietly(s):
         log(f"could not discard the standby microphone process: {e}")
 
 
-def _open_stream(buf):
+def _open_stream(buf, session=None):
     global stream, state, locked
     s = None
     try:
@@ -1431,6 +1463,8 @@ def _open_stream(buf):
 
         def capture(data, *_):
             buf.append(data)  # the reader supplies an owned array
+            if session is not None:
+                maybe_stream(session, len(data))
 
         s = _take_standby()
         if s is None:
@@ -2206,6 +2240,174 @@ def split_audio(audio, spans):
     )
 
 
+STREAM = object()  # job marker: transcribe the next stretch of a long recording
+
+
+def maybe_stream(session, frames):
+    """Queue the next stretch once there is enough unprocessed audio.
+
+    Runs on the audio reader thread for every delivered buffer, so it only
+    counts and compares; the worker finds the cut and does the work.
+    """
+    session.frames += frames
+    if session.frames < session.next_check or session.chunk_queued or not session.streaming:
+        return
+    session.next_check = session.frames + SAMPLE_RATE * STREAM_CHECK_SECONDS
+    if (session.frames >= SAMPLE_RATE * STREAM_AFTER_SECONDS
+            and session.frames - session.done_frames
+            >= SAMPLE_RATE * (STREAM_CHUNK_SECONDS + STREAM_SEARCH_SECONDS)):
+        session.chunk_queued = True
+        jobs.put((STREAM, session, job_generation))
+
+
+def find_cut(audio, start):
+    """Where the next stretch should end, or None to wait for more audio.
+
+    The middle of the longest pause from STREAM_CHUNK_SECONDS -
+    STREAM_SEARCH_SECONDS past `start`: one of sentence length until
+    STREAM_PATIENT_SECONDS in, any real pause after that. Waiting costs
+    nothing, since the work still happens while the user talks. Past
+    STREAM_MAX_SECONDS without one, the quietest 200 ms near the target.
+    """
+    if (len(audio) < SAMPLE_RATE * STREAM_AFTER_SECONDS
+            or len(audio) - start < SAMPLE_RATE * (STREAM_CHUNK_SECONDS + STREAM_SEARCH_SECONDS)):
+        return None
+    lo = start + SAMPLE_RATE * (STREAM_CHUNK_SECONDS - STREAM_SEARCH_SECONDS)
+    hi = min(len(audio), start + SAMPLE_RATE * STREAM_MAX_SECONDS)
+    frame = SAMPLE_RATE // 50  # 20 ms
+    region = audio[lo:hi][: (hi - lo) // frame * frame].reshape(-1, frame)
+    rms = np.sqrt(np.mean(np.square(region), axis=1))
+    # Relative to this speaker's loudness here: a pause is 20 dB under it
+    quiet = rms < max(0.002, 0.1 * float(np.percentile(rms, 90)))
+    best_len = best_mid = 0
+    run = 0
+    for i, q in enumerate(quiet):
+        run = run + 1 if q else 0
+        if run > best_len:
+            best_len, best_mid = run, i - run // 2
+    have = len(audio) - start
+    needed = (STREAM_SENTENCE_PAUSE_SECONDS if have < SAMPLE_RATE * STREAM_PATIENT_SECONDS
+              else STREAM_MIN_PAUSE_SECONDS)
+    if best_len * frame >= SAMPLE_RATE * needed:
+        return lo + best_mid * frame + frame // 2
+    if have < SAMPLE_RATE * STREAM_MAX_SECONDS:
+        return None
+    window = SAMPLE_RATE // 5
+    target_lo = start + SAMPLE_RATE * (STREAM_CHUNK_SECONDS - STREAM_SEARCH_SECONDS)
+    target_hi = start + SAMPLE_RATE * (STREAM_CHUNK_SECONDS + STREAM_SEARCH_SECONDS)
+    quietest = min(range(target_lo, target_hi - window, window // 2),
+                   key=lambda i: float(np.mean(np.square(audio[i:i + window]))))
+    return quietest + window // 2
+
+
+def stream_chunk(session, generation):
+    """Transcribe the next stretch of a recording that is still going."""
+    global last_inference
+    session.chunk_queued = False
+    if not session.streaming or session.cancelled or generation != job_generation:
+        return
+    if session.spans:
+        # An instruction applies to the whole text: the final job does it all
+        session.streaming = False
+        return
+    audio = np.concatenate(list(session.buf))[:, 0]
+    start = session.done_frames
+    cut = find_cut(audio, start)
+    if cut is None:
+        return
+    t0 = time.monotonic()
+    piece = audio[start:cut]
+    # Screen words only once they have arrived; take_screen_terms() is the
+    # final job's, and would stop a late read from landing
+    screen = session.screen_terms or ()
+    text = transcribe(piece, screen=screen) if np.abs(piece).max() >= MIN_PEAK else ""
+    if looks_hallucinated(text):
+        log(f"dropped a streamed stretch: looks like a repetition loop ({len(text.split())} words)")
+        text = ""
+    cleaned = None
+    if text and settings["rewrite"] == "clean":
+        cleaned = rewrite(text, "clean") or text
+    session.parts.append((text, cleaned))
+    session.done_frames = cut
+    field = _join_field()
+    if field is not None and len(session.parts) > 1:
+        prev, cur = list(session.parts[-2]), list(session.parts[-1])
+        if prev[field] and cur[field]:
+            prev[field], cur[field] = repair_join(prev[field], cur[field])
+            session.parts[-2], session.parts[-1] = tuple(prev), tuple(cur)
+    last_inference = time.monotonic()
+    log(f"[streamed {len(piece) / SAMPLE_RATE:.1f}s in {time.monotonic() - t0:.2f}s]")
+
+
+JOIN_WORDS = 12  # words either side of a join that the repair looks at
+JOIN_PROMPT = (
+    "Two pieces of one dictation were transcribed separately and joined at "
+    "\" | \". Fix only the punctuation and capitalization where they meet, so "
+    "it reads as one continuous speaker: remove a full stop that splits a "
+    "sentence, and lowercase a word that was capitalized only because a piece "
+    "started there. Do not add, remove, reorder or change any word. Reply "
+    "with the text only, without the \" | \".\n\nText:\n{text}"
+)
+
+
+def _bare_words(text):
+    return [w for w in re.sub(r"[^\w'\s-]", " ", text.lower()).split() if w]
+
+
+def repair_join(before, after):
+    """`before` and `after` with the punctuation where they meet made continuous.
+
+    Stretches are transcribed separately, so each one's end can get a full
+    stop and the next a capital even mid-sentence. Only the words at the join
+    go to the model, and its answer is used only if every word is unchanged.
+    """
+    if not before or not after or rewriter is None:
+        return before, after
+    a, b = before.split(), after.split()
+    head, tail = a[-JOIN_WORDS:], b[:JOIN_WORDS]
+    model, tokenizer = rewriter
+    try:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": JOIN_PROMPT.format(
+                text=" ".join(head) + " | " + " ".join(tail))}],
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        out = mlx_lm.generate(model, tokenizer, prompt=prompt,
+                              max_tokens=2 * len(tokenizer.encode(" ".join(head + tail))) + 16).strip()
+    except Exception as e:  # noqa: BLE001
+        log(f"join repair failed: {e!r} — kept as transcribed")
+        return before, after
+    fixed = out.replace(" | ", " ").split()
+    if len(fixed) != len(head) + len(tail) or _bare_words(" ".join(fixed)) != _bare_words(" ".join(head + tail)):
+        return before, after
+    # Only the join itself is taken from the answer: the last word's
+    # punctuation and the next word's capital. The model also lowercased
+    # everything else it saw, "I" and names included, which turned most of a
+    # 110 s dictation lowercase.
+    last, first = fixed[len(head) - 1], fixed[len(head)]
+    joined = not re.search(r"[.?!]['\"]?$", last) and re.search(r"[.?!]['\"]?$", a[-1])
+    if joined and first[:1].islower() and not re.fullmatch(r"I(['’].*)?", re.sub(r"[^\w'’]", "", b[0])):
+        first = b[0][:1].lower() + b[0][1:]
+    else:
+        first = b[0]
+    if not joined:
+        last = a[-1]
+    return " ".join(a[:-1] + [last]), " ".join([first] + b[1:])
+
+
+def _join_field():
+    """Which version of each stretch is pasted: cleaned in clean mode, raw
+    when rewriting is off, and none for modes that rewrite the whole text."""
+    return {"clean": 1, "off": 0}.get(settings["rewrite"])
+
+
+def join_parts(parts, tail, cleaned):
+    """The streamed stretches and the final one, in order."""
+    pieces = [(c or t) if cleaned else t for t, c in parts] + [tail]
+    return " ".join(p for p in pieces if p)
+
+
 def run_job(audio, generation, spans, released, t0, session=None):
     """Transcribe, optionally rewrite, and paste one recording.
 
@@ -2216,6 +2418,13 @@ def run_job(audio, generation, spans, released, t0, session=None):
     # Taken now, not awaited: a window that has not answered yet is skipped
     screen = session.take_screen_terms() if session is not None else ()
     instruction = None
+    # Streamed stretches only stand when nothing was said as an instruction;
+    # otherwise the whole recording goes through the instruction path below
+    parts = session.parts if session is not None and session.parts and not spans else []
+    if parts:
+        log(f"streamed {len(parts)} stretches while recording; "
+            f"{(len(audio) - session.done_frames) / SAMPLE_RATE:.1f}s left at release")
+        audio = audio[session.done_frames:]
     message_audio, instruction_audio = split_audio(audio, spans)
     if instruction_audio is not None:
         if len(instruction_audio) < SAMPLE_RATE * MIN_SECONDS:
@@ -2233,7 +2442,7 @@ def run_job(audio, generation, spans, released, t0, session=None):
                 log("instruction was empty — pasting the dictation as-is")
     # Shift pressed a moment after the hotkey leaves a sliver of message
     # audio before the instruction; there is nothing in it to transcribe
-    if instruction and len(audio) < SAMPLE_RATE * MIN_SECONDS:
+    if (instruction or parts) and len(audio) < SAMPLE_RATE * MIN_SECONDS:
         text = ""
     else:
         text = transcribe(audio, screen=screen)
@@ -2244,8 +2453,10 @@ def run_job(audio, generation, spans, released, t0, session=None):
         return
     if looks_hallucinated(text):
         log(f"dropped: transcription looks like a repetition loop ({len(text.split())} words)")
-        AppHelper.callAfter(overlay.hide)
-        return
+        if not parts:
+            AppHelper.callAfter(overlay.hide)
+            return
+        text = ""  # only the last stretch; the streamed ones were checked as they came
     if instruction and not text.strip():
         # Only an instruction was spoken, so it is about text already written
         edit_selection(instruction, generation, released, t0)
@@ -2256,6 +2467,29 @@ def run_job(audio, generation, spans, released, t0, session=None):
         # said what they want, which is more specific than a saved setting.
         AppHelper.callAfter(overlay.setPhase_, "rewriting")
         text = rewrite_with_instruction(text, instruction) or text
+        if generation != job_generation:
+            last_inference = time.monotonic()
+            log("cancelled during rewriting — nothing pasted")
+            return
+    elif parts:
+        # Each streamed stretch was cleaned as it came; only the last is left
+        if mode == "clean" and text:
+            AppHelper.callAfter(overlay.setPhase_, "rewriting")
+            text = rewrite(text, "clean") or text
+        field = _join_field()
+        if field is not None and text:
+            last = list(parts[-1])
+            if last[field]:
+                last[field], text = repair_join(last[field], text)
+                parts = [*parts[:-1], tuple(last)]
+        if mode == "clean":
+            text = join_parts(parts, text, cleaned=True)
+        else:
+            text = join_parts(parts, text, cleaned=False)
+            if text and mode != "off":
+                # Other modes shape the whole text, so they run once at the end
+                AppHelper.callAfter(overlay.setPhase_, "rewriting")
+                text = rewrite(text, mode) or text
         if generation != job_generation:
             last_inference = time.monotonic()
             log("cancelled during rewriting — nothing pasted")
@@ -2357,6 +2591,15 @@ def worker():
             except Exception as e:  # noqa: BLE001
                 log(f"warmup failed (harmless): {e!r}")
             last_inference = time.monotonic()
+            continue
+        if job[0] is STREAM:
+            _, session, generation = job
+            try:
+                stream_chunk(session, generation)
+            except Exception as e:  # noqa: BLE001
+                # The final job then transcribes whatever wasn't streamed
+                session.streaming = False
+                log(f"streaming failed: {e!r} — finishing the recording at release")
             continue
         # The sole worker must outlive any single bad job, or dictation dies
         # silently while the UI still shows ready
