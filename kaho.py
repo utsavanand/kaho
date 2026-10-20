@@ -108,6 +108,19 @@ def instruction_keys():
     return {keycode: mask, LEFT_SHIFT[0]: LEFT_SHIFT[1]}
 
 
+def instruction_held():
+    """Whether an instruction key is down right now.
+
+    Shift pressed a moment before the hotkey sends no flags-changed event
+    once recording has started, so it went unnoticed and the instruction was
+    dictated into the message. Most likely when editing a selection, where
+    both keys go down together. The HID state carries the device-specific
+    bits that tell left Shift from right.
+    """
+    flags = int(Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState))
+    return bool(flags & sum(instruction_keys().values()))
+
+
 def instruction_label():
     name = INSTRUCTION_FALLBACK
     if settings["hotkey"] == name:
@@ -1329,6 +1342,9 @@ def start_recording():
     if settings["screen_words"]:
         start_screen_read(recording)
     overlay.show()
+    if instruction_held():
+        recording.mark_instruction(True)
+        overlay.setPhase_("instructing")
     # Fire a warmup while the user is still speaking: the page-in of idle
     # model weights overlaps the recording instead of delaying the paste.
     # Same queue as real jobs, so it can never race the model.
