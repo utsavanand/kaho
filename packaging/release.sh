@@ -12,17 +12,35 @@
 #   3. xcrun notarytool store-credentials kaho-fresh \
 #        --apple-id "you@example.com" --team-id "TEAMID" --password "app-specific-password"
 #
-# Then:  ./packaging/release.sh 2.0.0
-#        ./packaging/release.sh 2.0.0 --build-only   # stop after the bundle checks, unsigned
-#        ./packaging/release.sh 2.0.0 --zip          # notarize and ship a zip, no DMG
+# Then:  ./packaging/release.sh 2.0.0              # the zip, then the DMG (same as --dmg)
+#        ./packaging/release.sh 2.0.0 --publish    # ...and the GitHub release
+#        ./packaging/release.sh 2.0.0 --zip        # notarize and ship a zip, no DMG
+#        ./packaging/release.sh 2.0.0 --build-only # stop after the bundle checks, unsigned
 
 set -euo pipefail
 
 VERSION="${1:-}"
-[[ -n "$VERSION" ]] || { echo "usage: $0 <version> [--build-only|--zip]   e.g. $0 2.0.0"; exit 1; }
-BUILD_ONLY="${2:-}"
+[[ -n "$VERSION" ]] || {
+    echo "usage: $0 <version> [--dmg|--zip|--build-only] [--publish]   e.g. $0 2.0.0"
+    exit 1
+}
+shift
+MODE="dmg"
+PUBLISH=""
+for arg in "$@"; do
+    case "$arg" in
+        --dmg|--zip|--build-only) MODE="${arg#--}" ;;
+        --publish) PUBLISH=1 ;;
+        *) echo "unknown option: $arg"; exit 1 ;;
+    esac
+done
+if [[ -n "$PUBLISH" && "$MODE" != dmg ]]; then
+    echo "--publish uploads the DMG and the zip, so it can't go with --$MODE"
+    exit 1
+fi
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="utsavanand/kaho"
 BUILD="$SRC/build-release"
 VENV="$SRC/build-venv"
 # The interpreter is bundled, so it sets the oldest macOS the app runs on.
@@ -47,7 +65,7 @@ IDENTITY="$(security find-identity -v -p codesigning \
     | { grep "Developer ID Application" || true; } \
     | head -1 \
     | sed -E 's/.*"(.*)"/\1/')"
-if [[ -z "$IDENTITY" && "$BUILD_ONLY" != "--build-only" ]]; then
+if [[ -z "$IDENTITY" && "$MODE" != build-only ]]; then
     echo "No 'Developer ID Application' certificate found in the keychain."
     echo "Create one at developer.apple.com > Certificates, then double-click the .cer."
     exit 1
@@ -60,6 +78,35 @@ if [[ ! -x "$PYTHON_ORG" ]]; then
     echo "interpreter then refuses to load on anything older."
     echo "Install the macOS universal2 installer from https://www.python.org/downloads/macos/"
     exit 1
+fi
+
+# Everything --publish needs is checked now, not after an hour of building
+# and notarizing. The notes go outside $BUILD, which is wiped just below.
+if [[ -n "$PUBLISH" ]]; then
+    command -v gh >/dev/null || { echo "--publish needs the gh CLI"; exit 1; }
+    gh auth status >/dev/null 2>&1 || { echo "gh is not logged in: run gh auth login"; exit 1; }
+    if [[ -n "$(git -C "$SRC" status --porcelain --untracked-files=no)" ]]; then
+        echo "uncommitted changes: a published release has to be built from a commit"
+        exit 1
+    fi
+    SHA="$(git -C "$SRC" rev-parse HEAD)"
+    if ! gh api "repos/$REPO/commits/$SHA" --silent 2>/dev/null; then
+        echo "$SHA is not on GitHub yet: push it first"
+        exit 1
+    fi
+    if gh release view "v$VERSION" --repo "$REPO" >/dev/null 2>&1; then
+        echo "v$VERSION is already released"
+        exit 1
+    fi
+    CHANGES="$(awk -v v="$VERSION" '/^## / { if (found) exit; found = ($2 == v); next } found' "$SRC/CHANGELOG.md")"
+    [[ -n "${CHANGES//[[:space:]]/}" ]] || { echo "CHANGELOG.md has no section for $VERSION"; exit 1; }
+    NOTES="$(mktemp "${TMPDIR:-/tmp}/kaho-$VERSION-notes.XXXXXX")"
+    {
+        print -r -- "**Download \`Kaho-$VERSION.dmg\`**, open it, and drag Kaho to Applications. Requires macOS ${MIN_MACOS%%.*} or later on Apple Silicon. With Homebrew: \`brew upgrade --cask kaho\` (or \`brew install --cask utsavanand/kaho/kaho\`)."
+        print
+        print -r -- "$CHANGES"
+    } > "$NOTES"
+    echo "publishing $SHA as v$VERSION; release notes in $NOTES"
 fi
 
 # A fresh venv every release. PyInstaller bundles whatever is importable, not
@@ -105,7 +152,7 @@ if [[ -n "$TOO_NEW" ]]; then
     exit 1
 fi
 
-if [[ "$BUILD_ONLY" == "--build-only" ]]; then
+if [[ "$MODE" == build-only ]]; then
     echo "built and checked, unsigned: $APP"
     exit 0
 fi
@@ -190,43 +237,84 @@ await_notarization() {
     return 1
 }
 
-if [[ "${2:-}" == "--zip" ]]; then
-    # Apple held and then dropped every Kaho DMG submitted in October 2026,
-    # including one wrapping an app it had already notarized, while the same
-    # app as a zip cleared in minutes. The zip is the release when DMGs stall.
-    ZIP="$BUILD/Kaho-$VERSION.zip"
-    echo "==> notarizing the app as a zip"
-    rm -f "$ZIP"
-    ditto -c -k --keepParent "$APP" "$ZIP"
-    SUBMIT_OUT="$BUILD/notarytool-submit.txt"
-    xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" \
-        2>&1 | tee "$SUBMIT_OUT"
-    SUBMIT_ID="$(awk '/^  id:/ {print $2; exit}' "$SUBMIT_OUT")"
-    [[ -n "$SUBMIT_ID" ]] || { echo "no submission id; notarytool output is in $SUBMIT_OUT"; exit 1; }
-    echo "submission id: $SUBMIT_ID"
-    await_notarization "$SUBMIT_ID" || exit 1
-    echo "==> stapling"
-    xcrun stapler staple "$APP"
-    xcrun stapler validate "$APP"
-    # Re-zipped around the stapled app, so a first launch offline still
-    # passes Gatekeeper without an online check. Without extended attributes:
-    # ditto stores them as ._ entries, and Archive Utility, which can't put
-    # an xattr on a symlink, writes the ones for Python.framework's symlinks
-    # out as ._Python and ._Resources. Files in a framework's root break its
-    # seal, and Gatekeeper then says Apple could not verify Kaho.
-    rm -f "$ZIP"
-    ditto -c -k --norsrc --noextattr --noqtn --noacl --keepParent "$APP" "$ZIP"
-    if unzip -l "$ZIP" | grep -qE '/\._'; then
-        echo "the zip still carries ._ entries; Archive Utility would break the signature"
-        exit 1
+# Submit and wait separately. `submit --wait` died mid-wait when the script
+# ran detached, leaving an unstapled file that looked like a success.
+# Capturing the id first means the wait can be retried without re-uploading.
+#
+# The submission goes to a file rather than straight into $( ): notarytool has
+# twice been killed partway through while the script was backgrounded, and a
+# command substitution swallows whatever it had printed, so the id — and the
+# upload it represents — was lost even though Apple had accepted the bytes.
+notarize() {  # notarize $1, keeping notarytool's output in $2
+    local file="$1" out="$2" id=""
+    xcrun notarytool submit "$file" --keychain-profile "$NOTARY_PROFILE" \
+        2>&1 | tee "$out"
+    id="$(awk '/^  id:/ {print $2; exit}' "$out")"
+    if [[ -z "$id" ]]; then
+        echo ""
+        echo "No submission id. notarytool output is in $out."
+        echo "If the upload did complete, find the id with:"
+        echo "  xcrun notarytool history --keychain-profile $NOTARY_PROFILE"
+        echo "then resume without re-uploading:"
+        echo "  xcrun notarytool info <id> --keychain-profile $NOTARY_PROFILE"
+        echo "  xcrun stapler staple \"$file\""
+        return 1
     fi
-    spctl -a -t exec -vv "$APP"
+    echo "submission id: $id"
+    await_notarization "$id"
+}
+
+# Retried: stapler fetches the ticket from Apple, and stapling a notarized
+# DMG once failed on a dropped connection, leaving the release unstapled
+staple() {
+    local attempt
+    for attempt in 1 2 3; do
+        if xcrun stapler staple "$1" && xcrun stapler validate "$1"; then
+            return 0
+        fi
+        if (( attempt == 3 )); then
+            echo "stapling $1 failed 3 times; once Apple answers, run: xcrun stapler staple \"$1\""
+            return 1
+        fi
+        echo "stapling failed — retrying in 15s"
+        sleep 15
+    done
+}
+
+# Apple held and then dropped every Kaho DMG submitted in October 2026,
+# including one wrapping an app it had already notarized, while the same app
+# as a zip cleared in minutes. So the app is always notarized as a zip, and
+# the zip ships with every release; the DMG is built around the stapled app.
+ZIP="$BUILD/Kaho-$VERSION.zip"
+echo "==> notarizing the app as a zip"
+rm -f "$ZIP"
+ditto -c -k --keepParent "$APP" "$ZIP"
+notarize "$ZIP" "$BUILD/notarytool-submit.txt" || exit 1
+echo "==> stapling the app"
+staple "$APP" || exit 1
+# Re-zipped around the stapled app, so a first launch offline still
+# passes Gatekeeper without an online check. Without extended attributes:
+# ditto stores them as ._ entries, and Archive Utility, which can't put
+# an xattr on a symlink, writes the ones for Python.framework's symlinks
+# out as ._Python and ._Resources. Files in a framework's root break its
+# seal, and Gatekeeper then says Apple could not verify Kaho.
+rm -f "$ZIP"
+ditto -c -k --norsrc --noextattr --noqtn --noacl --keepParent "$APP" "$ZIP"
+if unzip -l "$ZIP" | grep -qE '/\._'; then
+    echo "the zip still carries ._ entries; Archive Utility would break the signature"
+    exit 1
+fi
+spctl -a -t exec -vv "$APP"
+
+if [[ "$MODE" == zip ]]; then
     echo ""
     echo "done: $ZIP"
     exit 0
 fi
 
-echo "==> packaging the dmg"
+echo "==> packaging the dmg around the stapled app"
+# The app already carries its ticket, so the installed Kaho.app passes
+# Gatekeeper offline too; the DMG gets its own ticket for the download.
 DMG="$BUILD/Kaho-$VERSION.dmg"
 STAGE="$BUILD/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE"
@@ -239,70 +327,59 @@ ln -s /Applications "$STAGE/Applications"   # drag-to-install target
 # cause. It happened to /Volumes/Sotto, then to /Volumes/Kaho Installer.
 VOLNAME="Kaho $VERSION"
 hdiutil detach "/Volumes/$VOLNAME" -force >/dev/null 2>&1 || true
-hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
-codesign --force --timestamp --sign "$IDENTITY" "$DMG"
-
-echo "==> notarizing (usually minutes; large uploads can take an hour)"
-# Submit and wait separately. `submit --wait` died mid-wait when the script
-# ran detached, leaving an unstapled DMG that looked like a success. Capturing
-# the id first means the wait can be retried without re-uploading 350+ MB.
-#
-# The submission goes to a file rather than straight into $( ): notarytool has
-# twice been killed partway through while the script was backgrounded, and a
-# command substitution swallows whatever it had printed, so the id — and the
-# upload it represents — was lost even though Apple had accepted the bytes.
-SUBMIT_OUT="$BUILD/notarytool-submit.txt"
-xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" \
-    2>&1 | tee "$SUBMIT_OUT"
-SUBMIT_ID="$(awk '/^  id:/ {print $2; exit}' "$SUBMIT_OUT")"
-if [[ -z "$SUBMIT_ID" ]]; then
-    echo ""
-    echo "No submission id. notarytool output is in $SUBMIT_OUT."
-    echo "If the upload did complete, find the id with:"
-    echo "  xcrun notarytool history --keychain-profile $NOTARY_PROFILE"
-    echo "then resume without re-uploading:"
-    echo "  xcrun notarytool info <id> --keychain-profile $NOTARY_PROFILE"
-    echo "  xcrun stapler staple \"$DMG\""
-    exit 1
-fi
-echo "submission id: $SUBMIT_ID"
-await_notarization "$SUBMIT_ID" || exit 1
-
-STATUS="$(xcrun notarytool info "$SUBMIT_ID" --keychain-profile "$NOTARY_PROFILE" \
-    | awk '/^  status:/ {print $2; exit}')"
-if [[ "$STATUS" != "Accepted" ]]; then
-    echo "notarization $STATUS — details:"
-    xcrun notarytool log "$SUBMIT_ID" --keychain-profile "$NOTARY_PROFILE"
-    exit 1
-fi
-
-echo "==> stapling"
-# Both the app and the DMG, and the app FIRST — then the image is rebuilt
-# around the stapled copy. Notarizing the DMG approves the app inside it too,
-# but the ticket only lands on whatever stapler is pointed at: shipping only
-# the DMG ticket leaves the installed Kaho.app relying on an online check,
-# so a first launch offline or behind a slow network stalls on Gatekeeper.
-xcrun stapler staple "$APP"
-xcrun stapler validate "$APP"
-
-rm -rf "$STAGE"; mkdir -p "$STAGE"
-cp -R "$APP" "$STAGE/"
-ln -s /Applications "$STAGE/Applications"
-hdiutil detach "/Volumes/$VOLNAME" -force >/dev/null 2>&1 || true
 rm -f "$DMG"
 hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
-# The rebuilt image is a new file, so it needs its own trip through the
-# notary service; the app inside already carries its ticket.
-xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" \
-    2>&1 | tee "$BUILD/notarytool-dmg.txt"
-DMG_ID="$(awk '/^  id:/ {print $2; exit}' "$BUILD/notarytool-dmg.txt")"
-[[ -n "$DMG_ID" ]] || { echo "no submission id for the rebuilt dmg"; exit 1; }
-await_notarization "$DMG_ID" || exit 1
-xcrun stapler staple "$DMG"
-xcrun stapler validate "$DMG"
+echo "==> notarizing the dmg (usually minutes; large uploads can take an hour)"
+notarize "$DMG" "$BUILD/notarytool-dmg.txt" || exit 1
+echo "==> stapling the dmg"
+staple "$DMG" || exit 1
+spctl -a -t open --context context:primary-signature -vv "$DMG"
 
-echo ""
-echo "done: $DMG"
-echo "verify a clean install with:  spctl -a -t open --context context:primary-signature -v \"$DMG\""
+if [[ -z "$PUBLISH" ]]; then
+    echo ""
+    echo "done: $DMG"
+    echo "      $ZIP"
+    exit 0
+fi
+
+echo "==> publishing v$VERSION"
+gh release create "v$VERSION" "$DMG" "$ZIP" --repo "$REPO" --target "$SHA" \
+    --title "Kaho $VERSION" --notes-file "$NOTES" --latest
+
+# Checked against the digest GitHub computed on upload, never by downloading
+# the assets back: every download counts in the release stats
+echo "==> checking the uploads"
+for asset in "$DMG" "$ZIP"; do
+    want="sha256:$(shasum -a 256 "$asset" | awk '{print $1}')"
+    got=""
+    for attempt in 1 2 3; do
+        got="$(gh api "repos/$REPO/releases/tags/v$VERSION" --jq '.assets[]|.name,.digest' \
+            | awk -v n="${asset:t}" 'prev == n {print} {prev = $0}')"  # no early exit: pipefail would see gh's SIGPIPE
+        [[ -n "$got" && "$got" != null ]] && break
+        sleep 5  # the digest can trail the upload by a moment
+    done
+    if [[ "$got" != "$want" ]]; then
+        echo "${asset:t}: GitHub has ${got:-no digest}, the local file is $want"
+        echo "the release is up but its upload doesn't match: delete it and publish again"
+        exit 1
+    fi
+    echo "${asset:t}: $want"
+done
+rm -f "$NOTES"
+
+DMG_SHA="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+cat <<EDITS
+
+Published: https://github.com/$REPO/releases/tag/v$VERSION
+
+Not pushed. Make these two edits by hand:
+
+utsavanand/homebrew-kaho, Casks/kaho.rb:
+  version "$VERSION"
+  sha256 "$DMG_SHA"
+
+utsavanand/my-digital-card, src/kaho-release.js:
+  export const version = "$VERSION";
+EDITS

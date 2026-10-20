@@ -18,9 +18,26 @@ Developer ID, notarizes with Apple, and staples the ticket. The result opens on
 a stock Mac with no Gatekeeper warning and no terminal.
 
 ```sh
-./packaging/release.sh 1.7.3
+./packaging/release.sh 1.7.3                # notarized zip, then the DMG around the stapled app
+./packaging/release.sh 1.7.3 --publish      # ...then the GitHub release
+./packaging/release.sh 1.7.3 --zip          # the notarized zip only
 ./packaging/release.sh 1.7.3 --build-only   # unsigned bundle + checks, no notarization
 ```
+
+The app is always notarized as a zip first: Apple held and dropped every
+DMG submitted in October 2026 while the same app as a zip cleared in
+minutes. The DMG (the default, also `--dmg`) is built around the stapled
+app, then signed, notarized, stapled (retried, since stapling has failed on
+a dropped connection) and checked with `spctl`.
+
+`--publish` checks before building that `gh` is logged in, the tree is
+clean, `HEAD` is on GitHub, the tag is unused and the CHANGELOG has a
+section for the version. After the build it runs `gh release create` for
+the DMG and the zip at that commit, with the CHANGELOG section as notes.
+The uploads are verified against the digest GitHub reports, not by
+downloading them, which would count in the stats. Finally it prints the
+Homebrew cask edit (version and DMG sha256) and the site's
+`src/kaho-release.js` version, for you to push by hand.
 
 ### Requires python.org Python 3.13, not Homebrew's
 
