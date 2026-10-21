@@ -1,0 +1,168 @@
+{
+ "terms": [
+  "Siobhan",
+  "Debezium",
+  "Kaho",
+  "Slack",
+  "Kubernetes",
+  "PostgreSQL",
+  "Abhimanyu",
+  "Grafana",
+  "Kafka",
+  "Whisper",
+  "Qwen3-ASR",
+  "MLX",
+  "Tadhg",
+  "PyInstaller",
+  "Nguyen",
+  "Hoa",
+  "Terraform",
+  "VPC"
+ ],
+ "items": [
+  {
+   "file": "libri/6930-75918-0000.flac",
+   "set": "libri",
+   "seconds": 3.5,
+   "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS",
+   "speaker": 6930
+  },
+  {
+   "file": "libri/8463-294828-0022.flac",
+   "set": "libri",
+   "seconds": 2.35,
+   "reference": "WE'RE LEAVING ON THE ABRAHAM LINCOLN",
+   "speaker": 8463
+  },
+  {
+   "file": "libri/1995-1826-0002.flac",
+   "set": "libri",
+   "seconds": 4.61,
+   "reference": "JOHN TAYLOR WHO HAD SUPPORTED HER THROUGH COLLEGE WAS INTERESTED IN COTTON",
+   "speaker": 1995
+  },
+  {
+   "file": "libri/5142-33396-0002.flac",
+   "set": "libri",
+   "seconds": 3.67,
+   "reference": "TWO HUNDRED WARRIORS FEASTED IN HIS HALL AND FOLLOWED HIM TO BATTLE",
+   "speaker": 5142
+  },
+  {
+   "file": "libri/2830-3980-0008.flac",
+   "set": "libri",
+   "seconds": 4.84,
+   "reference": "PAUL TAKES PRIDE IN HIS MINISTRY NOT TO HIS OWN PRAISE BUT TO THE PRAISE OF GOD",
+   "speaker": 2830
+  },
+  {
+   "file": "libri/4446-2275-0005.flac",
+   "set": "libri",
+   "seconds": 4.45,
+   "reference": "I FELT IT IN MY BONES WHEN I WOKE THIS MORNING THAT SOMETHING SPLENDID WAS GOING TO TURN UP",
+   "speaker": 4446
+  },
+  {
+   "file": "libri/5639-40744-0015.flac",
+   "set": "libri",
+   "seconds": 11.02,
+   "reference": "THIS PERSON WAS RODOLFO WHO THOUGH HE HAD GONE TO LOOK FOR HIS FRIENDS HAD CHANGED HIS MIND IN THAT RESPECT NOT THINKING IT ADVISABLE TO ACQUAINT THEM WITH WHAT HAD PASSED BETWEEN HIM AND THE GIRL",
+   "speaker": 5639
+  },
+  {
+   "file": "libri/7729-102255-0040.flac",
+   "set": "libri",
+   "seconds": 11.76,
+   "reference": "IN THIS INCIDENT CONTRASTING THE CREATIVE AND THE DESTRUCTIVE SPIRIT OF THE FACTIONS THE EMIGRANT AID SOCIETY OF MASSACHUSETTS FINDS ITS MOST HONORABLE AND TRIUMPHANT VINDICATION",
+   "speaker": 7729
+  },
+  {
+   "file": "libri/2094-142345-0001.flac",
+   "set": "libri",
+   "seconds": 8.03,
+   "reference": "BUT THE WINDOWS ARE PATCHED WITH WOODEN PANES AND THE DOOR I THINK IS LIKE THE GATE IT IS NEVER OPENED",
+   "speaker": 2094
+  },
+  {
+   "file": "libri/7127-75947-0027.flac",
+   "set": "libri",
+   "seconds": 8.09,
+   "reference": "TO SAY NOTHING SAID MONTALAIS SO THAT WHEN MADEMOISELLE DE TONNAY CHARENTE THINKS ATHENAIS IS THE ONLY ONE WHO KNOWS IT",
+   "speaker": 7127
+  },
+  {
+   "file": "jargon/jargon0.flac",
+   "set": "jargon",
+   "reference": "Thanks Siobhan, I'll check the Debezium connector after standup.",
+   "terms": [
+    "Siobhan",
+    "Debezium"
+   ]
+  },
+  {
+   "file": "jargon/jargon1.flac",
+   "set": "jargon",
+   "reference": "Kaho pastes the transcript straight into Slack.",
+   "terms": [
+    "Kaho",
+    "Slack"
+   ]
+  },
+  {
+   "file": "jargon/jargon2.flac",
+   "set": "jargon",
+   "reference": "Can you bump the Kubernetes node pool before Friday?",
+   "terms": [
+    "Kubernetes"
+   ]
+  },
+  {
+   "file": "jargon/jargon3.flac",
+   "set": "jargon",
+   "reference": "The PostgreSQL replica is lagging behind the primary again.",
+   "terms": [
+    "PostgreSQL"
+   ]
+  },
+  {
+   "file": "jargon/jargon4.flac",
+   "set": "jargon",
+   "reference": "Abhimanyu said the Grafana dashboard shows the Kafka lag dropping.",
+   "terms": [
+    "Abhimanyu",
+    "Grafana",
+    "Kafka"
+   ]
+  },
+  {
+   "file": "jargon/jargon5.flac",
+   "set": "jargon",
+   "reference": "We moved the speech model from Whisper to Qwen3-ASR on MLX.",
+   "terms": [
+    "Whisper",
+    "Qwen3-ASR",
+    "MLX"
+   ]
+  },
+  {
+   "file": "jargon/jargon6.flac",
+   "set": "jargon",
+   "reference": "Please ask Tadhg to rerun the PyInstaller build on Windows.",
+   "terms": [
+    "Tadhg",
+    "PyInstaller"
+   ]
+  },
+  {
+   "file": "jargon/jargon7.flac",
+   "set": "jargon",
+   "reference": "Nguyen Thi Hoa reviewed the Terraform change for the staging VPC.",
+   "terms": [
+    "Nguyen",
+    "Hoa",
+    "Terraform",
+    "VPC"
+   ]
+  }
+ ]
+}
