@@ -1,6 +1,6 @@
 # Kaho downloads
 
-**Outside downloads: 43** of 56 in total (all releases and files, updated 2026-10-24).
+**Outside downloads: 43** of 56 in total (all releases and files, updated 2026-10-25).
 
 Every download of a release file counts, including Homebrew installs and the website's Download button. **Ours** are downloads by the maintainers' own release checks, listed in [stats/internal.csv](stats/internal.csv); they are recorded from 2.4.0 on, so earlier releases show none. From 2.4.2, releases are verified against GitHub's published checksums instead of being downloaded.
 
