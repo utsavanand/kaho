@@ -2868,3 +2868,44 @@ class TestPillScreen(KahoTestCase):
         self.assertGreater(x, self.RIGHT[0])
         x = self.place_with(None, mouse=(300, 300))
         self.assertLess(x, self.RIGHT[0])
+
+
+class TestHotwordEcho(KahoTestCase):
+    """A clip with no speech in it can come back as the hint-word list."""
+
+    DICTIONARY = ("Kaho", "Sotto", "Duckterm", "Rubber Term", "Whisper", "MLX", "Qwen",
+                  "Claude", "Anthropic", "Homebrew", "PortAudio", "CoreAudio")
+    SCREEN = ("inbox", "release-dev", "duckterm-lite", "ui-dev", "main-dev", "Timeline")
+    # The shape pasted twice on Oct 21: the hint line, written out verbatim
+    ECHO = ", ".join((*DICTIONARY, *SCREEN)) + "."
+
+    def setUp(self):
+        super().setUp()
+        self.asr = self.enterContext(mock.patch.object(kaho, "asr", mock.MagicMock()))
+        self.enterContext(mock.patch.object(kaho, "read_dictionary",
+                                            return_value=list(self.DICTIONARY)))
+
+    def test_a_transcript_that_is_the_hint_list_is_dropped(self):
+        self.asr.generate.return_value.text = self.ECHO
+        self.assertEqual(kaho.transcribe(REAL_NUMPY.zeros(100) if HAVE_NUMPY else None,
+                                         screen=self.SCREEN), "")
+        self.assertTrue(any("hint words" in m for m in self.logged))
+
+    def test_speech_that_names_several_hint_words_is_kept(self):
+        for said in ("Please add Kaho, Sotto, Duckterm, Whisper, and MLX to the doc.",
+                     "Kaho, Sotto and Duckterm all need the new icon.",
+                     ("We compared Whisper, Qwen, MLX, PortAudio, CoreAudio and Homebrew builds "
+                      "last week and the Qwen one won.")):
+            self.asr.generate.return_value.text = said
+            self.assertNotEqual(kaho.transcribe(None, screen=self.SCREEN), "", said)
+
+    def test_a_short_list_of_hint_words_is_not_an_echo(self):
+        # Someone can say three product names in a row
+        self.assertFalse(kaho.echoes_hotwords("Kaho, Sotto, Duckterm.", self.DICTIONARY))
+
+    def test_a_spoken_list_of_hint_words_is_kept(self):
+        said = "Whisper, Qwen, MLX, PortAudio, CoreAudio."
+        self.assertFalse(kaho.echoes_hotwords(said, [*self.DICTIONARY, *self.SCREEN]))
+
+    def test_an_echo_of_only_the_screen_words_is_caught_too(self):
+        self.assertTrue(kaho.echoes_hotwords(", ".join(self.SCREEN), [*self.DICTIONARY, *self.SCREEN]))

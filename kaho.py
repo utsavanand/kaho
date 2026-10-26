@@ -1835,7 +1835,28 @@ def transcribe(audio, use_dictionary=True, screen=()):
         # None lets the model detect; it takes the language's name, not its code
         language=None if settings["language"] == "auto" else LANGUAGES[settings["language"]],
     ).text.strip()
+    if echoes_hotwords(text, hotwords):
+        log(f"dropped: the model wrote out its hint words instead of speech ({len(text.split())} words)")
+        return ""
     return respell(text, terms)
+
+
+def echoes_hotwords(text, hotwords):
+    """True when the transcript is the hint-word list rather than speech.
+
+    The hint words reach the model as one comma-separated line in its
+    prompt. Given a short clip with no speech in it (a stray tap, a breath,
+    a key click), it transcribes that line: twice on Oct 21 a 0.9 s
+    recording pasted the dictionary and the on-screen words. Speech that
+    names a few of them ("add Kaho, Sotto and MLX") still has words of its
+    own between the commas, and a spoken list of them is in the speaker's
+    order rather than the prompt's.
+    """
+    position = {w.lower(): n for n, w in enumerate(hotwords)}
+    items = [i.strip(" .").lower() for i in text.split(",") if i.strip(" .")]
+    order = [position[i] for i in items if i in position]
+    return (len(order) >= 5 and len(order) >= 0.7 * len(items)
+            and order == sorted(order))
 
 
 def ensure_rewriter():
