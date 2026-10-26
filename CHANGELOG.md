@@ -1,4 +1,14 @@
 # Changelog
+## 2.4.6 — 2026-10-25
+
+- A stray tap no longer pastes your dictionary. Your dictionary and the
+  words Kaho reads off the screen reach the speech model as one list of
+  hints, and on a short recording with no speech in it (a quick tap, a
+  breath) the model sometimes wrote that list out instead, so a run of
+  names like "Kaho, Sotto, Duckterm, ui-dev, main-dev…" was pasted. Kaho
+  now recognises the list and pastes nothing. Sentences that mention
+  those words, and lists of them you say yourself, still paste.
+
 ## 2.4.5 — 2026-10-20
 
 - See your words while a long dictation is still going. Once Kaho starts
