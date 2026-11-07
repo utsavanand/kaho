@@ -1,6 +1,6 @@
 # Kaho downloads
 
-**Outside downloads: 45** of 58 in total (all releases and files, updated 2026-11-06).
+**Outside downloads: 47** of 60 in total (all releases and files, updated 2026-11-07).
 
 Every download of a release file counts, including Homebrew installs and the website's Download button. **Ours** are downloads by the maintainers' own release checks, listed in [stats/internal.csv](stats/internal.csv); they are recorded from 2.4.0 on, so earlier releases show none. From 2.4.2, releases are verified against GitHub's published checksums instead of being downloaded.
 
@@ -8,11 +8,11 @@ Every download of a release file counts, including Homebrew installs and the web
 
 | Release | File | Published | Downloads | Ours | Outside |
 |---|---|---|---:|---:|---:|
-| v2.4.6 | Kaho-2.4.6.dmg | 2026-10-26 | 1 | 0 | 1 |
+| v2.4.6 | Kaho-2.4.6.dmg | 2026-10-26 | 2 | 0 | 2 |
 | v2.4.6 | Kaho-2.4.6.zip | 2026-10-26 | 0 | 0 | 0 |
 | v2.4.3 | Kaho-2.4.3.dmg | 2026-10-20 | 2 | 2 | 0 |
 | v2.4.3 | Kaho-2.4.3.zip | 2026-10-20 | 1 | 1 | 0 |
-| v2.4.5 | Kaho-2.4.5.dmg | 2026-10-20 | 4 | 0 | 4 |
+| v2.4.5 | Kaho-2.4.5.dmg | 2026-10-20 | 5 | 0 | 5 |
 | v2.4.5 | Kaho-2.4.5.zip | 2026-10-20 | 1 | 0 | 1 |
 | v2.4.4 | Kaho-2.4.4.dmg | 2026-10-20 | 1 | 0 | 1 |
 | v2.4.4 | Kaho-2.4.4.zip | 2026-10-20 | 1 | 0 | 1 |
@@ -36,6 +36,8 @@ Snapshots run daily at 06:15 UTC, so a download counts toward the next snapshot.
 
 | Day | File | New |
 |---|---|---:|
+| 2026-11-07 | Kaho-2.4.5.dmg | 1 |
+| 2026-11-07 | Kaho-2.4.6.dmg | 1 |
 | 2026-11-06 | Kaho-2.4.5.dmg | 1 |
 | 2026-10-29 | Kaho-2.4.6.dmg | 1 |
 | 2026-10-23 | Kaho-2.4.5.dmg | 2 |
