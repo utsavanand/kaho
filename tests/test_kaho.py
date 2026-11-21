@@ -147,6 +147,7 @@ class KahoTestCase(unittest.TestCase):
             ("locked", False),
             ("press_time", 0.0),
             ("last_tap", 0.0),
+            ("format_tap_start", None),
             ("lock_time", 0.0),
             ("stream", None),
             ("record_buf", None),
@@ -2909,3 +2910,123 @@ class TestHotwordEcho(KahoTestCase):
 
     def test_an_echo_of_only_the_screen_words_is_caught_too(self):
         self.assertTrue(kaho.echoes_hotwords(", ".join(self.SCREEN), [*self.DICTIONARY, *self.SCREEN]))
+
+
+class TestFormatTap(KahoTestCase):
+    """Select text, then tap right Shift on its own to format it."""
+
+    def setUp(self):
+        super().setUp()
+        kaho.overlay.is_working.return_value = False
+        self.code, self.mask = kaho.format_key()
+
+    def press(self, flags=0):
+        kaho.handle_flags_changed(FakeEvent(self.code, self.mask | flags))
+
+    def release(self, flags=0):
+        kaho.handle_flags_changed(FakeEvent(self.code, flags))
+
+    def tap(self, hold=0.1):
+        self.press()
+        self.clock.advance(hold)
+        self.release()
+
+    def queued(self):
+        out = []
+        while not kaho.jobs.empty():
+            out.append(kaho.jobs.get())
+        return [j for j in out if j[0] is kaho.FORMAT]
+
+    def test_a_tap_queues_a_format(self):
+        self.tap()
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(kaho.state, "ready", "a format tap must not start recording")
+
+    def test_the_key_is_right_shift_unless_that_is_the_hotkey(self):
+        self.assertEqual(kaho.format_key(), kaho.HOTKEYS["right_shift"][:2])
+        kaho.settings["hotkey"] = "right_shift"
+        self.assertEqual(kaho.format_key(), kaho.HOTKEYS["right_command"][:2])
+
+    def test_a_long_press_is_not_a_tap(self):
+        self.tap(hold=kaho.TAP_MAX_SECONDS + 0.1)
+        self.assertEqual(self.queued(), [])
+
+    def test_shift_used_for_a_capital_letter_is_not_a_tap(self):
+        self.press()
+        kaho.handle_key_down(FakeEvent(0, self.mask))  # "A"
+        self.release()
+        self.assertEqual(self.queued(), [])
+
+    def test_a_shift_click_is_not_a_tap(self):
+        self.press()
+        kaho.interrupt_format_tap(object())
+        self.release()
+        self.assertEqual(self.queued(), [])
+
+    def test_with_another_modifier_held_it_is_a_shortcut_not_a_tap(self):
+        command = kaho.HOTKEYS["right_command"][1]
+        self.press(flags=command)
+        self.release(flags=command)
+        self.assertEqual(self.queued(), [])
+
+    def test_another_modifier_pressed_during_the_tap_cancels_it(self):
+        self.press()
+        kaho.handle_flags_changed(FakeEvent(58, 0x0020 | self.mask))  # left Option
+        self.release()
+        self.assertEqual(self.queued(), [])
+
+    def test_nothing_happens_while_a_dictation_is_in_flight(self):
+        kaho.overlay.is_working.return_value = True
+        self.tap()
+        self.assertEqual(self.queued(), [])
+
+    def test_shift_pressed_just_before_the_hotkey_still_starts_a_dictation(self):
+        self.press()
+        self.down()
+        self.assertEqual(kaho.state, "recording")
+        self.release()
+        self.assertEqual(self.queued(), [])
+
+    def test_shift_during_a_recording_is_still_an_instruction(self):
+        self.down()
+        self.run_audio_ops()
+        self.press()
+        kaho.overlay.setPhase_.assert_called_with("instructing")
+
+    def run_format(self, selected="raw text", rewritten="Formatted text."):
+        with mock.patch.object(kaho, "read_selection", return_value=selected), \
+             mock.patch.object(kaho, "rewrite", return_value=rewritten) as rw, \
+             mock.patch.object(kaho, "paste") as paste, \
+             mock.patch.object(kaho, "append_history"), \
+             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
+            kaho.format_selection(kaho.job_generation, None, self.clock.now)
+        return rw, paste
+
+    def test_it_rewrites_the_selection_in_the_chosen_style(self):
+        kaho.settings["rewrite"] = "caveman"
+        rw, paste = self.run_format()
+        rw.assert_called_once_with("raw text", "caveman")
+        paste.assert_called_once_with("Formatted text.")
+
+    def test_with_format_off_it_structures_the_text(self):
+        rw, _ = self.run_format()
+        rw.assert_called_once_with("raw text", "structured")
+
+    def test_with_nothing_selected_it_does_nothing_quietly(self):
+        rw, paste = self.run_format(selected=None)
+        rw.assert_not_called()
+        paste.assert_not_called()
+        kaho.overlay.showProblem_.assert_not_called()
+
+    def test_text_that_needs_no_change_is_left_alone(self):
+        _, paste = self.run_format(rewritten=None)
+        paste.assert_not_called()
+        kaho.AppHelper.callAfter.assert_any_call(kaho.overlay.showProblem_, "Left as it was")
+
+    def test_escape_during_formatting_leaves_the_selection(self):
+        with mock.patch.object(kaho, "read_selection", return_value="raw text"), \
+             mock.patch.object(kaho, "rewrite", return_value="Formatted."), \
+             mock.patch.object(kaho, "paste") as paste:
+            kaho.format_selection(kaho.job_generation - 1, None, self.clock.now)
+        paste.assert_not_called()
+

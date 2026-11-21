@@ -78,6 +78,12 @@ log, and one-click bug reports:
   selection still replaces it with what you dictate. Kaho reads the selection
   through Accessibility, and in apps that don't expose it (some terminals and
   web apps) copies it with ⌘C and puts your clipboard back.
+- **Format text you've already written** — select it and tap right Shift on
+  its own. Kaho rewrites the selection in the style chosen under **Format**
+  (Clean up, Structured or Caveman; Structured when Format is Off) and
+  pastes over it. Only a clean tap counts: Shift held for a capital, used
+  with another key, or held while clicking to extend a selection does
+  nothing. If right Shift is your hotkey, tap right Command instead.
 - **Rewrite model** — on this Mac by default. You can point the rewrite step
   at OpenAI, Anthropic, or any OpenAI-compatible endpoint (Groq, OpenRouter,
   a local Ollama) with your own key, which is worth it for "turn this ramble

@@ -1,4 +1,12 @@
 # Changelog
+## Unreleased
+
+- Format text you've already written: select it and tap right Shift on
+  its own. Kaho rewrites the selection in your Format style (Structured
+  when Format is Off) and pastes over it. A Shift used for a capital
+  letter, a shortcut or a Shift-click never triggers it, and with nothing
+  selected a tap does nothing.
+
 ## 2.4.6 — 2026-10-25
 
 - A stray tap no longer pastes your dictionary. Your dictionary and the
