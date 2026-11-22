@@ -1,5 +1,5 @@
 # Changelog
-## Unreleased
+## 2.4.8 — 2026-11-22
 
 - Hold right Shift to edit a selection by voice. Replaces the 2.4.7 tap,
   which formatted the selection without asking how. Select text, hold
