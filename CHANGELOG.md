@@ -1,5 +1,5 @@
 # Changelog
-## Unreleased
+## 2.4.7 — 2026-11-21
 
 - Format text you've already written: select it and tap right Shift on
   its own. Kaho rewrites the selection in your Format style (Structured
