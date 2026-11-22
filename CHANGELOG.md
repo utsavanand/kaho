@@ -1,4 +1,15 @@
 # Changelog
+## Unreleased
+
+- Hold right Shift to edit a selection by voice. Replaces the 2.4.7 tap,
+  which formatted the selection without asking how. Select text, hold
+  right Shift on its own and say what to change; let go and Kaho rewrites
+  the selection. A Shift used for a capital, Shift-arrow or Shift-click
+  never opens the mic.
+- When the selected text can't be edited (a sent message, terminal
+  output), the edit is put on the clipboard and the pill says so, instead
+  of a paste that silently did nothing.
+
 ## 2.4.7 — 2026-11-21
 
 - Format text you've already written: select it and tap right Shift on

@@ -147,7 +147,8 @@ class KahoTestCase(unittest.TestCase):
             ("locked", False),
             ("press_time", 0.0),
             ("last_tap", 0.0),
-            ("format_tap_start", None),
+            ("edit_hold_timer", None),
+            ("edit_recording", False),
             ("lock_time", 0.0),
             ("stream", None),
             ("record_buf", None),
@@ -2313,6 +2314,10 @@ if __name__ == "__main__":
 class TestEditSelection(KahoTestCase):
     """Select text, then hold Shift for the whole dictation to say how to change it."""
 
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(kaho, "selection_read_only", return_value=False))
+
     def run_instruction_only(self, transcripts, selected="draft text"):
         """A two-second recording whose last 1.9 s were spoken with Shift held."""
         with mock.patch.object(kaho, "transcribe", side_effect=transcripts), \
@@ -2404,6 +2409,25 @@ class TestReadSelection(KahoTestCase):
         self.answers("")
         self.assertIsNone(kaho.read_selection())
         self.copy.assert_not_called()
+
+
+class TestSelectionReadOnly(KahoTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ax = self.enterContext(mock.patch.object(kaho, "ApplicationServices"))
+        self.ax.AXUIElementCopyAttributeValue.return_value = (0, object())
+
+    def test_a_text_field_is_editable(self):
+        self.ax.AXUIElementIsAttributeSettable.return_value = (0, True)
+        self.assertFalse(kaho.selection_read_only())
+
+    def test_scrollback_or_a_sent_message_is_read_only(self):
+        self.ax.AXUIElementIsAttributeSettable.return_value = (0, False)
+        self.assertTrue(kaho.selection_read_only())
+
+    def test_an_app_that_cannot_say_is_pasted_into_as_before(self):
+        self.ax.AXUIElementIsAttributeSettable.return_value = (-25205, False)
+        self.assertFalse(kaho.selection_read_only())
 
 
 class TestCopySelection(KahoTestCase):
@@ -2912,121 +2936,136 @@ class TestHotwordEcho(KahoTestCase):
         self.assertTrue(kaho.echoes_hotwords(", ".join(self.SCREEN), [*self.DICTIONARY, *self.SCREEN]))
 
 
-class TestFormatTap(KahoTestCase):
-    """Select text, then tap right Shift on its own to format it."""
+class TestEditKey(KahoTestCase):
+    """Select text, hold right Shift alone and say how to change it."""
 
     def setUp(self):
         super().setUp()
         kaho.overlay.is_working.return_value = False
-        self.code, self.mask = kaho.format_key()
+        self.code, self.mask = kaho.edit_key()
+        self.selected = self.enterContext(
+            mock.patch.object(kaho, "ax_selected_text", return_value="draft text"))
+        kaho.AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_.reset_mock()
 
     def press(self, flags=0):
         kaho.handle_flags_changed(FakeEvent(self.code, self.mask | flags))
 
-    def release(self, flags=0):
-        kaho.handle_flags_changed(FakeEvent(self.code, flags))
+    def release(self):
+        kaho.handle_flags_changed(FakeEvent(self.code, 0))
 
-    def tap(self, hold=0.1):
+    def hold_timer(self):
+        calls = kaho.AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_.call_args_list
+        self.assertTrue(calls, "holding the key scheduled nothing")
+        interval, _, block = calls[-1][0]
+        self.assertEqual(interval, kaho.EDIT_HOLD_SECONDS)
+        return block
+
+    def hold(self):
         self.press()
-        self.clock.advance(hold)
-        self.release()
-
-    def queued(self):
-        out = []
-        while not kaho.jobs.empty():
-            out.append(kaho.jobs.get())
-        return [j for j in out if j[0] is kaho.FORMAT]
-
-    def test_a_tap_queues_a_format(self):
-        self.tap()
-        self.assertEqual(len(self.queued()), 1)
-        self.assertEqual(kaho.state, "ready", "a format tap must not start recording")
+        self.hold_timer()(None)
 
     def test_the_key_is_right_shift_unless_that_is_the_hotkey(self):
-        self.assertEqual(kaho.format_key(), kaho.HOTKEYS["right_shift"][:2])
+        self.assertEqual(kaho.edit_key(), kaho.HOTKEYS["right_shift"][:2])
         kaho.settings["hotkey"] = "right_shift"
-        self.assertEqual(kaho.format_key(), kaho.HOTKEYS["right_command"][:2])
+        self.assertEqual(kaho.edit_key(), kaho.HOTKEYS["right_command"][:2])
 
-    def test_a_long_press_is_not_a_tap(self):
-        self.tap(hold=kaho.TAP_MAX_SECONDS + 0.1)
-        self.assertEqual(self.queued(), [])
+    def test_pressing_it_does_not_open_the_mic_straight_away(self):
+        self.press()
+        self.assertEqual(kaho.state, "ready")
 
-    def test_shift_used_for_a_capital_letter_is_not_a_tap(self):
+    def test_holding_it_records_an_instruction(self):
+        self.hold()
+        self.assertEqual(kaho.state, "recording")
+        self.assertEqual(kaho.recording.spans, [[0, None]])
+        kaho.overlay.setPhase_.assert_called_with("instructing")
+
+    def test_releasing_it_ends_the_recording(self):
+        self.hold()
+        self.run_audio_ops()
+        self.release()
+        self.assertEqual(kaho.state, "ready")
+
+    def test_the_whole_recording_is_the_instruction(self):
+        self.hold()
+        self.run_audio_ops()
+        kaho.record_buf.append(REAL_NUMPY.full((kaho.SAMPLE_RATE, 1), 0.5, dtype="float32"))
+        self.clock.advance(1.0)
+        self.release()
+        self.run_audio_ops()
+        _, _, spans, _, _ = kaho.jobs.get()
+        self.assertEqual(spans, [[0, kaho.SAMPLE_RATE]])
+
+    def test_a_tap_does_nothing(self):
+        self.press()
+        self.release()
+        kaho.AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_.return_value \
+            .invalidate.assert_called()
+
+    def test_with_nothing_selected_holding_it_does_nothing(self):
+        self.selected.return_value = ""
+        self.hold()
+        self.assertEqual(kaho.state, "ready")
+
+    def test_an_app_that_cannot_report_its_selection_still_gets_the_edit(self):
+        self.selected.return_value = None
+        self.hold()
+        self.assertEqual(kaho.state, "recording")
+
+    def test_shift_for_a_capital_letter_never_opens_the_mic(self):
         self.press()
         kaho.handle_key_down(FakeEvent(0, self.mask))  # "A"
-        self.release()
-        self.assertEqual(self.queued(), [])
+        kaho.AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_.return_value \
+            .invalidate.assert_called()
 
-    def test_a_shift_click_is_not_a_tap(self):
-        self.press()
-        kaho.interrupt_format_tap(object())
-        self.release()
-        self.assertEqual(self.queued(), [])
+    def test_a_key_pressed_after_the_mic_opened_cancels_it(self):
+        # Shift held, then arrow keys to extend the selection
+        self.hold()
+        self.run_audio_ops()
+        kaho.handle_key_down(FakeEvent(124, self.mask))
+        self.assertEqual(kaho.state, "ready")
+        self.assertTrue(kaho.recording.cancelled)
 
-    def test_with_another_modifier_held_it_is_a_shortcut_not_a_tap(self):
-        command = kaho.HOTKEYS["right_command"][1]
-        self.press(flags=command)
-        self.release(flags=command)
-        self.assertEqual(self.queued(), [])
+    def test_a_shift_click_cancels_it(self):
+        self.hold()
+        self.run_audio_ops()
+        kaho.interrupt_edit_key(object())
+        self.assertEqual(kaho.state, "ready")
 
-    def test_another_modifier_pressed_during_the_tap_cancels_it(self):
-        self.press()
-        kaho.handle_flags_changed(FakeEvent(58, 0x0020 | self.mask))  # left Option
-        self.release()
-        self.assertEqual(self.queued(), [])
+    def test_with_another_modifier_held_it_is_a_shortcut(self):
+        self.press(flags=kaho.HOTKEYS["right_command"][1])
+        kaho.AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_.assert_not_called()
 
-    def test_nothing_happens_while_a_dictation_is_in_flight(self):
+    def test_nothing_starts_while_a_dictation_is_in_flight(self):
         kaho.overlay.is_working.return_value = True
-        self.tap()
-        self.assertEqual(self.queued(), [])
+        self.press()
+        kaho.AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_.assert_not_called()
 
     def test_shift_pressed_just_before_the_hotkey_still_starts_a_dictation(self):
         self.press()
         self.down()
         self.assertEqual(kaho.state, "recording")
-        self.release()
-        self.assertEqual(self.queued(), [])
+        self.assertFalse(kaho.edit_recording)
 
-    def test_shift_during_a_recording_is_still_an_instruction(self):
+    def test_shift_during_a_dictation_is_still_an_instruction(self):
         self.down()
         self.run_audio_ops()
         self.press()
         kaho.overlay.setPhase_.assert_called_with("instructing")
+        self.release()
+        self.assertEqual(kaho.state, "recording", "releasing it must not end a dictation")
 
-    def run_format(self, selected="raw text", rewritten="Formatted text."):
-        with mock.patch.object(kaho, "read_selection", return_value=selected), \
-             mock.patch.object(kaho, "rewrite", return_value=rewritten) as rw, \
+
+@unittest.skipUnless(HAVE_NUMPY, "run_job splits real audio buffers")
+class TestReadOnlySelection(KahoTestCase):
+    def test_an_edit_of_read_only_text_goes_to_the_clipboard(self):
+        with mock.patch.object(kaho, "read_selection", return_value="sent message"), \
+             mock.patch.object(kaho, "rewrite_with_instruction", return_value="Edited."), \
+             mock.patch.object(kaho, "selection_read_only", return_value=True), \
+             mock.patch.object(kaho, "set_clipboard") as clip, \
              mock.patch.object(kaho, "paste") as paste, \
-             mock.patch.object(kaho, "append_history"), \
-             mock.patch.object(kaho, "paste_blocked_reason", return_value=None):
-            kaho.format_selection(kaho.job_generation, None, self.clock.now)
-        return rw, paste
-
-    def test_it_rewrites_the_selection_in_the_chosen_style(self):
-        kaho.settings["rewrite"] = "caveman"
-        rw, paste = self.run_format()
-        rw.assert_called_once_with("raw text", "caveman")
-        paste.assert_called_once_with("Formatted text.")
-
-    def test_with_format_off_it_structures_the_text(self):
-        rw, _ = self.run_format()
-        rw.assert_called_once_with("raw text", "structured")
-
-    def test_with_nothing_selected_it_does_nothing_quietly(self):
-        rw, paste = self.run_format(selected=None)
-        rw.assert_not_called()
+             mock.patch.object(kaho, "append_history"):
+            kaho.edit_selection("make it formal", kaho.job_generation, None, self.clock.now)
         paste.assert_not_called()
-        kaho.overlay.showProblem_.assert_not_called()
-
-    def test_text_that_needs_no_change_is_left_alone(self):
-        _, paste = self.run_format(rewritten=None)
-        paste.assert_not_called()
-        kaho.AppHelper.callAfter.assert_any_call(kaho.overlay.showProblem_, "Left as it was")
-
-    def test_escape_during_formatting_leaves_the_selection(self):
-        with mock.patch.object(kaho, "read_selection", return_value="raw text"), \
-             mock.patch.object(kaho, "rewrite", return_value="Formatted."), \
-             mock.patch.object(kaho, "paste") as paste:
-            kaho.format_selection(kaho.job_generation - 1, None, self.clock.now)
-        paste.assert_not_called()
-
+        clip.assert_called_once_with("Edited.")
+        kaho.AppHelper.callAfter.assert_any_call(kaho.overlay.showProblem_,
+                                                 "Can't edit here — copied, ⌘V")

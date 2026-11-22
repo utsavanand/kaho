@@ -78,12 +78,14 @@ log, and one-click bug reports:
   selection still replaces it with what you dictate. Kaho reads the selection
   through Accessibility, and in apps that don't expose it (some terminals and
   web apps) copies it with ⌘C and puts your clipboard back.
-- **Format text you've already written** — select it and tap right Shift on
-  its own. Kaho rewrites the selection in the style chosen under **Format**
-  (Clean up, Structured or Caveman; Structured when Format is Off) and
-  pastes over it. Only a clean tap counts: Shift held for a capital, used
-  with another key, or held while clicking to extend a selection does
-  nothing. If right Shift is your hotkey, tap right Command instead.
+- **Edit a selection with right Shift alone** — select text, hold right
+  Shift and say what to change (*"make this more formal"*, *"turn it into
+  bullets"*), then let go. Kaho rewrites the selection and pastes over it.
+  The mic only opens after Shift has been held on its own for a moment, so
+  typing a capital, Shift-arrow or Shift-click never starts it, and nothing
+  happens with nothing selected. If the selected text can't be typed over
+  (a sent chat message, terminal output), the edit is put on the clipboard
+  instead. If right Shift is your hotkey, hold right Command instead.
 - **Rewrite model** — on this Mac by default. You can point the rewrite step
   at OpenAI, Anthropic, or any OpenAI-compatible endpoint (Groq, OpenRouter,
   a local Ollama) with your own key, which is worth it for "turn this ramble
