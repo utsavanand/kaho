@@ -128,30 +128,27 @@ def instruction_label():
     return HOTKEYS[name][2]
 
 
-# Device bits of every modifier that can be combined with a key. A format tap
-# only counts when its key is the sole one down: right Shift with Command is
-# a shortcut, not a request to format.
+# Device bits of every modifier that can be combined with a key. Holding the
+# edit key only starts a recording when it is the sole one down: right Shift
+# with Command is a shortcut, not a request to edit.
 MODIFIER_DEVICE_BITS = 0x207F
+# How long the edit key must be held alone before the mic opens. Shift is
+# pressed constantly while typing; a capital letter or a Shift-arrow presses
+# another key well within this, and a quick tap releases it.
+EDIT_HOLD_SECONDS = 0.3
 
 
-def format_key():
-    """(keycode, device mask) of the key whose tap formats the selection.
+def edit_key():
+    """(keycode, device mask) of the key held to say how to edit a selection.
 
-    The same right-side key that marks an instruction while recording, so a
-    selection is formatted with the key already used for "how to write it".
+    The same right-side key that marks an instruction while recording, so
+    "hold it and say how to write it" means the same thing either way.
     """
     name = INSTRUCTION_FALLBACK
     if settings["hotkey"] == name:
         name = "right_command"
     keycode, mask, _ = HOTKEYS[name]
     return keycode, mask
-
-
-def format_mode():
-    """The style a format tap applies: the one chosen under Format, or
-    Structured when that is Off, since tapping is itself asking for a format."""
-    mode = settings["rewrite"]
-    return mode if mode != "off" else "structured"
 
 
 # Replaced Whisper large-v3-turbo in 2.2.0. On an M4 Max (tools/benchmark.py):
@@ -684,8 +681,11 @@ class Recording:
 recording = None
 press_time = 0.0
 last_tap = 0.0
-# When the format key went down on its own, until something else happens
-format_tap_start = None
+# Pending start of an edit recording while the edit key is held alone
+edit_hold_timer = None
+# The current recording was started by holding the edit key, so releasing
+# that key ends it
+edit_recording = False
 lock_time = 0.0  # when hands-free last engaged, for the grace period
 settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto",
             "trigger": "hold", "rewrite_backend": "local",
@@ -1681,7 +1681,7 @@ def handle_flags_changed(event):
     global locked, press_time, last_tap, lock_time
     keycode, device_mask, _ = HOTKEYS[settings["hotkey"]]
     instr_keys = instruction_keys()
-    if handle_format_tap(event):
+    if handle_edit_key(event):
         return
     if event.keyCode() in instr_keys and state == "recording" and recording:
         # Held while any of them is down, so letting go of one Shift while
@@ -1764,45 +1764,79 @@ def handle_flags_changed(event):
         stop_recording()
 
 
-def handle_format_tap(event):
-    """A tap of the format key on its own formats the selected text.
+def handle_edit_key(event):
+    """Hold the edit key alone with text selected to say how to change it.
 
-    Shift is pressed all the time while typing, so only a clean tap counts:
-    pressed and released within TAP_MAX_SECONDS with no other key, modifier
-    or click in between. A Shift-click that extends a selection never
-    becomes one, and neither does Shift held for a capital letter. Returns
-    True when the event was the format key outside a recording.
+    The mic opens once it has been held EDIT_HOLD_SECONDS with nothing else
+    pressed, and everything said is an instruction for the selection.
+    Releasing it ends the recording. Returns True when the event was handled.
     """
-    global format_tap_start
-    code, mask = format_key()
+    global edit_recording
+    code, mask = edit_key()
     if event.keyCode() != code:
-        format_tap_start = None
+        cancel_edit_hold()
         return False
-    if state != "ready" or overlay.is_working():
-        format_tap_start = None
-        return state != "recording"
     flags = event.modifierFlags()
-    now = time.monotonic()
-    if flags & mask:
-        alone = not (flags & MODIFIER_DEVICE_BITS & ~mask)
-        format_tap_start = now if alone else None
+    if state == "recording":
+        if edit_recording and not flags & mask:
+            edit_recording = False
+            stop_recording()
+            return True
+        # Otherwise the usual instruction key inside a dictation
+        return False
+    # Whatever recording it started is over (Escape, the watchdog...)
+    edit_recording = False
+    if state != "ready" or overlay.is_working():
+        cancel_edit_hold()
         return True
-    started, format_tap_start = format_tap_start, None
-    if started is not None and now - started < TAP_MAX_SECONDS:
-        queue_format(now)
+    if flags & mask and not flags & MODIFIER_DEVICE_BITS & ~mask:
+        schedule_edit_hold()
+    else:
+        cancel_edit_hold()
     return True
 
 
-def interrupt_format_tap(_event=None):
-    """Any key or click while the format key is down makes it not a tap."""
-    global format_tap_start
-    format_tap_start = None
+def schedule_edit_hold():
+    global edit_hold_timer
+    cancel_edit_hold()
+    edit_hold_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+        EDIT_HOLD_SECONDS, False, start_edit_recording
+    )
 
 
-def queue_format(released):
-    global job_outstanding
-    job_outstanding = True
-    jobs.put((FORMAT, job_generation, released))
+def cancel_edit_hold():
+    global edit_hold_timer
+    if edit_hold_timer is not None:
+        edit_hold_timer.invalidate()
+        edit_hold_timer = None
+
+
+def start_edit_recording(_timer=None):
+    """The edit key has been held alone long enough: listen for the edit."""
+    global edit_hold_timer, edit_recording
+    edit_hold_timer = None
+    if state != "ready" or overlay.is_working():
+        return
+    if ax_selected_text() == "":
+        # The app says nothing is selected: Shift held for something else
+        return
+    start_recording()
+    if state == "recording":
+        edit_recording = True
+        # instruction_held() already opened the span; this covers a key
+        # released in the instant before the HID state was read
+        if recording.mark_instruction(True) == "opened":
+            overlay.setPhase_("instructing")
+
+
+def interrupt_edit_key(_event=None):
+    """Another key or a click while the edit key is down: it was Shift for
+    a capital, a Shift-arrow or a Shift-click, not an edit."""
+    global edit_recording
+    cancel_edit_hold()
+    if edit_recording and state == "recording":
+        edit_recording = False
+        cancel_pending_job()
 
 
 ESCAPE_KEYCODE = 53
@@ -1839,9 +1873,9 @@ def cancel_pending_job():
 
 
 def handle_key_down(event):
-    interrupt_format_tap()
     if event.keyCode() == ESCAPE_KEYCODE:
         return cancel_pending_job()
+    interrupt_edit_key()
     return False
 
 
@@ -1879,12 +1913,12 @@ def install_hotkey_monitors():
         AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
             AppKit.NSEventMaskKeyDown, lambda e: None if handle_key_down(e) else e
         ),
-        # A Shift-click extends a selection; it must not also format it
+        # A Shift-click extends a selection; it must not also start an edit
         AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            MOUSE_DOWN_MASK, interrupt_format_tap
+            MOUSE_DOWN_MASK, interrupt_edit_key
         ),
         AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
-            MOUSE_DOWN_MASK, lambda e: (interrupt_format_tap(e), e)[1]
+            MOUSE_DOWN_MASK, lambda e: (interrupt_edit_key(e), e)[1]
         ),
     ]
 
@@ -2250,15 +2284,38 @@ def read_selection():
     that answers with an empty selection really has nothing selected, and
     ⌘C there could copy something else: VS Code copies the whole line.
     """
-    system = ApplicationServices.AXUIElementCreateSystemWide()
-    # A hung app would otherwise block the worker for the system default of
-    # about six seconds
-    ApplicationServices.AXUIElementSetMessagingTimeout(system, SELECTION_READ_SECONDS)
-    focused = _ax(system, "AXFocusedUIElement")
-    selected = _ax(focused, "AXSelectedText") if focused is not None else None
-    if not isinstance(selected, str):
+    selected = ax_selected_text()
+    if selected is None:
         return copy_selection()
     return selected if selected.strip() else None
+
+
+def _focused_element():
+    system = ApplicationServices.AXUIElementCreateSystemWide()
+    # A hung app would otherwise block for the system default of about six
+    # seconds
+    ApplicationServices.AXUIElementSetMessagingTimeout(system, SELECTION_READ_SECONDS)
+    return _ax(system, "AXFocusedUIElement")
+
+
+def ax_selected_text():
+    """The selection as Accessibility reports it: "" for none, None when the
+    app can't say."""
+    focused = _focused_element()
+    selected = _ax(focused, "AXSelectedText") if focused is not None else None
+    return selected if isinstance(selected, str) else None
+
+
+def selection_read_only():
+    """True only when the app says its selection can't be typed over, like a
+    sent message in a chat or a terminal's scrollback. Pasting there does
+    nothing, so the edit would silently vanish."""
+    focused = _focused_element()
+    if focused is None:
+        return False
+    err, settable = ApplicationServices.AXUIElementIsAttributeSettable(
+        focused, "AXSelectedText", None)
+    return err == 0 and not settable
 
 
 def copy_selection():
@@ -2345,7 +2402,6 @@ def split_audio(audio, spans):
 
 
 STREAM = object()  # job marker: transcribe the next stretch of a long recording
-FORMAT = object()  # job marker: format the selected text
 
 
 def maybe_stream(session, frames):
@@ -2676,33 +2732,14 @@ def edit_selection(instruction, generation, released, t0):
         # rewrite_with_instruction already logged why
         AppHelper.callAfter(overlay.showProblem_, "Couldn't rewrite — unchanged")
         return
+    if selection_read_only():
+        set_clipboard(text)
+        append_history(text)
+        log("selection is read-only — the edit is on the clipboard")
+        AppHelper.callAfter(overlay.showProblem_, "Can't edit here — copied, ⌘V")
+        return
     deliver(text)
     log(f'[{job_timing(released, t0)}] edited {len(selected)} selected characters: "{instruction}"')
-
-
-def format_selection(generation, released, t0):
-    """Rewrite the selected text in the Format style and paste over it."""
-    global last_inference
-    selected = read_selection()
-    if not selected:
-        # Not worth a pill: a lone Shift tap with nothing selected is far
-        # more often a slip while typing than a request
-        log("format tap with nothing selected — ignored")
-        return
-    mode = format_mode()
-    AppHelper.callAfter(overlay.place)
-    AppHelper.callAfter(overlay.setPhase_, "rewriting")
-    text = rewrite(selected, mode)
-    last_inference = time.monotonic()
-    if generation != job_generation:
-        log("cancelled during formatting — selection left as it was")
-        return
-    if not text or text.strip() == selected.strip():
-        # rewrite() already logged why (already clean, model not loaded...)
-        AppHelper.callAfter(overlay.showProblem_, "Left as it was")
-        return
-    deliver(text)
-    log(f"[{job_timing(released, t0)}] formatted {len(selected)} selected characters ({mode})")
 
 
 def job_timing(released, t0):
@@ -2755,12 +2792,8 @@ def worker():
         # The sole worker must outlive any single bad job, or dictation dies
         # silently while the UI still shows ready
         try:
-            if job[0] is FORMAT:
-                _, generation, released = job
-                format_selection(generation, released, t0)
-            else:
-                audio, generation, spans, released, session = job
-                run_job(audio, generation, spans, released, t0, session)
+            audio, generation, spans, released, session = job
+            run_job(audio, generation, spans, released, t0, session)
         except Exception as e:  # noqa: BLE001
             AppHelper.callAfter(overlay.hide)
             log(f"transcription failed: {e!r} — dictation continues")
