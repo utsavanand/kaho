@@ -49,6 +49,7 @@ a = Analysis(
     # import with "No module named 'mlx._reprlib_fix'".
     hiddenimports=[
         "audio_capture",
+        "cloud",
         "mlx",
         "mlx.core",
         "mlx.nn",

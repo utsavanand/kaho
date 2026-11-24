@@ -39,8 +39,8 @@ telemetry.
   spells them, with nothing added to the dictionary. Read in memory when you
   press the hotkey, used for that one dictation, then discarded
 - **On-device** — audio never leaves the machine; works offline. (Optional:
-  point the *rewrite* step at a cloud model with your own key — transcript
-  only, never audio.)
+  bring your own key to transcribe or rewrite with a cloud model instead —
+  see **Cloud AI** below. Nothing is sent unless you pick a provider.)
 - **Small** — one Python file, eight dependencies
 
 ## The menu
@@ -86,14 +86,24 @@ log, and one-click bug reports:
   happens with nothing selected. If the selected text can't be typed over
   (a sent chat message, terminal output), the edit is put on the clipboard
   instead. If right Shift is your hotkey, hold right Command instead.
-- **Rewrite model** — on this Mac by default. You can point the rewrite step
-  at OpenAI, Anthropic, or any OpenAI-compatible endpoint (Groq, OpenRouter,
-  a local Ollama) with your own key, which is worth it for "turn this ramble
-  into a paragraph" where a 4B model has a ceiling. The key is stored in your
-  Keychain, never in Kaho's settings file. **Your audio never leaves the Mac
-  either way** — only the transcript is sent, and only when a key is set. If
-  the request fails for any reason, Kaho falls back to the on-device model
-  rather than losing your words.
+- **Cloud AI (your own key)** — in Settings, or **Transcribe with** and
+  **Rewrite model** in the menu. Both run on this Mac by default.
+  - *Transcribe with*: OpenAI, Groq, Deepgram, or any OpenAI-compatible
+    server. **Choosing one sends your audio to it**; your dictionary and the
+    words on screen go along as spelling hints.
+  - *Rewrite with*: OpenAI, Anthropic, Google Gemini, Groq, OpenRouter, or
+    any OpenAI-compatible server (a local Ollama too). Worth it for "turn
+    this ramble into a paragraph", where a 4B model has a ceiling. Only text
+    is sent.
+  - The key is checked with the provider before it is saved, and lives in
+    your Keychain, never in Kaho's settings file.
+  - **Auto** (the default) asks the provider which models your key can use
+    and picks the best one that still answers in a second or two — Sonnet
+    over Opus, Flash over Pro, reasoning switched off. It checks again once a
+    day, so a newly released model is picked up. Choose a model yourself in
+    Settings to override it.
+  - If a request fails for any reason, Kaho falls back to the on-device
+    model rather than losing your words.
 - **Trigger** — hold the key while you speak (default), or tap once to start
   and once to stop. Holding is self-limiting, so a forgotten recording cannot
   run for minutes; tapping is easier through a long prompt, and is the only

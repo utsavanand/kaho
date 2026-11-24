@@ -56,6 +56,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 cp "$SRC/kaho.py" "$STAGE/Contents/Resources/"
 cp "$SRC/audio_capture.py" "$STAGE/Contents/Resources/"
+cp "$SRC/cloud.py" "$STAGE/Contents/Resources/"
 cp "$SRC/assets/Kaho.icns" "$STAGE/Contents/Resources/"
 
 cat > "$STAGE/Contents/Info.plist" <<PLIST

@@ -40,6 +40,8 @@ import sounddevice as sd
 from mlx_audio.stt.utils import load_model
 from PyObjCTools import AppHelper
 
+import cloud
+
 # kVK_* keycodes from Carbon's Events.h. Raw keycodes, not characters: pynput
 # was dropped because its character mapping calls TIS (Text Input Source) APIs
 # off the main thread, which macOS 15 kills with EXC_BREAKPOINT
@@ -66,28 +68,20 @@ HOTKEYS = {  # name -> (keycode, device-specific modifier bit, label)
 INSTRUCTION_FALLBACK = "right_shift"
 
 # On-device is the default and the fallback: a key only ever adds a better
-# rewrite, it never becomes load-bearing. Nothing degrades without one, and
-# the audio never leaves the Mac either way — only the transcript is sent,
-# and only when a key is set.
-REWRITE_BACKENDS = {
-    "local": "On this Mac (Qwen3 4B)",
-    "openai": "OpenAI",
-    "anthropic": "Anthropic",
-    "custom": "Custom (OpenAI-compatible)",
-}
-
-# Defaults chosen so the common case needs only a key. Overridable for
-# self-hosted and proxy endpoints, which is the point of "custom".
-BACKEND_DEFAULTS = {
-    "openai": ("https://api.openai.com/v1/chat/completions", "gpt-5"),
-    "anthropic": ("https://api.anthropic.com/v1/messages", "claude-sonnet-5"),
-    "custom": ("", ""),
-}
+# model, it never becomes load-bearing. Nothing degrades without one, and a
+# failed cloud call falls back to the on-device model. Audio leaves the Mac
+# only when a cloud transcription provider is chosen; the rewrite sends text.
+REWRITE_BACKENDS = {"local": "On this Mac (Qwen3 4B)"} | {
+    name: cloud.PROVIDERS[name]["label"] for name in cloud.providers_for("rewrite")}
+STT_BACKENDS = {"local": "On this Mac (Qwen3-ASR)"} | {
+    name: cloud.PROVIDERS[name]["label"] for name in cloud.providers_for("stt")}
+# Models the 2.x builds wrote into settings as fixed choices. Read as Auto,
+# so upgrading moves those users onto the best model their key has.
+OLD_DEFAULT_MODELS = {"gpt-5", "claude-sonnet-5"}
+# How long a provider's model list is trusted before it is asked again
+MODEL_LIST_MAX_AGE = 24 * 3600
 
 KEYCHAIN_SERVICE = "com.utsavanand.kaho.apikey"
-# Generous, because a frontier model on a long dictation is not fast; the
-# fallback to on-device matters more than the exact number
-API_TIMEOUT_SECONDS = 30
 
 
 LEFT_SHIFT = (56, 0x0002)
@@ -689,7 +683,10 @@ edit_recording = False
 lock_time = 0.0  # when hands-free last engaged, for the grace period
 settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto",
             "trigger": "hold", "rewrite_backend": "local",
-            "api_url": "", "api_model": "", "screen_words": True, "check_updates": True}
+            "api_url": "", "api_model": cloud.AUTO, "stt_backend": "local",
+            "stt_model": cloud.AUTO, "screen_words": True, "check_updates": True,
+            # "kind:provider" -> {"ids": [best first], "checked": epoch seconds}
+            "cloud_models": {}}
 mlx_lm = None  # imported lazily by _load_rewriter — pulls in transformers (~2s)
 rewriter = None  # (model, tokenizer) once loaded
 rewriter_thread = None
@@ -767,9 +764,20 @@ def load_settings():
         settings["trigger"] = saved["trigger"]
     if _settings_key(saved, "rewrite_backend") in REWRITE_BACKENDS:
         settings["rewrite_backend"] = saved["rewrite_backend"]
-    for key in ("api_url", "api_model"):
+    if _settings_key(saved, "stt_backend") in STT_BACKENDS:
+        settings["stt_backend"] = saved["stt_backend"]
+    for key in ("api_url", "api_model", "stt_model"):
         if isinstance(saved.get(key), str):
             settings[key] = saved[key]
+    if settings["api_model"] in OLD_DEFAULT_MODELS or not settings["api_model"]:
+        settings["api_model"] = cloud.AUTO
+    if not settings["stt_model"]:
+        settings["stt_model"] = cloud.AUTO
+    if isinstance(saved.get("cloud_models"), dict):
+        settings["cloud_models"] = {
+            k: v for k, v in saved["cloud_models"].items()
+            if isinstance(v, dict) and isinstance(v.get("ids"), list)
+            and isinstance(v.get("checked"), (int, float))}
     for key in ("screen_words", "check_updates"):
         if isinstance(saved.get(key), bool):
             settings[key] = saved[key]
@@ -1938,24 +1946,56 @@ def looks_hallucinated(text):
     return unique_ratio < 0.12
 
 
-def transcribe(audio, use_dictionary=True, screen=()):
+def transcribe(audio, use_dictionary=True, screen=(), use_cloud=True):
     """`screen` words bias the model but never feed respell(): a word that
-    happens to be on screen must not rewrite a word the user said."""
+    happens to be on screen must not rewrite a word the user said.
+
+    `use_cloud=False` for warmups: they exist to page in the local model,
+    and must never send a half second of silence to a paid API.
+    """
     terms = read_dictionary() if use_dictionary else []
     hotwords = terms + list(screen)
-    # Whisper needed condition_on_previous_text=False to stop one 30 s
-    # window's bad guess seeding the next. This model decodes the whole
-    # dictation in one pass, so there is no window-to-window context to cut.
-    text = asr.generate(
-        audio,
-        hotwords=hotwords or None,
-        # None lets the model detect; it takes the language's name, not its code
-        language=None if settings["language"] == "auto" else LANGUAGES[settings["language"]],
-    ).text.strip()
+    text = transcribe_cloud(audio, hotwords) if use_cloud else None
+    if text is None:
+        # Whisper needed condition_on_previous_text=False to stop one 30 s
+        # window's bad guess seeding the next. This model decodes the whole
+        # dictation in one pass, so there is no window-to-window context to cut.
+        text = asr.generate(
+            audio,
+            hotwords=hotwords or None,
+            # None lets the model detect; it takes the language's name, not its code
+            language=None if settings["language"] == "auto" else LANGUAGES[settings["language"]],
+        ).text.strip()
     if echoes_hotwords(text, hotwords):
         log(f"dropped: the model wrote out its hint words instead of speech ({len(text.split())} words)")
         return ""
     return respell(text, terms)
+
+
+def transcribe_cloud(audio, hotwords):
+    """The chosen cloud provider's transcript, or None to use the local model."""
+    provider = settings["stt_backend"]
+    if provider == "local":
+        return None
+    key = get_api_key(provider)
+    if not key:
+        log(f"{provider}: no API key stored — transcribing on this Mac")
+        return None
+    model = resolve_model("stt", provider, key)
+    if not model:
+        log(f"{provider}: no transcription model available — transcribing on this Mac")
+        return None
+    t0 = time.monotonic()
+    try:
+        text = cloud.transcribe(
+            provider, key, model, audio, SAMPLE_RATE,
+            language=None if settings["language"] == "auto" else settings["language"],
+            terms=hotwords, custom_url=settings["api_url"], context=https_context())
+    except cloud.CloudError as e:
+        log(f"{provider} transcription failed: {e} — transcribing on this Mac")
+        return None
+    log(f"[transcribed via {provider} {model} {time.monotonic() - t0:.2f}s]")
+    return text
 
 
 def echoes_hotwords(text, hotwords):
@@ -2127,47 +2167,69 @@ def call_rewrite_api(backend, prompt):
     if not key:
         log(f"{backend}: no API key stored — using the on-device model")
         return None
-    url = settings.get("api_url") or BACKEND_DEFAULTS[backend][0]
-    model = settings.get("api_model") or BACKEND_DEFAULTS[backend][1]
-    if not url or not model:
-        log(f"{backend}: endpoint or model not set — using the on-device model")
-        return None
-
-    if backend == "anthropic":
-        headers = {"x-api-key": key, "anthropic-version": "2023-06-01",
-                   "content-type": "application/json"}
-        body = {"model": model, "max_tokens": 2048,
-                "messages": [{"role": "user", "content": prompt}]}
-    else:
-        # OpenAI's shape, which Groq, OpenRouter, Ollama and most proxies
-        # also speak — hence one "custom" option rather than one per vendor
-        headers = {"Authorization": f"Bearer {key}",
-                   "content-type": "application/json"}
-        body = {"model": model,
-                "messages": [{"role": "user", "content": prompt}]}
-
-    try:
-        # Request() is inside the try on purpose: it raises ValueError on a
-        # malformed url, which a user typing a custom endpoint will hit, and
-        # outside it that escaped as a crash instead of falling back.
-        req = urllib.request.Request(
-            url, data=json.dumps(body).encode(), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS, context=https_context()) as r:
-            data = json.loads(r.read())
-    except Exception as e:  # noqa: BLE001
-        # Never log the key, and never log the response body: both can carry
-        # the transcript or the credential into a file the user may share
-        log(f"{backend} request failed: {type(e).__name__} — using the on-device model")
+    model = resolve_model("rewrite", backend, key)
+    if not model:
+        log(f"{backend}: no model available — using the on-device model")
         return None
     try:
-        if backend == "anthropic":
-            return "".join(b.get("text", "") for b in data["content"]).strip()
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError, TypeError, AttributeError):
-        # AttributeError included: a provider returning "content": null gives
-        # None.strip(), which is a shape problem like any other
-        log(f"{backend}: unexpected response shape — using the on-device model")
+        return cloud.chat(backend, key, model, prompt, custom_url=settings["api_url"],
+                          context=https_context()) or None
+    except cloud.CloudError as e:
+        # CloudError never carries the key or the response body: both can
+        # put the transcript or the credential into a log the user may share
+        log(f"{backend} request failed: {e} — using the on-device model")
         return None
+
+
+def resolve_model(kind, provider, key):
+    """The model to use: the user's pick, else the best the key can use.
+
+    The list is fetched once and kept for MODEL_LIST_MAX_AGE; a dictation
+    only waits on it the first time after a key is set without one.
+    """
+    chosen = settings["stt_model" if kind == "stt" else "api_model"]
+    if chosen and chosen != cloud.AUTO:
+        return chosen
+    entry = settings["cloud_models"].get(f"{kind}:{provider}")
+    if not entry:
+        refresh_models(provider, key)
+        entry = settings["cloud_models"].get(f"{kind}:{provider}")
+    return entry["ids"][0] if entry and entry["ids"] else None
+
+
+def refresh_models(provider, key=None, ids=None):
+    """Ask the provider which models the key can use and rank them for each
+    job it does. Returns False when the list could not be fetched."""
+    if ids is None:
+        key = key or get_api_key(provider)
+        if not key:
+            return False
+        try:
+            ids = cloud.list_models(provider, key, settings["api_url"], https_context())
+        except cloud.CloudError as e:
+            log(f"{provider}: could not list models ({e})")
+            return False
+    now = time.time()
+    for kind in cloud.PROVIDERS[provider]["kinds"]:
+        ranked = (cloud.rank_rewrite_models(provider, ids) if kind == "rewrite"
+                  else cloud.rank_stt_models(provider, ids))
+        settings["cloud_models"][f"{kind}:{provider}"] = {"ids": ranked[:40], "checked": now}
+        if ranked:
+            log(f"{provider}: best {'transcription' if kind == 'stt' else 'rewrite'} "
+                f"model is {ranked[0]}")
+    save_settings()
+    return True
+
+
+def refresh_stale_models():
+    """In the background, re-ask each provider in use, at most once a day,
+    so Auto moves to a newer model when the provider ships one."""
+    for provider in {settings["rewrite_backend"], settings["stt_backend"]} - {"local"}:
+        checked = min((v["checked"] for k, v in settings["cloud_models"].items()
+                       if k.endswith(f":{provider}")), default=0)
+        if time.time() - checked > MODEL_LIST_MAX_AGE:
+            refresh_models(provider)
+    AppHelper.callAfter(refresh_settings_ui)
 
 
 def rewrite_with_instruction(text, instruction):
@@ -2771,7 +2833,8 @@ def worker():
         if job is WARMUP:
             warmup_queued = False
             try:
-                transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), use_dictionary=False)
+                transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), use_dictionary=False,
+                           use_cloud=False)
                 if rewriter is not None and settings["rewrite"] != "off":
                     model, tokenizer = rewriter
                     mlx_lm.generate(model, tokenizer, prompt="hi", max_tokens=1)
@@ -2874,7 +2937,8 @@ def backend():
         asr = load_model(path)
         # Warmup on silence: pays model load + Metal kernel compilation now
         # instead of on the first real dictation
-        transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), use_dictionary=False)
+        transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), use_dictionary=False,
+                   use_cloud=False)
         last_inference = time.monotonic()
         log(f"model ready in {time.monotonic() - t0:.1f}s — hold {hotkey_label()} to dictate")
         threading.Thread(target=update_loop, name="Kaho update check", daemon=True).start()
@@ -3555,6 +3619,49 @@ class Overlay(AppKit.NSObject):
         self.view.setNeedsDisplay_(True)
 
 
+def build_cloud_section(self, content, base):
+    """Settings' Cloud AI rows. A function, not a method: PyObjC turns a
+    method's name into a selector, and one with arguments but no colons
+    fails at class creation.
+
+    Your own key: which provider transcribes, which rewrites, and
+    which of their models — Auto unless the user picks one."""
+    divider = AppKit.NSBox.alloc().initWithFrame_(((24, base + CLOUD_HEIGHT - 4), (412, 1)))
+    divider.setBoxType_(AppKit.NSBoxSeparator)
+    content.addSubview_(divider)
+    content.addSubview_(make_label("Cloud AI (your own key)", 24, base + 164, 13, bold=True))
+    self.key_button = AppKit.NSButton.alloc().initWithFrame_(((306, base + 158), (130, 26)))
+    self.key_button.setTitle_("Change API Key…")
+    self.key_button.setBezelStyle_(AppKit.NSBezelStyleRounded)
+    self.key_button.setTarget_(self)
+    self.key_button.setAction_("changeKey:")
+    content.addSubview_(self.key_button)
+    self.cloud_popups = {}
+    for kind, title, y, backends in (("stt", "Transcribe with", base + 140, STT_BACKENDS),
+                                     ("rewrite", "Rewrite with", base + 88, REWRITE_BACKENDS)):
+        content.addSubview_(make_label(title, 24, y, 11, dim=True))
+        provider = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            ((24, y - 28), (200, 26)), False)
+        for name, label in backends.items():
+            provider.addItemWithTitle_(label)
+            provider.lastItem().setRepresentedObject_(name)
+        provider.setTarget_(self)
+        provider.setAction_("cloudProviderChanged:")
+        provider.setTag_(0 if kind == "stt" else 1)
+        content.addSubview_(provider)
+        model = AppKit.NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            ((232, y - 28), (204, 26)), False)
+        model.setTarget_(self)
+        model.setAction_("cloudModelChanged:")
+        model.setTag_(0 if kind == "stt" else 1)
+        content.addSubview_(model)
+        self.cloud_popups[kind] = (provider, model)
+    self.cloud_status = make_label("", 24, base + 10, 11, dim=True)
+    self.cloud_status.setFrame_(((24, base + 8), (412, 44)))
+    self.cloud_status.cell().setWraps_(True)
+    content.addSubview_(self.cloud_status)
+
+
 class SettingsWindow(AppKit.NSObject):
     """Real window for hotkey and rewrite mode.
 
@@ -3570,6 +3677,8 @@ class SettingsWindow(AppKit.NSObject):
         self.syncControls()
         AppKit.NSApp.activateIgnoringOtherApps_(True)
         self.window.makeKeyAndOrderFront_(None)
+        # So the model pickers list what the key can use today
+        threading.Thread(target=refresh_stale_models, daemon=True).start()
 
     def buildWindow(self):
         mask = (
@@ -3578,7 +3687,8 @@ class SettingsWindow(AppKit.NSObject):
             | AppKit.NSWindowStyleMaskMiniaturizable
         )
         window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((0, 0), (460, 522 + ABOUT_HEIGHT)), mask, AppKit.NSBackingStoreBuffered, False
+            ((0, 0), (460, 522 + CLOUD_HEIGHT + ABOUT_HEIGHT)), mask,
+            AppKit.NSBackingStoreBuffered, False
         )
         window.setTitle_("Kaho Settings")
         window.setReleasedWhenClosed_(False)
@@ -3675,10 +3785,12 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(self.notice)
 
         # Everything above is laid out from the bottom edge; lift it to make
-        # room for About underneath rather than renumbering every control
+        # room for Cloud AI and About underneath rather than renumbering
+        # every control
         for view in content.subviews():
             (x, y), size = view.frame()
-            view.setFrame_(((x, y + ABOUT_HEIGHT), size))
+            view.setFrame_(((x, y + CLOUD_HEIGHT + ABOUT_HEIGHT), size))
+        build_cloud_section(self, content, ABOUT_HEIGHT)
         divider = AppKit.NSBox.alloc().initWithFrame_(((24, ABOUT_HEIGHT - 4), (412, 1)))
         divider.setBoxType_(AppKit.NSBoxSeparator)
         content.addSubview_(divider)
@@ -3705,7 +3817,61 @@ class SettingsWindow(AppKit.NSObject):
         content.addSubview_(self.updates_box)
         self.window = window
 
+    def syncCloud(self):
+        lines = []
+        for kind, (provider_popup, model_popup) in self.cloud_popups.items():
+            provider = settings["stt_backend" if kind == "stt" else "rewrite_backend"]
+            chosen = settings["stt_model" if kind == "stt" else "api_model"]
+            for i in range(provider_popup.numberOfItems()):
+                if provider_popup.itemAtIndex_(i).representedObject() == provider:
+                    provider_popup.selectItemAtIndex_(i)
+            model_popup.removeAllItems()
+            if provider == "local":
+                model_popup.addItemWithTitle_("Built in")
+                model_popup.setEnabled_(False)
+                continue
+            model_popup.setEnabled_(True)
+            ranked = settings["cloud_models"].get(f"{kind}:{provider}", {}).get("ids", [])
+            best = ranked[0] if ranked else None
+            model_popup.addItemWithTitle_(f"Auto ({best})" if best else "Auto — best available")
+            model_popup.lastItem().setRepresentedObject_(cloud.AUTO)
+            for mid in ranked if chosen in ranked or chosen == cloud.AUTO else [chosen, *ranked]:
+                model_popup.addItemWithTitle_(mid)
+                model_popup.lastItem().setRepresentedObject_(mid)
+            model_popup.selectItemAtIndex_(next(
+                (i for i in range(model_popup.numberOfItems())
+                 if model_popup.itemAtIndex_(i).representedObject() == chosen), 0))
+            using = best if chosen == cloud.AUTO else chosen
+            what = "Audio" if kind == "stt" else "Text"
+            job = "transcribed" if kind == "stt" else "rewritten"
+            label = cloud.PROVIDERS[provider]["label"]
+            if not get_api_key(provider):
+                lines.append(f"{label}: no key yet — using this Mac until one is added.")
+            else:
+                lines.append(f"{what} is {job} by {label}" + (f" ({using})." if using else "."))
+        in_use = {settings["stt_backend"], settings["rewrite_backend"]} - {"local"}
+        self.key_button.setEnabled_(bool(in_use))
+        self.cloud_status.setStringValue_(
+            " ".join(lines) if lines
+            else "Pick a provider to use your own key. Without one, everything runs on this Mac.")
+
+    def changeKey_(self, _sender):
+        for provider in dict.fromkeys((settings["stt_backend"], settings["rewrite_backend"])):
+            if provider != "local":
+                kind = "stt" if settings["stt_backend"] == provider else "rewrite"
+                prompt_for_api_key(provider, kind)
+        refresh_settings_ui()
+
+    def cloudProviderChanged_(self, sender):
+        name = sender.selectedItem().representedObject()
+        (apply_stt_backend if sender.tag() == 0 else apply_rewrite_backend)(name)
+
+    def cloudModelChanged_(self, sender):
+        apply_model("stt" if sender.tag() == 0 else "rewrite",
+                    sender.selectedItem().representedObject())
+
     def syncControls(self):
+        self.syncCloud()
         for i in range(self.hotkey_popup.numberOfItems()):
             if self.hotkey_popup.itemAtIndex_(i).representedObject() == settings["hotkey"]:
                 self.hotkey_popup.selectItemAtIndex_(i)
@@ -3740,9 +3906,7 @@ class SettingsWindow(AppKit.NSObject):
                 "this Mac."
             )
         else:
-            self.notice.setStringValue_(
-                "Everything runs on this Mac. Audio never leaves the device."
-            )
+            self.notice.setStringValue_(privacy_summary())
         mode = settings["rewrite"]
         self.hint.setStringValue_(REWRITE_HINTS.get(mode, ""))
         if mode == "off":
@@ -3786,6 +3950,23 @@ class SettingsWindow(AppKit.NSObject):
 
 # Room at the bottom of Settings for the About section
 ABOUT_HEIGHT = 102
+# And above it, for Cloud AI
+CLOUD_HEIGHT = 196
+
+
+def privacy_summary():
+    """One line on what leaves the Mac, for the foot of Settings."""
+    stt, rw = settings["stt_backend"], settings["rewrite_backend"]
+    if stt == "local" and rw == "local":
+        return "Everything runs on this Mac. Audio never leaves the device."
+    parts = []
+    if stt != "local":
+        parts.append(f"Audio goes to {cloud.PROVIDERS[stt]['label']} to be transcribed.")
+    else:
+        parts.append("Audio never leaves this Mac.")
+    if rw != "local":
+        parts.append(f"Text goes to {cloud.PROVIDERS[rw]['label']} to be rewritten.")
+    return " ".join(parts)
 
 
 def open_url(url):
@@ -4101,6 +4282,11 @@ def check_for_update():
 def update_loop():
     while True:
         check_for_update()
+        # Same daily beat: Auto picks up a model the provider shipped since
+        try:
+            refresh_stale_models()
+        except Exception as e:  # noqa: BLE001
+            log(f"model list refresh failed: {e!r}")
         time.sleep(UPDATE_INTERVAL_SECONDS)
 
 
@@ -4112,56 +4298,127 @@ def apply_screen_words(on):
 
 
 def apply_rewrite_backend(name):
-    """Switch the rewrite model, prompting for a key the first time."""
-    settings["rewrite_backend"] = name
-    if name != "local":
-        settings["api_url"], settings["api_model"] = BACKEND_DEFAULTS[name]
+    """Switch the rewrite model, asking for a key the first time."""
+    _apply_backend("rewrite", name)
+
+
+def apply_stt_backend(name):
+    """Switch transcription, asking for a key the first time."""
+    _apply_backend("stt", name)
+
+
+def _apply_backend(kind, name):
+    field, model_field = (("stt_backend", "stt_model") if kind == "stt"
+                          else ("rewrite_backend", "api_model"))
+    if settings[field] != name:
+        # Another provider's model ids mean nothing to this one
+        settings[model_field] = cloud.AUTO
+    settings[field] = name
     save_settings()
-    log(f"rewrite model: {REWRITE_BACKENDS[name]}")
-    if name != "local" and not get_api_key(name):
-        prompt_for_api_key(name)
+    labels = STT_BACKENDS if kind == "stt" else REWRITE_BACKENDS
+    log(f"{'transcription' if kind == 'stt' else 'rewrite model'}: {labels[name]}")
+    if name != "local":
+        if not get_api_key(name) or (name == "custom" and not settings["api_url"]):
+            prompt_for_api_key(name, kind)
+        else:
+            threading.Thread(target=refresh_stale_models, daemon=True).start()
     refresh_settings_ui()
 
 
-def prompt_for_api_key(backend):
-    """Ask for the key in a secure field, so it is never on screen or on disk.
+def apply_model(kind, model):
+    settings["stt_model" if kind == "stt" else "api_model"] = model
+    save_settings()
+    log(f"{'transcription' if kind == 'stt' else 'rewrite'} model: {model}")
+    refresh_settings_ui()
+
+
+def privacy_note(provider):
+    """What leaves the Mac with this provider, for the key prompt."""
+    sends = []
+    if settings["stt_backend"] == provider:
+        sends.append("your audio, to be transcribed")
+    if settings["rewrite_backend"] == provider:
+        sends.append("your dictated text, to be rewritten")
+    what = " and ".join(sends) or "your dictations"
+    return f"Kaho sends {what} to {cloud.PROVIDERS[provider]['label']}."
+
+
+def prompt_for_api_key(backend, kind="rewrite"):
+    """Ask for the key in a secure field, check it, then keep it.
 
     NSSecureTextField rather than a text file: the whole reason the key lives
     in the Keychain is that a plaintext copy in Application Support is a
-    credential anything can read.
+    credential anything can read. The key is tried against the provider
+    before it is saved, so a typo shows up here, not as every dictation
+    quietly falling back to the on-device model.
     """
-    alert = AppKit.NSAlert.alloc().init()
-    alert.setMessageText_(f"{REWRITE_BACKENDS[backend]} API key")
-    alert.setInformativeText_(
-        "Stored in your Keychain, never in Kaho's settings file.\n\n"
-        "Your dictated text is sent to this service to be rewritten. Audio "
-        "always stays on this Mac. Leave empty to keep using the on-device "
-        "model."
-    )
-    field = AppKit.NSSecureTextField.alloc().initWithFrame_(((0, 0), (300, 24)))
-    alert.setAccessoryView_(field)
-    alert.addButtonWithTitle_("Save")
-    alert.addButtonWithTitle_("Cancel")
-    # Same as ask(): without this the alert can open on another Space and the
-    # user never sees it. Safe to run modally here because this is reached
-    # from a menu click while idle — runModal starves NSTimers, which is why
-    # nothing on the recording path may ever show an alert.
-    alert.window().setCollectionBehavior_(
-        AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
-        | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
-    )
-    AppKit.NSApp.activateIgnoringOtherApps_(True)
-    if alert.runModal() == AppKit.NSAlertFirstButtonReturn:
+    label = cloud.PROVIDERS[backend]["label"]
+    problem = ""
+    while True:
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_(f"{label} API key")
+        alert.setInformativeText_(
+            (f"{problem}\n\n" if problem else "")
+            + "Stored in your Keychain, never in Kaho's settings file. "
+            + privacy_note(backend)
+            + " If it can't be reached, Kaho uses the on-device model.\n\n"
+            "Leave empty to keep everything on this Mac."
+        )
+        accessory = AppKit.NSView.alloc().initWithFrame_(((0, 0), (300, 56 if backend == "custom" else 24)))
+        field = AppKit.NSSecureTextField.alloc().initWithFrame_(((0, 0), (300, 24)))
+        field.setPlaceholderString_("API key")
+        accessory.addSubview_(field)
+        url_field = None
+        if backend == "custom":
+            url_field = AppKit.NSTextField.alloc().initWithFrame_(((0, 32), (300, 24)))
+            url_field.setPlaceholderString_("Base URL, e.g. https://api.groq.com/openai/v1")
+            url_field.setStringValue_(cloud.base_url("custom", settings["api_url"]))
+            accessory.addSubview_(url_field)
+        alert.setAccessoryView_(accessory)
+        alert.addButtonWithTitle_("Verify and Save")
+        alert.addButtonWithTitle_("Cancel")
+        if cloud.PROVIDERS[backend]["keys"]:
+            alert.addButtonWithTitle_("Get a Key…")
+        # Same as ask(): without this the alert can open on another Space and
+        # the user never sees it. Safe to run modally here because this is
+        # reached from a settings click while idle — runModal starves
+        # NSTimers, which is why nothing on the recording path may show one.
+        alert.window().setCollectionBehavior_(
+            AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+            | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        alert.window().setInitialFirstResponder_(field)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+        response = alert.runModal()
+        if response == AppKit.NSAlertThirdButtonReturn:
+            open_url(cloud.PROVIDERS[backend]["keys"])
+            continue
+        if response != AppKit.NSAlertFirstButtonReturn:
+            break
         key = field.stringValue().strip()
+        if url_field is not None:
+            settings["api_url"] = url_field.stringValue().strip()
+        if not key:
+            break
+        try:
+            ids = cloud.verify_key(backend, key, settings["api_url"], https_context())
+        except cloud.CloudError as e:
+            # The reason only: never the key, never the response body
+            problem = f"That key didn't work ({e}). Check it and try again."
+            log(f"{backend}: key check failed ({e})")
+            continue
         set_api_key(backend, key)
-        if key:
-            log(f"{backend}: API key saved to the Keychain")
-            return
+        log(f"{backend}: API key verified and saved to the Keychain")
+        refresh_models(backend, key, ids)
+        return True
     # No key: a cloud backend without one silently falls back on every
     # dictation, which reads as the setting not working
-    settings["rewrite_backend"] = "local"
+    for field_name in ("rewrite_backend", "stt_backend"):
+        if settings[field_name] == backend and not get_api_key(backend):
+            settings[field_name] = "local"
     save_settings()
     log("no key given — staying on the on-device model")
+    return False
 
 
 def apply_language(code):
@@ -4306,6 +4563,13 @@ class StatusItem(AppKit.NSObject):
         )
         menu.addItem_(
             build_submenu(
+                self, "Transcribe with",
+                [(l, b) for b, l in STT_BACKENDS.items()],
+                settings["stt_backend"], "setSttBackend:",
+            )
+        )
+        menu.addItem_(
+            build_submenu(
                 self, "Rewrite model",
                 [(l, b) for b, l in REWRITE_BACKENDS.items()],
                 settings["rewrite_backend"], "setRewriteBackend:",
@@ -4349,6 +4613,9 @@ class StatusItem(AppKit.NSObject):
 
     def setRewriteBackend_(self, sender):
         apply_rewrite_backend(sender.representedObject())
+
+    def setSttBackend_(self, sender):
+        apply_stt_backend(sender.representedObject())
 
     def setTrigger_(self, sender):
         apply_trigger(sender.representedObject())
