@@ -162,7 +162,9 @@ class KahoTestCase(unittest.TestCase):
         self.enterContext(mock.patch.object(
             kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True, "check_updates": True}
+             "api_url": "", "api_model": "auto", "stt_backend": "local",
+             "stt_model": "auto", "screen_words": True, "check_updates": True,
+             "cloud_models": {}}
         ))
         self.enterContext(mock.patch.object(kaho, "overlay", mock.MagicMock()))
         # A real read starts a thread against the stubbed accessibility API;
@@ -502,7 +504,9 @@ class TestSettings(KahoTestCase):
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True, "check_updates": True},
+             "api_url": "", "api_model": "auto", "stt_backend": "local",
+             "stt_model": "auto", "screen_words": True, "check_updates": True,
+             "cloud_models": {}},
         )
 
     def test_a_non_finite_timestamp_is_skipped_not_fatal(self):
@@ -567,7 +571,9 @@ class TestSettings(KahoTestCase):
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
              "trigger": "hold", "rewrite_backend": "local",
-             "api_url": "", "api_model": "", "screen_words": True, "check_updates": True},
+             "api_url": "", "api_model": "auto", "stt_backend": "local",
+             "stt_model": "auto", "screen_words": True, "check_updates": True,
+             "cloud_models": {}},
         )
 
     def test_saved_settings_round_trip_and_stay_private(self):
@@ -1622,12 +1628,114 @@ class TestSpokenInstruction(KahoTestCase):
         self.assertIsNone(kaho.recording)
 
 
+def reply_with(urlopen, *bodies):
+    """Make each urlopen call answer with the next JSON body."""
+    urlopen.return_value.__enter__.return_value.read.side_effect = [
+        json.dumps(b).encode() for b in bodies]
+
+
+class TestAutoModel(KahoTestCase):
+    """Auto asks the provider which models the key has and uses the best."""
+
+    def setUp(self):
+        super().setUp()
+        kaho.settings["rewrite_backend"] = "anthropic"
+        self.enterContext(mock.patch.object(kaho, "get_api_key", return_value="sk-test"))
+
+    def test_the_best_listed_model_is_used_and_the_list_kept(self):
+        models = {"data": [{"id": "claude-opus-5-5"}, {"id": "claude-sonnet-5-5"},
+                           {"id": "claude-haiku-5-5"}]}
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            reply_with(urlopen, models, {"content": [{"text": "One."}]},
+                       {"content": [{"text": "Two."}]})
+            kaho.call_rewrite_api("anthropic", "first")
+            kaho.call_rewrite_api("anthropic", "second")
+        sent = [json.loads(c.args[0].data) for c in urlopen.call_args_list if c.args[0].data]
+        self.assertEqual([b["model"] for b in sent], ["claude-sonnet-5-5"] * 2)
+        self.assertEqual(urlopen.call_count, 3, "the model list is fetched once, not per dictation")
+
+    def test_a_model_the_user_picked_is_used_as_is(self):
+        kaho.settings["api_model"] = "claude-opus-5-5"
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            reply_with(urlopen, {"content": [{"text": "Done."}]})
+            kaho.call_rewrite_api("anthropic", "x")
+        self.assertEqual(json.loads(urlopen.call_args.args[0].data)["model"], "claude-opus-5-5")
+
+    def test_the_old_hardcoded_models_become_auto_on_upgrade(self):
+        pathlib.Path(kaho.SETTINGS_PATH).write_text(json.dumps(
+            {"rewrite_backend": "anthropic", "api_model": "claude-sonnet-5"}))
+        kaho.load_settings()
+        self.assertEqual(kaho.settings["api_model"], "auto")
+
+    def test_a_stale_list_is_refreshed_and_a_fresh_one_left_alone(self):
+        kaho.settings["cloud_models"] = {
+            "rewrite:anthropic": {"ids": ["claude-sonnet-5-5"], "checked": 0}}
+        with mock.patch.object(kaho, "refresh_models") as refresh, \
+             mock.patch.object(kaho.AppHelper, "callAfter"):
+            kaho.refresh_stale_models()
+            refresh.assert_called_once_with("anthropic")
+            kaho.settings["cloud_models"]["rewrite:anthropic"]["checked"] = kaho.time.time()
+            refresh.reset_mock()
+            kaho.refresh_stale_models()
+            refresh.assert_not_called()
+
+
+@unittest.skipUnless(HAVE_NUMPY, "cloud transcription encodes real audio")
+class TestCloudTranscription(KahoTestCase):
+    """Audio goes to the cloud only when chosen, and never costs the words."""
+
+    def setUp(self):
+        super().setUp()
+        kaho.settings.update(stt_backend="groq", stt_model="whisper-large-v3-turbo")
+        self.enterContext(mock.patch.object(kaho, "get_api_key", return_value="gsk-test"))
+        self.enterContext(mock.patch.object(kaho, "read_dictionary", return_value=["Kaho"]))
+        self.asr = self.enterContext(mock.patch.object(kaho, "asr"))
+        self.asr.generate.return_value.text = "local words"
+        self.audio = REAL_NUMPY.zeros(kaho.SAMPLE_RATE, dtype="float32")
+
+    def test_the_cloud_transcript_is_used(self):
+        with mock.patch.object(kaho.cloud, "transcribe", return_value="cloud words") as call:
+            self.assertEqual(kaho.transcribe(self.audio, screen=("Duckterm",)), "cloud words")
+        self.asr.generate.assert_not_called()
+        self.assertEqual(call.call_args.kwargs["terms"], ["Kaho", "Duckterm"])
+
+    def test_a_failed_request_falls_back_to_this_mac(self):
+        with mock.patch.object(kaho.cloud, "transcribe",
+                               side_effect=kaho.cloud.CloudError("HTTP 503")):
+            self.assertEqual(kaho.transcribe(self.audio), "local words")
+        self.assertTrue(any("transcribing on this Mac" in m for m in self.logged))
+
+    def test_a_warmup_never_reaches_the_cloud(self):
+        with mock.patch.object(kaho.cloud, "transcribe") as call:
+            kaho.transcribe(self.audio, use_dictionary=False, use_cloud=False)
+        call.assert_not_called()
+
+    def test_without_a_key_nothing_is_sent(self):
+        with mock.patch.object(kaho, "get_api_key", return_value=""), \
+             mock.patch.object(kaho.cloud, "transcribe") as call:
+            self.assertEqual(kaho.transcribe(self.audio), "local words")
+        call.assert_not_called()
+
+    def test_local_is_the_default(self):
+        kaho.settings["stt_backend"] = "local"
+        with mock.patch.object(kaho.cloud, "transcribe") as call:
+            kaho.transcribe(self.audio)
+        call.assert_not_called()
+
+    def test_an_echoed_hint_list_is_still_dropped(self):
+        words = [f"Term{i}" for i in range(8)]
+        with mock.patch.object(kaho, "read_dictionary", return_value=words), \
+             mock.patch.object(kaho.cloud, "transcribe", return_value=", ".join(words)):
+            self.assertEqual(kaho.transcribe(self.audio), "")
+
+
 class TestBringYourOwnKey(KahoTestCase):
     """A key only ever adds quality; nothing may depend on it."""
 
     def setUp(self):
         super().setUp()
         kaho.settings["rewrite_backend"] = "openai"
+        kaho.settings["api_model"] = "gpt-test"
         self.enterContext(mock.patch.object(kaho, "get_api_key", return_value="sk-test"))
 
     def test_the_transcript_is_sent_and_the_reply_used(self):
@@ -1644,6 +1752,7 @@ class TestBringYourOwnKey(KahoTestCase):
     def test_anthropic_uses_its_own_shape(self):
         reply = {"content": [{"text": "Polished."}]}
         kaho.settings["rewrite_backend"] = "anthropic"
+        kaho.settings["api_model"] = "claude-test"
         with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
             urlopen.return_value.__enter__.return_value.read.return_value = \
                 json.dumps(reply).encode()

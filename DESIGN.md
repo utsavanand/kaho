@@ -60,7 +60,9 @@ detail.
 ## Goals
 
 - Hold-to-talk dictation that works in any app (editor, browser, terminal, Slack)
-- Fully local: audio never leaves the machine, works offline
+- Fully local by default: audio never leaves the machine, works offline.
+  A cloud provider with the user's own key is opt-in, and always falls back
+  to the on-device models
 - Fast enough to feel like typing: < 1.5 s **end-to-end** (key-release to text
   visible) in steady state on this machine (M4 Max). Transcription cost grows
   with the length of the dictation (about 0.2 s for 5 s of speech, 0.5 s for
