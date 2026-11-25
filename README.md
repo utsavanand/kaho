@@ -1,6 +1,6 @@
 # Kaho downloads
 
-**Outside downloads: 75** of 88 in total (all releases and files, updated 2026-11-24).
+**Outside downloads: 77** of 90 in total (all releases and files, updated 2026-11-25).
 
 Every download of a release file counts, including Homebrew installs and the website's Download button. **Ours** are downloads by the maintainers' own release checks, listed in [stats/internal.csv](stats/internal.csv); they are recorded from 2.4.0 on, so earlier releases show none. From 2.4.2, releases are verified against GitHub's published checksums instead of being downloaded.
 
@@ -8,6 +8,8 @@ Every download of a release file counts, including Homebrew installs and the web
 
 | Release | File | Published | Downloads | Ours | Outside |
 |---|---|---|---:|---:|---:|
+| v2.4.9 | Kaho-2.4.9.dmg | 2026-11-25 | 1 | 0 | 1 |
+| v2.4.9 | Kaho-2.4.9.zip | 2026-11-25 | 1 | 0 | 1 |
 | v2.4.8 | Kaho-2.4.8.dmg | 2026-11-22 | 2 | 0 | 2 |
 | v2.4.8 | Kaho-2.4.8.zip | 2026-11-22 | 1 | 0 | 1 |
 | v2.4.7 | Kaho-2.4.7.dmg | 2026-11-22 | 1 | 0 | 1 |
@@ -40,6 +42,8 @@ Snapshots run daily at 06:15 UTC, so a download counts toward the next snapshot.
 
 | Day | File | New |
 |---|---|---:|
+| 2026-11-25 | Kaho-2.4.9.dmg | 1 |
+| 2026-11-25 | Kaho-2.4.9.zip | 1 |
 | 2026-11-24 | Kaho-2.4.8.dmg | 1 |
 | 2026-11-22 | Sotto-1.7.10.dmg | 1 |
 | 2026-11-22 | Sotto-1.7.5.dmg | 1 |
