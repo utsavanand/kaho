@@ -1,4 +1,22 @@
 # Changelog
+## 2.4.9 — 2026-11-24
+
+- Bring your own key, properly. A new **Cloud AI** section in Settings
+  picks who transcribes and who rewrites, and which model.
+  - Transcription can now use OpenAI, Groq, Deepgram or any
+    OpenAI-compatible server. Choosing one sends your audio to it; it stays
+    on this Mac unless you do.
+  - Rewriting adds Google Gemini, Groq and OpenRouter to OpenAI, Anthropic
+    and custom servers.
+  - **Auto** picks the best model your key can use that still answers
+    quickly, and checks for newer ones daily. Before, the model was fixed
+    (gpt-5 or claude-sonnet-5), so newer ones were never used.
+  - Keys are checked before they're saved, so a typo shows up straight
+    away rather than as every dictation quietly falling back.
+  - Reasoning is switched off for rewrites and the timeout is 10 s
+    instead of 30, so a slow provider costs less before the on-device
+    model takes over.
+
 ## 2.4.8 — 2026-11-22
 
 - Hold right Shift to edit a selection by voice. Replaces the 2.4.7 tap,
