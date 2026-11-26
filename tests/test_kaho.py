@@ -3178,3 +3178,119 @@ class TestReadOnlySelection(KahoTestCase):
         clip.assert_called_once_with("Edited.")
         kaho.AppHelper.callAfter.assert_any_call(kaho.overlay.showProblem_,
                                                  "Can't edit here — copied, ⌘V")
+
+
+UPDATE_RELEASE = {"tag_name": "v9.0.0", "html_url": "https://github.com/utsavanand/kaho/releases/tag/v9.0.0",
+               "assets": [{"name": "Kaho-9.0.0.dmg", "digest": "sha256:aa",
+                           "browser_download_url": "https://github.com/x/Kaho-9.0.0.dmg"},
+                          {"name": "Kaho-9.0.0.zip", "digest": "sha256:bb",
+                           "browser_download_url": "https://github.com/x/Kaho-9.0.0.zip"}]}
+
+
+class TestUpdate(KahoTestCase):
+    """Update Kaho…: only a signed, checksummed release replaces the app."""
+
+    def setUp(self):
+        super().setUp()
+        self.RELEASE = UPDATE_RELEASE
+
+    def test_the_zip_and_githubs_digest_are_used(self):
+        self.assertEqual(kaho.update_asset(self.RELEASE, "9.0.0"),
+                         ("https://github.com/x/Kaho-9.0.0.zip", "bb"))
+
+    def test_an_asset_without_a_digest_or_off_github_is_refused(self):
+        for asset in ({"name": "Kaho-9.0.0.zip", "browser_download_url": "https://github.com/x"},
+                      {"name": "Kaho-9.0.0.zip", "digest": "sha256:bb",
+                       "browser_download_url": "https://evil.example/Kaho.zip"}):
+            self.assertIsNone(kaho.update_asset({"assets": [asset]}, "9.0.0"))
+
+    def test_a_download_that_does_not_match_is_rejected(self):
+        dest = pathlib.Path(self.tmp.name) / "k.zip"
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            response = urlopen.return_value.__enter__.return_value
+            response.headers = {"Content-Length": "5"}
+            response.read.side_effect = [b"hello", b""]
+            with self.assertRaises(OSError):
+                kaho.download_update("https://github.com/x", "0" * 64, dest)
+            response.read.side_effect = [b"hello", b""]
+            kaho.download_update("https://github.com/x",
+                                 kaho.hashlib.sha256(b"hello").hexdigest(), dest)
+        self.assertEqual(dest.read_bytes(), b"hello")
+
+    def test_a_failed_swap_puts_the_old_app_back(self):
+        root = pathlib.Path(self.tmp.name)
+        current, new = root / "Kaho.app", root / "src" / "Kaho.app"
+        current.mkdir()
+        (current / "old").write_text("1")
+        new.mkdir(parents=True)
+        real_rename = os.rename
+        def rename(a, b):
+            if str(a).endswith(".new"):
+                raise OSError("disk full")
+            return real_rename(a, b)
+        with mock.patch.object(kaho.os, "rename", side_effect=rename), \
+             self.assertRaises(OSError):
+            kaho.replace_app(str(current), str(new))
+        self.assertTrue((current / "old").exists(), "the working app must survive")
+
+    def test_up_to_date_says_so(self):
+        release = dict(self.RELEASE, tag_name=f"v{kaho.APP_VERSION}")
+        with mock.patch.object(kaho.sys, "frozen", True, create=True), \
+             mock.patch.object(kaho, "fetch_latest_release", return_value=release), \
+             mock.patch.object(kaho, "run_alert") as alert:
+            kaho.offer_update()
+        self.assertEqual(alert.call_args.args[0], "Kaho is up to date")
+
+    def test_a_newer_release_is_installed_when_accepted(self):
+        with mock.patch.object(kaho.sys, "frozen", True, create=True), \
+             mock.patch.object(kaho, "fetch_latest_release", return_value=self.RELEASE), \
+             mock.patch.object(kaho, "run_alert", return_value=0), \
+             mock.patch.object(kaho.threading, "Thread") as thread:
+            kaho.offer_update()
+        self.assertIs(thread.call_args.kwargs["target"], kaho.install_update)
+        self.assertEqual(thread.call_args.kwargs["args"], (self.RELEASE, "9.0.0"))
+
+    def test_a_source_install_is_not_replaced(self):
+        with mock.patch.object(kaho.sys, "frozen", False, create=True), \
+             mock.patch.object(kaho, "fetch_latest_release") as fetch, \
+             mock.patch.object(kaho, "run_alert"):
+            kaho.offer_update()
+        fetch.assert_not_called()
+
+
+class TestBugReport(KahoTestCase):
+    """Report a Bug…: sent straight to the report service."""
+
+    def test_the_report_carries_diagnostics_but_no_log_unless_asked(self):
+        pathlib.Path(kaho.LOG_PATH).write_text("[1.0s] something private\n")
+        with mock.patch.object(kaho.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"id":7}'
+            self.assertEqual(kaho.send_bug_report("it broke", "", False), (True, 7))
+            sent = json.loads(urlopen.call_args.args[0].data)
+            self.assertEqual(sent["log"], "")
+            self.assertIn(kaho.APP_VERSION, sent["diagnostics"])
+            kaho.send_bug_report("it broke", "a@b.c", True)
+            self.assertIn("something private", json.loads(urlopen.call_args.args[0].data)["log"])
+
+    def test_a_blocked_domain_falls_through_to_the_next_address(self):
+        ok = mock.MagicMock()
+        ok.__enter__.return_value.read.return_value = b'{"ok":true,"id":3}'
+        with mock.patch.object(kaho.urllib.request, "urlopen",
+                               side_effect=[OSError("ssl: wrong version number"), ok]) as urlopen:
+            self.assertEqual(kaho.send_bug_report("x y z", "", False), (True, 3))
+        hosts = [c.args[0].full_url for c in urlopen.call_args_list]
+        self.assertEqual(hosts, list(kaho.REPORT_URLS))
+
+    def test_the_services_own_refusal_is_shown_and_not_retried(self):
+        error = kaho.urllib.error.HTTPError(
+            kaho.REPORT_URLS[0], 429, "x", {}, io.BytesIO(b'{"ok":false,"error":"Too many reports"}'))
+        with mock.patch.object(kaho.urllib.request, "urlopen", side_effect=error) as urlopen:
+            self.assertEqual(kaho.send_bug_report("x y z", "", False), (False, "Too many reports"))
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_diagnostics_never_carry_a_key_or_the_dictionary(self):
+        with mock.patch.object(kaho, "get_api_key", return_value="sk-secret"), \
+             mock.patch.object(kaho, "read_dictionary", return_value=["Secretname"]):
+            text = kaho.bug_diagnostics()
+        self.assertNotIn("sk-secret", text)
+        self.assertNotIn("Secretname", text)

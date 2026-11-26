@@ -48,7 +48,7 @@ telemetry.
 Recent transcripts (click to copy), your hotkey, rewrite mode, history,
 log, and one-click bug reports:
 
-<img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey, Trigger, Language and Rewrite submenus, Settings, History, Open Log, Report a Bug">
+<img src="assets/menu.svg" width="640" alt="Kaho menu: transcripts, Hotkey, Trigger, Language and Rewrite submenus, Settings, History, Open Log, Report a Bug, Update Kaho">
 
 - **Settings…** — a real window (⌘,) for hotkey, trigger, language and
   rewrite. **About Kaho** at the bottom shows the installed version, and says
@@ -113,8 +113,16 @@ log, and one-click bug reports:
   window, and on brief or noisy audio it guesses wrong.
 - **Restart Kaho** — recovers a stuck microphone. macOS's audio stack can
   wedge mid-recording; the pill says so when it happens.
-- **Report a Bug…** — opens a pre-filled Mail draft with diagnostics and the
-  log attached; nothing sends until you review it.
+- **Report a Bug…** — a short form: what happened, an optional email for a
+  reply, and whether to attach the recent log (it includes your last few
+  dictations, so it's off unless you tick it). **Send** delivers it straight
+  to the developer, with your Kaho version and settings (never keys or your
+  dictionary). If it can't be sent, Kaho offers a Mail draft instead.
+- **Update Kaho…** — checks GitHub for a newer version and offers to install
+  it in place: Kaho downloads the release, checks it against GitHub's
+  checksum, refuses it unless it is signed by Kaho's developer and notarized
+  by Apple, swaps it in and restarts. Your settings, dictionary and history
+  are kept.
 
 If your menu bar is full, macOS hides the icon behind the notch. Kaho
 detects that and adds a Dock icon with the same menu, so Settings and
