@@ -1,4 +1,18 @@
 # Changelog
+## 2.4.10 — 2026-11-25
+
+- **Update Kaho…** in the menu (and the Dock menu) checks for a newer
+  version and installs it in place: download, check, swap, restart. An
+  update is refused unless it matches GitHub's checksum, is signed by
+  Kaho's developer and notarized by Apple. "Kaho x.y.z is available" and
+  Settings' Get button do the same, instead of opening a web page. This
+  is the first version that can update itself, so getting to it is the
+  last manual download.
+- **Report a Bug…** is now a short form that sends the report straight to
+  the developer, instead of opening a Mail draft. Attaching the log, which
+  holds your recent dictations, is up to you and off by default. If the
+  report can't be sent, a Mail draft is still offered.
+
 ## 2.4.9 — 2026-11-24
 
 - Bring your own key, properly. A new **Cloud AI** section in Settings
