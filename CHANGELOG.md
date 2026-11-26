@@ -1,4 +1,17 @@
 # Changelog
+## 2.4.11 — 2026-11-25
+
+- A pause in a long dictation no longer pastes your hint words. Kaho
+  transcribes long dictations in stretches while you talk, and a stretch
+  that was mostly a pause could come back as your dictionary and the words
+  on screen ("Duckterm, Sotto, …"), mixed into your sentence. 2.4.6 only
+  caught it when that was all that came back. Now it's cut out wherever it
+  appears, and your words around it are kept.
+- Kaho now dictates in your Mac's language unless you choose otherwise.
+  Detect automatically was the default, and it sometimes heard English as
+  Hindi. Pick Detect automatically in Settings if you dictate in more than
+  one language.
+
 ## 2.4.10 — 2026-11-25
 
 - **Update Kaho…** in the menu (and the Dock menu) checks for a newer
