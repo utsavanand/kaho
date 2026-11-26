@@ -16,6 +16,7 @@ import collections
 import ctypes
 import difflib
 import fcntl
+import hashlib
 import json
 import math
 import multiprocessing
@@ -28,6 +29,7 @@ import subprocess
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -525,6 +527,17 @@ RELEASE_NOTES_URL = f"https://github.com/utsavanand/kaho/releases/tag/v{APP_VERS
 LATEST_RELEASE_API = "https://api.github.com/repos/utsavanand/kaho/releases/latest"
 UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
 BUG_REPORT_EMAIL = "getutsava@gmail.com"
+# Report a Bug posts here (the website's /api/kaho-report), which files it as
+# an issue in a private repo. Tried in order: some ISP security filters block
+# utsava.xyz outright, and Vercel's own name for the site gets through.
+REPORT_URLS = (
+    "https://kaho.utsava.xyz/api/kaho-report",
+    "https://my-digital-card-three.vercel.app/api/kaho-report",
+)
+REPORT_LOG_LINES = 300
+# An update is only installed if it is signed by this team and notarized
+UPDATE_TEAM_ID = "C8CT7D82V3"
+UPDATE_DIR = os.path.expanduser("~/Library/Caches/Kaho/update")
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 # One Kaho per user. A tester reopened Kaho to "apply" the Accessibility grant
 # without quitting it, and two copies then recorded, transcribed and tried to
@@ -3923,8 +3936,11 @@ class SettingsWindow(AppKit.NSObject):
         open_dictionary()
 
     def openReleaseNotes_(self, _sender):
-        # The newer release once there is one: its page has the download
-        open_url(latest_release[1] if latest_release else RELEASE_NOTES_URL)
+        # "Get x.y.z" once a newer release is known: install it in place
+        if latest_release:
+            offer_update()
+        else:
+            open_url(RELEASE_NOTES_URL)
 
     def checkUpdatesChanged_(self, sender):
         apply_check_updates(sender.state() == AppKit.NSControlStateValueOn)
@@ -4149,6 +4165,7 @@ MENU_ACTIONS = (
     ("History…", "showHistory:", "h"),
     ("Open Log", "openLog:", ""),
     ("Report a Bug…", "reportBug:", ""),
+    ("Update Kaho…", "updateKaho:", ""),
     ("Restart Kaho", "restart:", ""),
     ("Quit Kaho", "quit:", "q"),
 )
@@ -4262,21 +4279,327 @@ def set_latest_release(found):
     AppHelper.callAfter(refresh_settings_ui)
 
 
-def check_for_update():
-    if not settings["check_updates"]:
-        return
+def fetch_latest_release():
     request = urllib.request.Request(
         LATEST_RELEASE_API,
         headers={"Accept": "application/vnd.github+json", "User-Agent": f"Kaho/{APP_VERSION}"},
     )
+    with urllib.request.urlopen(request, timeout=10, context=https_context()) as response:
+        return json.load(response)
+
+
+def check_for_update():
+    if not settings["check_updates"]:
+        return
     try:
-        with urllib.request.urlopen(request, timeout=10, context=https_context()) as response:
-            release = json.load(response)
+        release = fetch_latest_release()
     except (OSError, ValueError) as e:
         # Offline is normal for an app that works offline; try again tomorrow
         log(f"update check skipped: {e}")
         return
     set_latest_release(newer_release(release, APP_VERSION))
+
+
+def update_asset(release, version):
+    """(download URL, sha256) of the release's zip, or None.
+
+    The zip, not the DMG: it unpacks with ditto and needs no mounting. The
+    digest is GitHub's own, so a download that was cut short or altered on
+    the way is caught before anything is installed.
+    """
+    for asset in release.get("assets") or []:
+        if not isinstance(asset, dict) or asset.get("name") != f"Kaho-{version}.zip":
+            continue
+        url, digest = asset.get("browser_download_url"), asset.get("digest") or ""
+        if (isinstance(url, str) and url.startswith("https://github.com/")
+                and isinstance(digest, str) and digest.startswith("sha256:")):
+            return url, digest.removeprefix("sha256:")
+    return None
+
+
+def download_update(url, sha256, dest, progress=None):
+    """Download to `dest` and check its sha256. Raises OSError on any failure."""
+    digest = hashlib.sha256()
+    request = urllib.request.Request(url, headers={"User-Agent": f"Kaho/{APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=30, context=https_context()) as response, \
+            open(dest, "wb") as f:
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        while chunk := response.read(1 << 20):
+            f.write(chunk)
+            digest.update(chunk)
+            done += len(chunk)
+            if progress and total:
+                progress(done * 100 // total)
+    if digest.hexdigest() != sha256:
+        raise OSError("the download doesn't match GitHub's checksum")
+
+
+def verify_update(app, version):
+    """Refuse anything not signed by Kaho's team, notarized, and the version
+    that was offered. Raises OSError naming what failed."""
+    def run(*cmd):
+        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if run("codesign", "--verify", "--deep", "--strict", app).returncode != 0:
+        raise OSError("the new app's signature doesn't verify")
+    if f"TeamIdentifier={UPDATE_TEAM_ID}" not in run("codesign", "-dv", "--verbose=2", app).stderr:
+        raise OSError("the new app isn't signed by Kaho's developer")
+    if run("spctl", "--assess", "--type", "execute", app).returncode != 0:
+        raise OSError("macOS doesn't accept the new app as notarized")
+    found = run("defaults", "read", f"{app}/Contents/Info", "CFBundleShortVersionString").stdout.strip()
+    if found != version:
+        raise OSError(f"the download is version {found or 'unknown'}, not {version}")
+
+
+def replace_app(current, new):
+    """Put `new` where `current` is. The old copy is renamed aside first and
+    only trashed once the new one is in place, so a failure leaves a working
+    Kaho behind."""
+    staged = f"{current}.new"
+    aside = os.path.join(os.path.dirname(current), ".Kaho-previous.app")
+    for leftover in (staged, aside):
+        if os.path.exists(leftover):
+            subprocess.run(["rm", "-rf", leftover], check=False)
+    if subprocess.run(["ditto", new, staged], capture_output=True, check=False).returncode != 0:
+        raise OSError(f"couldn't copy the new version next to {current}")
+    os.rename(current, aside)
+    try:
+        os.rename(staged, current)
+    except OSError:
+        os.rename(aside, current)
+        raise
+    try:
+        trash(aside)
+    except OSError:
+        subprocess.run(["rm", "-rf", aside], check=False)
+
+
+def install_update(release, version):
+    """Download, check and install `version`, then restart into it. Runs on
+    a background thread; reports progress on the pill."""
+    current = bundle_path()
+    try:
+        asset = update_asset(release, version)
+        if asset is None:
+            raise OSError("the release has no zip to install from")
+        if not os.access(os.path.dirname(current), os.W_OK):
+            raise OSError(f"Kaho can't write to {os.path.dirname(current)}")
+        subprocess.run(["rm", "-rf", UPDATE_DIR], check=False)
+        os.makedirs(UPDATE_DIR, exist_ok=True)
+        archive = os.path.join(UPDATE_DIR, f"Kaho-{version}.zip")
+        last = [-1]
+
+        def progress(pct):
+            if pct // 10 != last[0]:
+                last[0] = pct // 10
+                AppHelper.callAfter(overlay.announce_, f"Downloading Kaho {version}… {pct}%")
+        AppHelper.callAfter(overlay.announce_, f"Downloading Kaho {version}…")
+        download_update(*asset, archive, progress)
+        AppHelper.callAfter(overlay.announce_, f"Checking Kaho {version}…")
+        unpacked = os.path.join(UPDATE_DIR, "unpacked")
+        if subprocess.run(["ditto", "-x", "-k", archive, unpacked],
+                          capture_output=True, check=False).returncode != 0:
+            raise OSError("couldn't unpack the download")
+        new = os.path.join(unpacked, "Kaho.app")
+        verify_update(new, version)
+        # Never swap the app out from under a dictation
+        for _ in range(120):
+            if state != "recording" and not job_outstanding:
+                break
+            time.sleep(0.5)
+        replace_app(current, new)
+        subprocess.run(["rm", "-rf", UPDATE_DIR], check=False)
+    except OSError as e:
+        log(f"update to {version} failed: {e}")
+        AppHelper.callAfter(update_failed, version, str(e))
+        return
+    log(f"installed Kaho {version}")
+    AppHelper.callAfter(relaunch, current, f"to finish updating to {version}")
+
+
+def update_failed(version, reason):
+    overlay.hide()
+    if run_alert(f"Couldn't update to Kaho {version}",
+                 f"{reason[:1].upper()}{reason[1:]}. Your current version is untouched.\n\n"
+                 "You can download it from the release page instead.",
+                 ["Open Release Page", "Close"]) == 0:
+        open_url(f"https://github.com/utsavanand/kaho/releases/tag/v{version}")
+
+
+def offer_update():
+    """Update Kaho…: check now, then offer to install in place."""
+    if not getattr(sys, "frozen", False):
+        # A source install updates with git; replacing its bundle would
+        # throw away the checkout's own build
+        run_alert("Update Kaho", "This copy runs from source. Update it with git pull "
+                  "and ./install.sh.", ["OK"])
+        return
+    try:
+        release = fetch_latest_release()
+    except (OSError, ValueError) as e:
+        log(f"update check failed: {e}")
+        run_alert("Couldn't check for updates",
+                  "GitHub didn't answer. Check your connection and try again.", ["OK"])
+        return
+    found = newer_release(release, APP_VERSION)
+    set_latest_release(found)
+    if not found:
+        run_alert("Kaho is up to date", f"You have Kaho {APP_VERSION}, the latest version.", ["OK"])
+        return
+    version, page = found
+    notes = (release.get("body") or "").strip()
+    notes = notes if len(notes) <= 600 else notes[:600].rsplit("\n", 1)[0] + "\n…"
+    choice = run_alert(f"Kaho {version} is available",
+                       f"You have {APP_VERSION}.\n\n{notes}".rstrip(),
+                       ["Update and Restart", "Later", "Release Notes"])
+    if choice == 0:
+        threading.Thread(target=install_update, args=(release, version),
+                         name="Kaho update", daemon=True).start()
+    elif choice == 2:
+        open_url(page)
+
+
+def bug_diagnostics():
+    """What's useful for a bug, and nothing the user said: no transcripts,
+    no dictionary, no keys."""
+    return (
+        f"Kaho {APP_VERSION} · macOS {platform.mac_ver()[0]} · "
+        f"Python {platform.python_version()}\n"
+        f"mic: {input_name} · state: {state}\n"
+        f"hotkey: {hotkey_label()} · trigger: {settings['trigger']} · "
+        f"rewrite: {settings['rewrite']} · language: {settings['language']}\n"
+        f"transcribe with: {settings['stt_backend']} ({settings['stt_model']}) · "
+        f"rewrite with: {settings['rewrite_backend']} ({settings['api_model']})\n"
+        f"speech model: {MODEL_REPO}@{MODEL_REVISION[:8]}\n"
+        f"rewrite model: {REWRITE_REPO}@{REWRITE_REVISION[:8]} "
+        f"(loaded: {rewriter is not None})"
+    )
+
+
+def log_tail(lines=REPORT_LOG_LINES):
+    try:
+        with open(LOG_PATH, errors="replace") as f:
+            return "".join(collections.deque(f, maxlen=lines))
+    except OSError:
+        return ""
+
+
+def send_bug_report(description, email, attach_log):
+    """Post the report. Returns (True, issue number) or (False, reason)."""
+    payload = json.dumps({
+        "version": APP_VERSION, "description": description, "email": email,
+        "diagnostics": bug_diagnostics(), "log": log_tail() if attach_log else "",
+    }).encode()
+    reason = "Kaho couldn't reach the report service"
+    for url in REPORT_URLS:
+        request = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"content-type": "application/json", "User-Agent": f"Kaho/{APP_VERSION}"})
+        try:
+            with urllib.request.urlopen(request, timeout=15, context=https_context()) as r:
+                return True, json.load(r).get("id")
+        except urllib.error.HTTPError as e:
+            # The service answered: the next address would say the same
+            try:
+                reason = json.load(e).get("error") or reason
+            except (ValueError, AttributeError):
+                reason = f"The report service answered HTTP {e.code}"
+            return False, reason
+        except (OSError, ValueError) as e:
+            log(f"bug report to {urllib.parse.urlsplit(url).netloc} failed: {type(e).__name__}")
+    return False, reason
+
+
+def report_bug():
+    """Report a Bug…: a short form, sent straight to the developer."""
+    description, email, attach, problem = "", "", False, ""
+    while True:
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_("Report a Bug")
+        alert.setInformativeText_(
+            (f"{problem}\n\n" if problem else "")
+            + "Goes straight to Kaho's developer, with your Kaho version and "
+            "settings. Your dictations are only included if you attach the log."
+        )
+        view = AppKit.NSView.alloc().initWithFrame_(((0, 0), (380, 196)))
+        prompt = make_label("What happened, and what did you expect?", 0, 176, 12)
+        prompt.setFrame_(((0, 176), (380, 18)))
+        view.addSubview_(prompt)
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(((0, 62), (380, 108)))
+        scroll.setHasVerticalScroller_(True)
+        scroll.setBorderType_(AppKit.NSBezelBorder)
+        text = AppKit.NSTextView.alloc().initWithFrame_(((0, 0), (376, 108)))
+        text.setRichText_(False)
+        text.setFont_(AppKit.NSFont.systemFontOfSize_(13))
+        text.setString_(description)
+        scroll.setDocumentView_(text)
+        view.addSubview_(scroll)
+        email_field = AppKit.NSTextField.alloc().initWithFrame_(((0, 30), (380, 24)))
+        email_field.setPlaceholderString_("Your email, if you'd like a reply (optional)")
+        email_field.setStringValue_(email)
+        view.addSubview_(email_field)
+        log_box = AppKit.NSButton.alloc().initWithFrame_(((0, 0), (380, 22)))
+        log_box.setButtonType_(AppKit.NSButtonTypeSwitch)
+        log_box.setTitle_("Attach the recent log (includes your last few dictations)")
+        log_box.setState_(AppKit.NSControlStateValueOn if attach else AppKit.NSControlStateValueOff)
+        view.addSubview_(log_box)
+        alert.setAccessoryView_(view)
+        alert.addButtonWithTitle_("Send")
+        alert.addButtonWithTitle_("Cancel")
+        alert.window().setCollectionBehavior_(
+            AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+            | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        alert.window().setInitialFirstResponder_(text)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+        if alert.runModal() != AppKit.NSAlertFirstButtonReturn:
+            return
+        description = text.string().strip()
+        email = email_field.stringValue().strip()
+        attach = log_box.state() == AppKit.NSControlStateValueOn
+        if len(description) < 3:
+            problem = "Say what went wrong first."
+            continue
+        ok, result = send_bug_report(description, email, attach)
+        if ok:
+            log(f"bug report sent (#{result})")
+            run_alert("Thanks — your report was sent",
+                      "It went straight to Kaho's developer."
+                      + (" You'll hear back by email." if email else ""), ["OK"])
+            return
+        log(f"bug report not sent: {result}")
+        choice = run_alert("Couldn't send the report", f"{result}.",
+                           ["Try Again", "Send by Email Instead", "Cancel"])
+        if choice == 1:
+            email_bug_report(description, attach)
+            return
+        if choice != 0:
+            return
+        problem = ""
+
+
+def email_bug_report(description, attach_log):
+    """The old way, kept as the fallback: a Mail draft with the log attached."""
+    body = (f"{description}\n\n--- diagnostics ---\n{bug_diagnostics()}\n")
+    service = AppKit.NSSharingService.sharingServiceNamed_(
+        AppKit.NSSharingServiceNameComposeEmail
+    )
+    if service:
+        service.setRecipients_([BUG_REPORT_EMAIL])
+        service.setSubject_(f"Kaho bug report ({APP_VERSION})")
+        items = [body]
+        if attach_log and os.path.exists(LOG_PATH):
+            items.append(AppKit.NSURL.fileURLWithPath_(LOG_PATH))
+        service.performWithItems_(items)
+        return
+    # No Mail.app account: a mailto: draft in the default mail handler, which
+    # can't carry an attachment
+    url = (
+        f"mailto:{BUG_REPORT_EMAIL}"
+        f"?subject={urllib.parse.quote(f'Kaho bug report ({APP_VERSION})')}"
+        f"&body={urllib.parse.quote(body)}"
+    )
+    AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(url))
 
 
 def update_loop():
@@ -4645,46 +4968,13 @@ class StatusItem(AppKit.NSObject):
         open_dictionary()
 
     def reportBug_(self, _sender):
-        body = (
-            "Describe the bug — what did you do, what did you expect, what "
-            "happened instead?\n\n\n"
-            "If the issue is visual, attach a screenshot (press ⇧⌘4).\n\n"
-            "--- diagnostics (keep this section) ---\n"
-            f"Kaho {APP_VERSION} · macOS {platform.mac_ver()[0]} · "
-            f"Python {platform.python_version()}\n"
-            f"mic: {input_name} · state: {state}\n"
-            f"hotkey: {hotkey_label()} · rewrite: {settings['rewrite']}\n"
-            f"speech model: {MODEL_REPO}@{MODEL_REVISION[:8]}\n"
-            f"rewrite model: {REWRITE_REPO}@{REWRITE_REVISION[:8]} "
-            f"(loaded: {rewriter is not None})\n\n"
-            "The attached Kaho.log includes recent transcripts — delete "
-            "anything private before sending.\n"
-        )
-        service = AppKit.NSSharingService.sharingServiceNamed_(
-            AppKit.NSSharingServiceNameComposeEmail
-        )
-        if service:
-            service.setRecipients_([BUG_REPORT_EMAIL])
-            service.setSubject_(f"Kaho bug report ({APP_VERSION})")
-            items = [body]
-            if os.path.exists(LOG_PATH):
-                items.append(AppKit.NSURL.fileURLWithPath_(LOG_PATH))
-            service.performWithItems_(items)
-        else:
-            # No Mail.app account: fall back to a mailto: draft in the default
-            # mail handler (no attachment — mailto can't carry one; the body
-            # asks for the log instead)
-            body += f"\nPlease also attach {LOG_PATH}\n"
-            url = (
-                f"mailto:{BUG_REPORT_EMAIL}"
-                f"?subject={urllib.parse.quote(f'Kaho bug report ({APP_VERSION})')}"
-                f"&body={urllib.parse.quote(body)}"
-            )
-            AppKit.NSWorkspace.sharedWorkspace().openURL_(AppKit.NSURL.URLWithString_(url))
+        report_bug()
+
+    def updateKaho_(self, _sender):
+        offer_update()
 
     def openUpdate_(self, _sender):
-        if latest_release:
-            open_url(latest_release[1])
+        offer_update()
 
     def allowAccessibility_(self, _sender):
         open_privacy_settings()
