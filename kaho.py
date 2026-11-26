@@ -695,6 +695,9 @@ edit_hold_timer = None
 edit_recording = False
 lock_time = 0.0  # when hands-free last engaged, for the grace period
 settings = {"hotkey": "right_option", "rewrite": "off", "language": "auto",
+            # Set once the user picks a language themselves; until then it
+            # follows the Mac's (see default_language)
+            "language_chosen": False,
             "trigger": "hold", "rewrite_backend": "local",
             "api_url": "", "api_model": cloud.AUTO, "stt_backend": "local",
             "stt_model": cloud.AUTO, "screen_words": True, "check_updates": True,
@@ -749,6 +752,27 @@ def _settings_key(saved, key):
 
 
 def load_settings():
+    _load_saved_settings()
+    if not settings["language_chosen"] and settings["language"] == "auto":
+        settings["language"] = default_language()
+
+
+def default_language():
+    """The Mac's own language when Kaho can transcribe it, else auto-detect.
+
+    Auto-detect was the default, and on a short or accented English clip it
+    sometimes heard Hindi and wrote Hindi (bug report #3, Nov 2026). Someone
+    who dictates in more than one language picks Detect automatically
+    themselves.
+    """
+    for tag in AppKit.NSLocale.preferredLanguages() or []:
+        code = str(tag).split("-")[0].lower()
+        if code in LANGUAGES and code != "auto":
+            return code
+    return "auto"
+
+
+def _load_saved_settings():
     """Unknown values fall back to defaults — a settings file written by a
     newer version must not brick this one."""
     try:
@@ -773,6 +797,11 @@ def load_settings():
         settings["rewrite"] = mode
     if _settings_key(saved, "language") in LANGUAGES:
         settings["language"] = saved["language"]
+    if isinstance(saved.get("language_chosen"), bool):
+        settings["language_chosen"] = saved["language_chosen"]
+    elif settings["language"] != "auto":
+        # Saved before the flag existed: anything but the old default was a choice
+        settings["language_chosen"] = True
     if _settings_key(saved, "trigger") in TRIGGERS:
         settings["trigger"] = saved["trigger"]
     if _settings_key(saved, "rewrite_backend") in REWRITE_BACKENDS:
@@ -1979,9 +2008,13 @@ def transcribe(audio, use_dictionary=True, screen=(), use_cloud=True):
             # None lets the model detect; it takes the language's name, not its code
             language=None if settings["language"] == "auto" else LANGUAGES[settings["language"]],
         ).text.strip()
-    if echoes_hotwords(text, hotwords):
-        log(f"dropped: the model wrote out its hint words instead of speech ({len(text.split())} words)")
-        return ""
+    cleaned = strip_hotword_echo(text, hotwords)
+    if cleaned != text:
+        dropped = len(text.split()) - len(cleaned.split())
+        log(f"dropped {dropped} words: the model wrote out its hint words instead of speech")
+        if not cleaned:
+            return ""
+        text = cleaned
     return respell(text, terms)
 
 
@@ -2011,22 +2044,85 @@ def transcribe_cloud(audio, hotwords):
     return text
 
 
-def echoes_hotwords(text, hotwords):
-    """True when the transcript is the hint-word list rather than speech.
+# Fewest hint words, back to back in the prompt's order, that count as the
+# model writing out its prompt rather than the user saying them
+ECHO_MIN_HINTS = 5
+# The cloud transcription prompt's own words (cloud.transcribe), which come
+# back with the list when a cloud model echoes it
+_ECHO_PREAMBLE = ("words", "that", "may", "come", "up")
+
+
+def _echo_words(text):
+    """Words for matching: lowercased, split on spaces and commas, with
+    sentence punctuation trimmed (hyphens and dots inside a word stay)."""
+    return [(m.start(), m.end(), m.group().strip(".;:!?\"'()").lower())
+            for m in re.finditer(r"[^\s,]+", text)]
+
+
+def strip_hotword_echo(text, hotwords):
+    """The transcript with any written-out hint-word list cut out of it.
 
     The hint words reach the model as one comma-separated line in its
-    prompt. Given a short clip with no speech in it (a stray tap, a breath,
-    a key click), it transcribes that line: twice on Oct 21 a 0.9 s
-    recording pasted the dictionary and the on-screen words. Speech that
-    names a few of them ("add Kaho, Sotto and MLX") still has words of its
-    own between the commas, and a spoken list of them is in the speaker's
-    order rather than the prompt's.
+    prompt. On audio with no speech in it (a stray tap, a breath, a long
+    pause) it writes that line out. 2.4.6 dropped a transcript that was
+    nothing but the list, but in a long dictation, transcribed in stretches
+    while the user talks, a pause lands inside a stretch with speech around
+    it: on Nov 25 the list was pasted twice in the middle of a 179 s
+    dictation, run into the words on either side ("…a dialog box kaho,
+    Sotto, Duckterm, … Inbox, PRs Also, think of…").
+
+    So the list is cut wherever it appears: any run of ECHO_MIN_HINTS or
+    more hint words back to back in the prompt's order, however many times
+    it repeats. Speech that names a few of them has words of its own
+    between, and a spoken list is in the speaker's order, not the prompt's.
     """
-    position = {w.lower(): n for n, w in enumerate(hotwords)}
-    items = [i.strip(" .").lower() for i in text.split(",") if i.strip(" .")]
-    order = [position[i] for i in items if i in position]
-    return (len(order) >= 5 and len(order) >= 0.7 * len(items)
-            and order == sorted(order))
+    canon, owner = [], []
+    for word in _ECHO_PREAMBLE:
+        canon.append(word)
+        owner.append(-1)
+    for n, hint in enumerate(hotwords):
+        for _, _, word in _echo_words(hint):
+            canon.append(word)
+            owner.append(n)
+    tokens = _echo_words(text)
+    live = list(range(len(tokens)))
+    cut = set()
+    while live:
+        words = [tokens[i][2] for i in live]
+        m = difflib.SequenceMatcher(None, words, canon, autojunk=False).find_longest_match(
+            0, len(words), 0, len(canon))
+        if len({owner[k] for k in range(m.b, m.b + m.size)} - {-1}) < ECHO_MIN_HINTS:
+            break
+        run = live[m.a:m.a + m.size]
+        cut.update(run)
+        live = live[:m.a] + live[m.a + m.size:]
+    if not cut:
+        return text
+    # Each run of cut words goes as one span, commas between them included
+    out, pos, i = [], 0, 0
+    while i < len(tokens):
+        if i not in cut:
+            i += 1
+            continue
+        j = i
+        while j + 1 in cut:
+            j += 1
+        out.append(text[pos:tokens[i][0]])
+        pos = tokens[j][1]
+        # The list's own trailing comma, if it had one
+        if text[pos:pos + 1] == ",":
+            pos += 1
+        i = j + 1
+    out.append(text[pos:])
+    # Rejoin around the gaps: no doubled spaces, no space before punctuation
+    cleaned = re.sub(r"\s+([,.!?])", r"\1", re.sub(r"\s{2,}", " ", "".join(out)))
+    cleaned = cleaned.strip(" ,")
+    return cleaned if re.search(r"\w", cleaned) else ""
+
+
+def echoes_hotwords(text, hotwords):
+    """True when the whole transcript is the hint-word list rather than speech."""
+    return bool(text.strip()) and not strip_hotword_echo(text, hotwords)
 
 
 def ensure_rewriter():
@@ -4746,6 +4842,7 @@ def prompt_for_api_key(backend, kind="rewrite"):
 
 def apply_language(code):
     settings["language"] = code
+    settings["language_chosen"] = True
     save_settings()
     log(f"language: {LANGUAGES[code]}")
     refresh_settings_ui()

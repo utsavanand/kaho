@@ -161,6 +161,7 @@ class KahoTestCase(unittest.TestCase):
             self.enterContext(mock.patch.object(kaho, name, value))
         self.enterContext(mock.patch.object(
             kaho, "settings", {"hotkey": "right_option", "rewrite": "off", "language": "auto",
+             "language_chosen": False,
              "trigger": "hold", "rewrite_backend": "local",
              "api_url": "", "api_model": "auto", "stt_backend": "local",
              "stt_model": "auto", "screen_words": True, "check_updates": True,
@@ -503,6 +504,7 @@ class TestSettings(KahoTestCase):
         self.assertEqual(
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
+             "language_chosen": False,
              "trigger": "hold", "rewrite_backend": "local",
              "api_url": "", "api_model": "auto", "stt_backend": "local",
              "stt_model": "auto", "screen_words": True, "check_updates": True,
@@ -570,6 +572,7 @@ class TestSettings(KahoTestCase):
         self.assertEqual(
             kaho.settings,
             {"hotkey": "right_option", "rewrite": "off", "language": "auto",
+             "language_chosen": False,
              "trigger": "hold", "rewrite_backend": "local",
              "api_url": "", "api_model": "auto", "stt_backend": "local",
              "stt_model": "auto", "screen_words": True, "check_updates": True,
@@ -3041,8 +3044,67 @@ class TestHotwordEcho(KahoTestCase):
         said = "Whisper, Qwen, MLX, PortAudio, CoreAudio."
         self.assertFalse(kaho.echoes_hotwords(said, [*self.DICTIONARY, *self.SCREEN]))
 
+    def test_an_echo_inside_real_speech_is_cut_out_and_the_speech_kept(self):
+        # Bug report #2, Nov 25: a pause mid-dictation, the list twice, run
+        # into the words around it
+        hints = [*self.DICTIONARY, *self.SCREEN]
+        echo = ", ".join(hints)
+        said = f"open a dialog box {echo} {echo} Also, think of a couple more widgets."
+        self.assertEqual(kaho.strip_hotword_echo(said, hints),
+                         "open a dialog box Also, think of a couple more widgets.")
+
+    def test_the_echo_is_cut_from_a_streamed_stretch(self):
+        self.asr.generate.return_value.text = f"Then ship it. {self.ECHO}"
+        self.assertEqual(kaho.transcribe(None, screen=self.SCREEN), "Then ship it.")
+        self.assertTrue(any("hint words" in m for m in self.logged))
+
+    def test_a_cloud_models_echo_takes_its_preamble_with_it(self):
+        hints = list(self.DICTIONARY)
+        said = "Words that may come up: " + ", ".join(hints) + ". Okay."
+        self.assertEqual(kaho.strip_hotword_echo(said, hints), "Okay.")
+
+    def test_a_few_hint_words_in_order_inside_speech_are_kept(self):
+        said = "We moved Kaho, Sotto, Duckterm and Rubber Term to the new org."
+        self.assertEqual(kaho.strip_hotword_echo(said, list(self.DICTIONARY)), said)
+
     def test_an_echo_of_only_the_screen_words_is_caught_too(self):
         self.assertTrue(kaho.echoes_hotwords(", ".join(self.SCREEN), [*self.DICTIONARY, *self.SCREEN]))
+
+
+class TestDefaultLanguage(KahoTestCase):
+    """English Macs dictate English unless the user asks for detection."""
+
+    def mac_languages(self, *tags):
+        return mock.patch.object(kaho.AppKit.NSLocale, "preferredLanguages", return_value=list(tags))
+
+    def test_a_new_install_takes_the_macs_language(self):
+        with self.mac_languages("en-US", "hi-IN"):
+            kaho.load_settings()
+        self.assertEqual(kaho.settings["language"], "en")
+
+    def test_a_mac_language_kaho_cannot_transcribe_leaves_detection_on(self):
+        with self.mac_languages("ko-KR"):
+            kaho.load_settings()
+        self.assertEqual(kaho.settings["language"], "auto")
+
+    def test_the_old_untouched_default_moves_to_the_macs_language(self):
+        pathlib.Path(kaho.SETTINGS_PATH).write_text(json.dumps({"language": "auto"}))
+        with self.mac_languages("en-GB"):
+            kaho.load_settings()
+        self.assertEqual(kaho.settings["language"], "en")
+
+    def test_detection_picked_on_purpose_is_kept(self):
+        with self.mac_languages("en-US"):
+            kaho.apply_language("auto")
+            kaho.settings["language"] = "en"
+            kaho.load_settings()
+        self.assertEqual(kaho.settings["language"], "auto")
+
+    def test_a_language_chosen_before_the_flag_existed_is_kept(self):
+        pathlib.Path(kaho.SETTINGS_PATH).write_text(json.dumps({"language": "hi"}))
+        with self.mac_languages("en-US"):
+            kaho.load_settings()
+        self.assertEqual(kaho.settings["language"], "hi")
 
 
 class TestEditKey(KahoTestCase):
