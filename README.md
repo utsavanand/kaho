@@ -118,6 +118,7 @@ log, and one-click bug reports:
   dictations, so it's off unless you tick it). **Send** delivers it straight
   to the developer, with your Kaho version and settings (never keys or your
   dictionary). If it can't be sent, Kaho offers a Mail draft instead.
+  How reports are delivered: [docs/bug-reports.md](docs/bug-reports.md).
 - **Update Kaho…** — checks GitHub for a newer version and offers to install
   it in place: Kaho downloads the release, checks it against GitHub's
   checksum, refuses it unless it is signed by Kaho's developer and notarized
