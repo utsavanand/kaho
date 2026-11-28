@@ -41,7 +41,7 @@ if args.mode.startswith("native_"):
             self.callback(data, 1600, None, None)
 
         def stop(self):
-            time.sleep(30)
+            time.sleep(0.5 if args.mode == "native_slow_close" else 30)
 
         def close(self):
             pass
