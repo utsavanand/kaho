@@ -746,6 +746,13 @@ class TestCleanSkip(KahoTestCase):
         self.assertEqual(kaho.rewrite("let's meet Thursday no wait Friday", "clean"),
                          "Let's meet on Friday.")
 
+    def test_a_clean_up_that_drops_a_filler_i_dont_know_pastes_the_rewrite(self):
+        self.check_returns(0.0)
+        self.mlx_lm.generate.return_value = "Think of words in other languages."
+        self.assertEqual(
+            kaho.rewrite("think of like I don't know like words in other languages", "clean"),
+            "Think of words in other languages.")
+
 
 class TestLostNegation(unittest.TestCase):
     def test_counts_each_way_of_saying_not(self):
@@ -764,6 +771,22 @@ class TestLostNegation(unittest.TestCase):
     def test_keeping_or_contracting_a_negation_is_fine(self):
         self.assertFalse(kaho.lost_negation("I do not know", "I don't know"))
         self.assertFalse(kaho.lost_negation("um I can't", "I can't."))
+
+    def test_a_dropped_filler_i_dont_know_is_not_a_negation(self):
+        self.assertFalse(kaho.lost_negation(
+            "think of like I don't know like words in other languages",
+            "Think of words in other languages."))
+        self.assertFalse(kaho.lost_negation("I don't know. I'm not following",
+                                            "I'm not following."))
+
+    def test_a_collapsed_stutter_is_not_a_negation(self):
+        self.assertFalse(kaho.lost_negation("It doesn't have, doesn't have any cleanliness",
+                                            "It doesn't have any cleanliness."))
+
+    def test_a_real_negation_beside_filler_is_still_caught(self):
+        self.assertTrue(kaho.lost_negation("I don't know. I'm not following",
+                                           "I don't know. I'm following."))
+        self.assertTrue(kaho.lost_negation("I don't know", "I know"))
 
 
 class TestAudioDropRules(KahoTestCase):
