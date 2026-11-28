@@ -399,12 +399,25 @@ CLEAN_CHECK_PROMPT = (
 # "what can be achieved". Filler in the paste is a nuisance; a reversed
 # sentence is wrong, so a Clean up that loses a negation is thrown away.
 NEGATION = re.compile(r"\b(?:not|never|cannot)\b|n't\b", re.IGNORECASE)
+# But Clean up exists to drop filler, and on 2.4.11 the guard threw away 16 of
+# 234 rewrites (~7%), several only for losing a filler "I don't know" or a
+# stutter ("doesn't have, doesn't have"). So a stutter counts once, and an
+# "I don't know" the rewrite dropped (rather than turned into "I know") not at all.
+REPEATED_PHRASE = re.compile(r"\b((?:[\w']+\W+){0,3}[\w']+)(?:\W+\1\b)+", re.IGNORECASE)
+I_DONT_KNOW = re.compile(r"\bI\s+(?:don't|do\s+not)\s+know\b", re.IGNORECASE)
+I_KNOW = re.compile(r"\bI\s+know\b", re.IGNORECASE)
 
 
 def lost_negation(before, after):
-    def count(text):
-        return len(NEGATION.findall(text.replace("’", "'")))
-    return count(after) < count(before)
+    before = REPEATED_PHRASE.sub(r"\1", before.replace("’", "'"))
+    after = after.replace("’", "'")
+
+    def count(pattern, text):
+        return len(pattern.findall(text))
+    reversed_to_i_know = max(0, count(I_KNOW, after) - count(I_KNOW, before))
+    dropped_filler = max(0, count(I_DONT_KNOW, before) - count(I_DONT_KNOW, after)
+                         - reversed_to_i_know)
+    return count(NEGATION, after) < count(NEGATION, before) - dropped_filler
 
 
 # A wrong skip pastes filler the user asked to have removed; a wrong rewrite
