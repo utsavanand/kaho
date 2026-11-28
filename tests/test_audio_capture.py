@@ -35,7 +35,8 @@ class TestAudioCapture(unittest.TestCase):
         self.assertEqual(float(chunks[0][0, 0]), 0.25)
         self.assertEqual(float(chunks[-1][-1, 0]), 0.5)
         self.assertIsNone(stream.process.poll(), "fixture must still be stuck during handoff")
-        stream.stop()
+        with mock.patch.object(audio_capture, "CLOSE_TIMEOUT", 0.3):
+            stream.stop()
         stream.close()
         self.assertIsNotNone(stream.process.returncode)
         self.assertTrue(any("terminated" in line for line in logs))
@@ -105,9 +106,18 @@ class TestAudioCapture(unittest.TestCase):
         stream.start()
         stream.freeze()
         self.assertEqual(sum(len(c) for c in chunks), 1600)
-        stream.stop()
+        with mock.patch.object(audio_capture, "CLOSE_TIMEOUT", 0.3):
+            stream.stop()
         self.assertIsNotNone(stream.process.returncode)
         self.assertTrue(any("terminated" in line for line in logs))
+
+    def test_a_child_still_closing_after_frozen_is_not_killed(self):
+        stream, chunks, logs, _ = self.make_stream("native_slow_close")
+        stream.start()
+        stream.stop()
+        self.assertEqual(stream.process.returncode, 0)
+        self.assertFalse(any("stuck" in line or "terminated" in line for line in logs))
+        self.assertEqual(sum(len(c) for c in chunks), 1600)
 
     def test_actual_child_protocol_survives_native_open_hang(self):
         stream, _, _, _ = self.make_stream("native_open_hang")
